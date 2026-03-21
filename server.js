@@ -4,6 +4,8 @@ const mqtt = require('mqtt');
 const { Pool } = require('pg');
 const cors = require('cors');
 const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 app.use(express.json());
@@ -41,7 +43,143 @@ mqttClient.on('message', async (topic, payload) => {
   } catch (e) { console.error(e.message); }
 });
 
-// API
+// ===== LINE Pay 工具函式 =====
+const LINE_PAY_CHANNEL_ID = process.env.LINE_PAY_CHANNEL_ID;
+const LINE_PAY_CHANNEL_SECRET = process.env.LINE_PAY_CHANNEL_SECRET;
+const LINE_PAY_ENV = process.env.LINE_PAY_ENV || 'sandbox';
+const LINE_PAY_API_HOST = LINE_PAY_ENV === 'sandbox'
+  ? 'sandbox-api-pay.line.me'
+  : 'api-pay.line.me';
+
+function linePayRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const nonce = uuid();
+    const bodyStr = body ? JSON.stringify(body) : '';
+    const message = LINE_PAY_CHANNEL_SECRET + path + bodyStr + nonce;
+    const signature = crypto.createHmac('sha256', LINE_PAY_CHANNEL_SECRET)
+      .update(message).digest('base64');
+
+    const options = {
+      hostname: LINE_PAY_API_HOST,
+      path,
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-LINE-ChannelId': LINE_PAY_CHANNEL_ID,
+        'X-LINE-Authorization-Nonce': nonce,
+        'X-LINE-Authorization': signature,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ===== LINE Pay API =====
+
+// 1. 建立付款請求
+app.post('/api/payment/request', async (req, res) => {
+  try {
+    const { orderId, amount, orderName } = req.body;
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+
+    const body = {
+      amount,
+      currency: 'TWD',
+      orderId,
+      packages: [{
+        id: orderId,
+        amount,
+        name: orderName || '悠洗洗衣服務',
+        products: [{
+          name: orderName || '洗衣服務',
+          quantity: 1,
+          price: amount,
+        }],
+      }],
+      redirectUrls: {
+        confirmUrl: `${SERVER_URL}/api/payment/confirm`,
+        cancelUrl: `${FRONTEND_URL}/payment-cancel`,
+      },
+    };
+
+    const result = await linePayRequest('POST', '/v3/payments/request', body);
+    console.log('LINE Pay request result:', JSON.stringify(result));
+
+    if (result.returnCode === '0000') {
+      // 儲存 transactionId 到訂單
+      await db.query(
+        `UPDATE orders SET status='waiting_payment' WHERE id=$1`,
+        [orderId]
+      );
+      res.json({
+        success: true,
+        paymentUrl: result.info.paymentUrl.web,
+        transactionId: result.info.transactionId,
+      });
+    } else {
+      res.status(400).json({ success: false, error: result.returnMessage, code: result.returnCode });
+    }
+  } catch (e) {
+    console.error('LINE Pay request error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// 2. 確認付款（LINE Pay redirect 回來）
+app.get('/api/payment/confirm', async (req, res) => {
+  try {
+    const { transactionId, orderId } = req.query;
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+
+    // 查訂單金額
+    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
+    if (orderResult.rows.length === 0) {
+      return res.redirect(`${FRONTEND_URL}/payment-result?status=error&msg=訂單不存在`);
+    }
+    const order = orderResult.rows[0];
+
+    const body = { amount: order.total_amount, currency: 'TWD' };
+    const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
+    console.log('LINE Pay confirm result:', JSON.stringify(result));
+
+    if (result.returnCode === '0000') {
+      await db.query(
+        `UPDATE orders SET status='paid', paid_at=NOW() WHERE id=$1`,
+        [orderId]
+      );
+      res.redirect(`${FRONTEND_URL}/payment-result?status=success&orderId=${orderId}`);
+    } else {
+      res.redirect(`${FRONTEND_URL}/payment-result?status=fail&msg=${result.returnMessage}`);
+    }
+  } catch (e) {
+    console.error('LINE Pay confirm error:', e);
+    res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=error&msg=${e.message}`);
+  }
+});
+
+// 3. 取消付款
+app.get('/api/payment/cancel', async (req, res) => {
+  const { orderId } = req.query;
+  const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+  if (orderId) {
+    await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
+  }
+  res.redirect(`${FRONTEND_URL}/payment-result?status=cancel`);
+});
+
+// ===== 原有 API =====
 app.get('/api/stores', async (req, res) => {
   const r = await db.query('SELECT * FROM stores ORDER BY name');
   res.json(r.rows);
