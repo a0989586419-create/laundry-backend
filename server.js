@@ -43,17 +43,59 @@ mqttClient.on('message', async (topic, payload) => {
   } catch (e) { console.error(e.message); }
 });
 
+// ===== MQTT 發布啟動指令 =====
+function publishStartCommand(order) {
+  const { id: orderId, store_id, machine_id, mode, addons, temp, total_amount } = order;
+
+  // 洗衣程序對應（模式 -> 程序號）
+  const washModeMap = {
+    standard: 1,
+    small:    2,
+    washonly: 3,
+    soft:     4,
+    strong:   5,
+    dryonly:  0,  // 只烘乾不洗
+  };
+
+  // 烘乾程序對應（溫度 -> 程序號）
+  const dryModeMap = {
+    '高溫': 1,
+    '中溫': 2,
+    '低溫': 3,
+    '輕柔': 4,
+  };
+
+  const washMode = washModeMap[mode] ?? 1;
+  const dryMode  = mode === 'washonly' ? 0 : (dryModeMap[temp] ?? 1);
+  const coins    = Math.ceil(total_amount / 10);
+
+  const topic   = `laundry/${store_id}/${machine_id}/command`;
+  const payload = JSON.stringify({
+    cmd:       'start',
+    orderId,
+    wash_mode: washMode,
+    dry_mode:  dryMode,
+    coins,
+    amount:    total_amount,
+  });
+
+  mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
+    if (err) console.error('❌ MQTT 發布失敗:', err);
+    else console.log(`✅ MQTT 啟動指令已發布 → ${topic}`, payload);
+  });
+}
+
 // ===== LINE Pay 工具函式 =====
-const LINE_PAY_CHANNEL_ID = process.env.LINE_PAY_CHANNEL_ID;
+const LINE_PAY_CHANNEL_ID     = process.env.LINE_PAY_CHANNEL_ID;
 const LINE_PAY_CHANNEL_SECRET = process.env.LINE_PAY_CHANNEL_SECRET;
-const LINE_PAY_ENV = process.env.LINE_PAY_ENV || 'sandbox';
-const LINE_PAY_API_HOST = LINE_PAY_ENV === 'sandbox'
+const LINE_PAY_ENV            = process.env.LINE_PAY_ENV || 'sandbox';
+const LINE_PAY_API_HOST       = LINE_PAY_ENV === 'sandbox'
   ? 'sandbox-api-pay.line.me'
   : 'api-pay.line.me';
 
 function linePayRequest(method, path, body) {
   return new Promise((resolve, reject) => {
-    const nonce = uuid();
+    const nonce   = uuid();
     const bodyStr = body ? JSON.stringify(body) : '';
     const message = LINE_PAY_CHANNEL_SECRET + path + bodyStr + nonce;
     const signature = crypto.createHmac('sha256', LINE_PAY_CHANNEL_SECRET)
@@ -91,7 +133,7 @@ function linePayRequest(method, path, body) {
 app.post('/api/payment/request', async (req, res) => {
   try {
     const { orderId, amount, orderName } = req.body;
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const SERVER_URL   = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
 
     const body = {
@@ -102,30 +144,22 @@ app.post('/api/payment/request', async (req, res) => {
         id: orderId,
         amount,
         name: orderName || '悠洗洗衣服務',
-        products: [{
-          name: orderName || '洗衣服務',
-          quantity: 1,
-          price: amount,
-        }],
+        products: [{ name: orderName || '洗衣服務', quantity: 1, price: amount }],
       }],
       redirectUrls: {
         confirmUrl: `${SERVER_URL}/api/payment/confirm`,
-        cancelUrl: `${FRONTEND_URL}/payment-cancel`,
+        cancelUrl:  `${FRONTEND_URL}/payment-result?status=cancel&orderId=${orderId}`,
       },
     };
 
     const result = await linePayRequest('POST', '/v3/payments/request', body);
-    console.log('LINE Pay request result:', JSON.stringify(result));
+    console.log('LINE Pay request:', result.returnCode, result.returnMessage);
 
     if (result.returnCode === '0000') {
-      // 儲存 transactionId 到訂單
-      await db.query(
-        `UPDATE orders SET status='waiting_payment' WHERE id=$1`,
-        [orderId]
-      );
+      await db.query(`UPDATE orders SET status='waiting_payment' WHERE id=$1`, [orderId]);
       res.json({
         success: true,
-        paymentUrl: result.info.paymentUrl.web,
+        paymentUrl:    result.info.paymentUrl.web,
         transactionId: result.info.transactionId,
       });
     } else {
@@ -137,35 +171,41 @@ app.post('/api/payment/request', async (req, res) => {
   }
 });
 
-// 2. 確認付款（LINE Pay redirect 回來）
+// 2. 確認付款（LINE Pay redirect 回來）→ 付款成功後發 MQTT 啟動指令
 app.get('/api/payment/confirm', async (req, res) => {
   try {
     const { transactionId, orderId } = req.query;
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
 
-    // 查訂單金額
+    // 查訂單
     const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
     if (orderResult.rows.length === 0) {
       return res.redirect(`${FRONTEND_URL}/payment-result?status=error&msg=訂單不存在`);
     }
     const order = orderResult.rows[0];
 
-    const body = { amount: order.total_amount, currency: 'TWD' };
+    // 確認付款
+    const body   = { amount: order.total_amount, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
-    console.log('LINE Pay confirm result:', JSON.stringify(result));
+    console.log('LINE Pay confirm:', result.returnCode, result.returnMessage);
 
     if (result.returnCode === '0000') {
+      // 更新訂單狀態為已付款
       await db.query(
         `UPDATE orders SET status='paid', paid_at=NOW() WHERE id=$1`,
         [orderId]
       );
+
+      // ✅ 發布 MQTT 啟動指令給樹莓派
+      publishStartCommand(order);
+
       res.redirect(`${FRONTEND_URL}/payment-result?status=success&orderId=${orderId}`);
     } else {
-      res.redirect(`${FRONTEND_URL}/payment-result?status=fail&msg=${result.returnMessage}`);
+      res.redirect(`${FRONTEND_URL}/payment-result?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
     }
   } catch (e) {
     console.error('LINE Pay confirm error:', e);
-    res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=error&msg=${e.message}`);
+    res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=error&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -176,7 +216,7 @@ app.get('/api/payment/cancel', async (req, res) => {
   if (orderId) {
     await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
   }
-  res.redirect(`${FRONTEND_URL}/payment-result?status=cancel`);
+  res.redirect(`${FRONTEND_URL}/payment-result?status=cancel&orderId=${orderId || ''}`);
 });
 
 // ===== 原有 API =====
@@ -205,12 +245,14 @@ app.post('/api/orders/create', async (req, res) => {
     member = { id };
   }
   const orderId = 'ORD' + Date.now();
-  const pulses = Math.ceil(totalAmount / 10);
+  const pulses  = Math.ceil(totalAmount / 10);
   const modeDur = { standard:65, small:50, washonly:35, soft:65, strong:75, dryonly:40 };
   const durationSec = ((modeDur[mode]||65) + parseInt(extendMin||0)) * 60;
-  await db.query(`INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NOW())`,
-    [orderId, member.id, storeId, machineId, mode, JSON.stringify(addons||[]), extendMin||0, temp, totalAmount, pulses, durationSec]);
+  await db.query(
+    `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NOW())`,
+    [orderId, member.id, storeId, machineId, mode, JSON.stringify(addons||[]), extendMin||0, temp, totalAmount, pulses, durationSec]
+  );
   res.json({ orderId, totalAmount, pulses });
 });
 
@@ -236,11 +278,24 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS members (id VARCHAR(40) PRIMARY KEY, line_user_id VARCHAR(60) UNIQUE, wallet INT DEFAULT 0, is_admin BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS orders (id VARCHAR(30) PRIMARY KEY, member_id VARCHAR(40), store_id VARCHAR(20), machine_id VARCHAR(30), mode VARCHAR(20), addons JSONB DEFAULT '[]', extend_min INT DEFAULT 0, temp VARCHAR(10), total_amount INT, pulses INT, duration_sec INT, status VARCHAR(20) DEFAULT 'pending', paid_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW());
   `);
-  await db.query('DELETE FROM machines WHERE store_id IN ('s1','s2')'); await db.query('DELETE FROM stores WHERE id IN ('s1','s2')'); await db.query(`INSERT INTO stores (id,name,address,phone) VALUES ('s1','悠洗自助洗衣','嘉義市東區文雅街181號',''),('s2','吼你洗自助洗衣(玉清店)','苗栗縣苗栗市玉清路51號',''),('s3','吼你洗自助洗衣(農會店)','苗栗縣苗栗市為公路290號',''),('s4','熊愛洗自助洗衣','台中市西屯區福聯街22巷2號',''),('s5','上好洗自助洗衣','高雄市鳳山區北平路214號','') ON CONFLICT DO NOTHING`);
+
+  // 清除舊店家資料，重新插入
+  await db.query(`DELETE FROM machines WHERE store_id IN ('s1','s2','s3','s4','s5')`);
+  await db.query(`DELETE FROM stores WHERE id IN ('s1','s2','s3','s4','s5')`);
+  await db.query(`INSERT INTO stores (id,name,address,phone) VALUES
+    ('s1','悠洗自助洗衣','嘉義市東區文雅街181號',''),
+    ('s2','吼你洗自助洗衣(玉清店)','苗栗縣苗栗市玉清路51號',''),
+    ('s3','吼你洗自助洗衣(農會店)','苗栗縣苗栗市為公路290號',''),
+    ('s4','熊愛洗自助洗衣','台中市西屯區福聯街22巷2號',''),
+    ('s5','上好洗自助洗衣','高雄市鳳山區北平路214號','')
+    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, address=EXCLUDED.address`);
   for (const sid of ['s1','s2','s3','s4','s5']) {
     for (let i=1;i<=6;i++) {
       const size = i<=2?'大型':i<=5?'中型':'小型';
-      await db.query(`INSERT INTO machines (id,store_id,name,size,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [`${sid}-m${i}`,sid,`洗脫烘${i}號`,size,i]);
+      await db.query(
+        `INSERT INTO machines (id,store_id,name,size,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+        [`${sid}-m${i}`, sid, `洗脫烘${i}號`, size, i]
+      );
     }
   }
   console.log('✅ 資料庫初始化完成');
