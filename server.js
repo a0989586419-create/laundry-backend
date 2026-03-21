@@ -236,8 +236,8 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS members (id VARCHAR(40) PRIMARY KEY, line_user_id VARCHAR(60) UNIQUE, wallet INT DEFAULT 0, is_admin BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS orders (id VARCHAR(30) PRIMARY KEY, member_id VARCHAR(40), store_id VARCHAR(20), machine_id VARCHAR(30), mode VARCHAR(20), addons JSONB DEFAULT '[]', extend_min INT DEFAULT 0, temp VARCHAR(10), total_amount INT, pulses INT, duration_sec INT, status VARCHAR(20) DEFAULT 'pending', paid_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW());
   `);
-  await db.query(`INSERT INTO stores (id,name,address,phone) VALUES ('s1','三重和平店','新北市三重區和平路88號','02-2288-8888'),('s2','信義嘉興店','台北市信義區嘉興街120號','02-2777-7777') ON CONFLICT DO NOTHING`);
-  for (const sid of ['s1','s2']) {
+  await db.query('DELETE FROM machines WHERE store_id IN ('s1','s2')'); await db.query('DELETE FROM stores WHERE id IN ('s1','s2')'); await db.query(`INSERT INTO stores (id,name,address,phone) VALUES ('s1','悠洗自助洗衣','嘉義市東區文雅街181號',''),('s2','吼你洗自助洗衣(玉清店)','苗栗縣苗栗市玉清路51號',''),('s3','吼你洗自助洗衣(農會店)','苗栗縣苗栗市為公路290號',''),('s4','熊愛洗自助洗衣','台中市西屯區福聯街22巷2號',''),('s5','上好洗自助洗衣','高雄市鳳山區北平路214號','') ON CONFLICT DO NOTHING`);
+  for (const sid of ['s1','s2','s3','s4','s5']) {
     for (let i=1;i<=6;i++) {
       const size = i<=2?'大型':i<=5?'中型':'小型';
       await db.query(`INSERT INTO machines (id,store_id,name,size,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [`${sid}-m${i}`,sid,`洗脫烘${i}號`,size,i]);
