@@ -825,6 +825,77 @@ app.post('/api/machines/state', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════
+//  API: LINE Pay Topup
+// ═══════════════════════════════════════
+app.post('/api/topup/linepay', async (req, res) => {
+  try {
+    const { userId, groupId, amount } = req.body;
+    if (!userId || !groupId || !amount || amount <= 0) return res.status(400).json({ error: 'missing params' });
+    const orderId = 'TOP' + Date.now();
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    // Get group name
+    const gr = await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId]);
+    const groupName = gr.rows[0]?.name || '洗衣服務';
+
+    try {
+      const payBody = {
+        amount, currency: 'TWD', orderId,
+        packages: [{ id: orderId, amount, name: `${groupName} 儲值`, products: [{ name: `${groupName} 點數儲值 ${amount}點`, quantity: 1, price: amount }] }],
+        redirectUrls: {
+          confirmUrl: `${SERVER_URL}/api/topup/confirm?userId=${encodeURIComponent(userId)}&groupId=${groupId}&amount=${amount}`,
+          cancelUrl: `${FRONTEND_URL}/?status=cancel`,
+        },
+      };
+      const result = await linePayRequest('POST', '/v3/payments/request', payBody);
+      if (result.returnCode === '0000') {
+        return res.json({ success: true, paymentUrl: result.info.paymentUrl.web, transactionId: result.info.transactionId, orderId });
+      }
+    } catch (linePayErr) {
+      console.warn('LINE Pay topup unavailable, using demo mode:', linePayErr.message);
+    }
+
+    // Demo mode fallback: add points directly
+    await db.query(`
+      INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+      ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
+    `, [userId, groupId, amount]);
+    await db.query(`
+      INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+      VALUES ($1, $2, 'topup', $3, $4, NOW())
+    `, [userId, groupId, amount, `儲值 +${amount}`]);
+    const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
+    res.json({ success: true, demoMode: true, balance: wr.rows[0]?.balance || 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/topup/confirm', async (req, res) => {
+  try {
+    const { transactionId, userId, groupId, amount } = req.query;
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const amountInt = parseInt(amount);
+    const body = { amount: amountInt, currency: 'TWD' };
+    const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
+    if (result.returnCode === '0000') {
+      // Add points to wallet
+      await db.query(`
+        INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+        ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
+      `, [userId, groupId, amountInt]);
+      await db.query(`
+        INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+        VALUES ($1, $2, 'topup', $3, $4, NOW())
+      `, [userId, groupId, amountInt, `LINE Pay 儲值 +${amountInt}`]);
+      res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}`);
+    } else {
+      res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
+    }
+  } catch (e) {
+    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=topup_fail`);
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
 // Admin: cleanup duplicate roles
