@@ -158,12 +158,8 @@ app.get('/api/user/profile', async (req, res) => {
         ORDER BY sg.name
       `, [lineUserId]);
       groups = gr.rows;
-      // If no groups yet and no entry group, return empty (user needs a group link)
-      if (groups.length === 0 && !entryGroupId) {
-        // Return all groups as fallback so the app still works
-        const allGr = await db.query('SELECT * FROM store_groups ORDER BY name');
-        groups = allGr.rows;
-      }
+      // If no groups yet and no entry group, return empty
+      // Consumer must enter via a group link to get associated
     }
 
     // Get stores for each group
