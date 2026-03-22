@@ -124,6 +124,12 @@ app.get('/api/user/profile', async (req, res) => {
     if (!lineUserId) return res.status(400).json({ error: 'userId required' });
 
     const member = await getOrCreateMember(lineUserId);
+    // Save profile data if provided
+    const { displayName, pictureUrl } = req.query;
+    if (displayName) {
+      await db.query(`UPDATE members SET display_name=$1, picture_url=$2, last_login=NOW() WHERE line_user_id=$3`,
+        [displayName, pictureUrl || '', lineUserId]).catch(() => {});
+    }
     // Auto-assign super_admin if this is the admin user
     const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
     if (lineUserId === SUPER_ADMIN_ID) {
@@ -528,16 +534,18 @@ app.get('/api/admin/consumers', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
     let query = `
-      SELECT w.line_user_id, w.group_id, w.balance, sg.name as group_name
+      SELECT w.line_user_id, w.group_id, w.balance, sg.name as group_name,
+        m.display_name, m.picture_url, m.created_at as registered_at, m.last_login
       FROM wallets w
       JOIN store_groups sg ON w.group_id = sg.id
+      LEFT JOIN members m ON w.line_user_id = m.line_user_id
       WHERE 1=1
     `;
     const params = [];
     let idx = 1;
     if (scopeGroupId) { query += ` AND w.group_id=$${idx++}`; params.push(scopeGroupId); }
-    if (search) { query += ` AND w.line_user_id ILIKE $${idx++}`; params.push(`%${search}%`); }
-    query += ' ORDER BY w.balance DESC LIMIT 50';
+    if (search) { query += ` AND (w.line_user_id ILIKE $${idx} OR m.display_name ILIKE $${idx})`; params.push(`%${search}%`); idx++; }
+    query += ' ORDER BY m.last_login DESC NULLS LAST, w.balance DESC LIMIT 50';
     const r = await db.query(query, params);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -825,6 +833,9 @@ async function initDB() {
   // Add group_id column to stores if not exists
   try {
     await db.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS group_id VARCHAR(20)`);
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS picture_url TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
