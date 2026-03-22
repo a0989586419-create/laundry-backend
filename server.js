@@ -120,10 +120,19 @@ async function getUserRole(lineUserId) {
 app.get('/api/user/profile', async (req, res) => {
   try {
     const lineUserId = req.query.userId;
+    const entryGroupId = req.query.groupId; // From URL param ?group=sg2
     if (!lineUserId) return res.status(400).json({ error: 'userId required' });
 
     const member = await getOrCreateMember(lineUserId);
     const roleInfo = await getUserRole(lineUserId);
+
+    // If consumer entered via a group link, auto-associate them
+    if (entryGroupId && roleInfo.role === 'consumer') {
+      await db.query(`
+        INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, 0)
+        ON CONFLICT (line_user_id, group_id) DO NOTHING
+      `, [lineUserId, entryGroupId]);
+    }
 
     // Get groups this user has access to
     let groups = [];
@@ -134,13 +143,19 @@ app.get('/api/user/profile', async (req, res) => {
       const gr = await db.query('SELECT * FROM store_groups WHERE id=$1', [roleInfo.groupId]);
       groups = gr.rows;
     } else {
-      // Consumer - get groups from their wallets (any group they've interacted with)
+      // Consumer - get only groups they have a wallet for
       const gr = await db.query(`
-        SELECT DISTINCT sg.* FROM store_groups sg
-        LEFT JOIN wallets w ON w.group_id = sg.id AND w.line_user_id = $1
+        SELECT sg.* FROM store_groups sg
+        INNER JOIN wallets w ON w.group_id = sg.id AND w.line_user_id = $1
         ORDER BY sg.name
       `, [lineUserId]);
       groups = gr.rows;
+      // If no groups yet and no entry group, return empty (user needs a group link)
+      if (groups.length === 0 && !entryGroupId) {
+        // Return all groups as fallback so the app still works
+        const allGr = await db.query('SELECT * FROM store_groups ORDER BY name');
+        groups = allGr.rows;
+      }
     }
 
     // Get stores for each group
