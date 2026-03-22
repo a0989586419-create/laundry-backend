@@ -533,21 +533,80 @@ app.get('/api/admin/consumers', async (req, res) => {
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    // Group by unique member, aggregate wallets
     let query = `
-      SELECT w.line_user_id, w.group_id, w.balance, sg.name as group_name,
-        m.display_name, m.picture_url, m.created_at as registered_at, m.last_login
-      FROM wallets w
-      JOIN store_groups sg ON w.group_id = sg.id
-      LEFT JOIN members m ON w.line_user_id = m.line_user_id
-      WHERE 1=1
+      SELECT m.line_user_id, m.display_name, m.picture_url, m.created_at as registered_at, m.last_login,
+        COALESCE(SUM(w.balance), 0) as total_balance,
+        COUNT(w.id) as group_count,
+        json_agg(json_build_object('group_id', w.group_id, 'group_name', sg.name, 'balance', w.balance)) as wallets
+      FROM members m
+      LEFT JOIN wallets w ON w.line_user_id = m.line_user_id
+      LEFT JOIN store_groups sg ON w.group_id = sg.id
+      WHERE w.id IS NOT NULL
     `;
     const params = [];
     let idx = 1;
     if (scopeGroupId) { query += ` AND w.group_id=$${idx++}`; params.push(scopeGroupId); }
-    if (search) { query += ` AND (w.line_user_id ILIKE $${idx} OR m.display_name ILIKE $${idx})`; params.push(`%${search}%`); idx++; }
-    query += ' ORDER BY m.last_login DESC NULLS LAST, w.balance DESC LIMIT 50';
+    if (search) { query += ` AND (m.line_user_id ILIKE $${idx} OR m.display_name ILIKE $${idx})`; params.push(`%${search}%`); idx++; }
+    query += ' GROUP BY m.line_user_id, m.display_name, m.picture_url, m.created_at, m.last_login';
+    query += ' ORDER BY m.last_login DESC NULLS LAST LIMIT 50';
     const r = await db.query(query, params);
     res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get a specific consumer's detail with transaction history
+app.get('/api/admin/consumer/:lineUserId', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const targetId = req.params.lineUserId;
+
+    // Member info
+    const memberR = await db.query('SELECT * FROM members WHERE line_user_id=$1', [targetId]);
+    const member = memberR.rows[0] || {};
+
+    // Wallets
+    const walletsR = await db.query(`
+      SELECT w.group_id, w.balance, sg.name as group_name
+      FROM wallets w JOIN store_groups sg ON w.group_id = sg.id
+      WHERE w.line_user_id=$1 ORDER BY sg.name
+    `, [targetId]);
+
+    // Transactions
+    let txQuery = 'SELECT t.*, sg.name as group_name FROM transactions t LEFT JOIN store_groups sg ON t.group_id = sg.id WHERE t.line_user_id=$1';
+    const txParams = [targetId];
+    if (roleInfo.role === 'store_admin') {
+      txQuery += ' AND t.group_id=$2';
+      txParams.push(roleInfo.groupId);
+    }
+    txQuery += ' ORDER BY t.created_at DESC LIMIT 50';
+    const txR = await db.query(txQuery, txParams);
+
+    // Orders
+    let orderQuery = `
+      SELECT o.*, s.name as store_name, m2.name as machine_name
+      FROM orders o
+      JOIN members mb ON o.member_id = mb.id
+      JOIN stores s ON o.store_id = s.id
+      JOIN machines m2 ON o.machine_id = m2.id
+      WHERE mb.line_user_id=$1
+    `;
+    const orderParams = [targetId];
+    if (roleInfo.role === 'store_admin') {
+      orderQuery += ' AND s.group_id=$2';
+      orderParams.push(roleInfo.groupId);
+    }
+    orderQuery += ' ORDER BY o.created_at DESC LIMIT 30';
+    const orderR = await db.query(orderQuery, orderParams);
+
+    res.json({
+      member: { lineUserId: targetId, displayName: member.display_name, pictureUrl: member.picture_url, registeredAt: member.created_at, lastLogin: member.last_login },
+      wallets: walletsR.rows,
+      transactions: txR.rows,
+      orders: orderR.rows,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
