@@ -346,12 +346,15 @@ app.get('/api/admin/dashboard', async (req, res) => {
       SELECT m.id, m.store_id, m.name, m.size, s.name as store_name,
         CASE
           WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
-          ELSE COALESCE(cs.state, 'unknown')
+          WHEN cs.state = 'running' THEN 'running'
+          WHEN cs.state IS NULL OR cs.state = 'unknown' THEN 'idle'
+          ELSE cs.state
         END as state,
         CASE
           WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
           ELSE 0
-        END as remain_sec
+        END as remain_sec,
+        cs.updated_at as last_seen
       FROM machines m
       JOIN stores s ON m.store_id = s.id
       LEFT JOIN machine_current_state cs ON m.id = cs.machine_id
@@ -441,6 +444,106 @@ app.delete('/api/admin/users/:id', async (req, res) => {
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query('DELETE FROM user_roles WHERE id=$1', [req.params.id]);
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin Store Topup Management
+// ═══════════════════════════════════════
+// Get topup overview per group
+app.get('/api/admin/topup-overview', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : null;
+    let query = `
+      SELECT sg.id, sg.name, sg.type, sg.phone,
+        COALESCE(sg.topup_enabled, true) as topup_enabled,
+        COALESCE(w.total_balance, 0) as total_balance,
+        COALESCE(w.consumer_count, 0) as consumer_count,
+        COALESCE(t.total_topup, 0) as total_topup,
+        COALESCE(t.total_spent, 0) as total_spent
+      FROM store_groups sg
+      LEFT JOIN (
+        SELECT group_id, SUM(balance) as total_balance, COUNT(DISTINCT line_user_id) as consumer_count
+        FROM wallets GROUP BY group_id
+      ) w ON w.group_id = sg.id
+      LEFT JOIN (
+        SELECT group_id,
+          COALESCE(SUM(CASE WHEN type='topup' THEN amount ELSE 0 END), 0) as total_topup,
+          COALESCE(SUM(CASE WHEN type='payment' THEN ABS(amount) ELSE 0 END), 0) as total_spent
+        FROM transactions GROUP BY group_id
+      ) t ON t.group_id = sg.id
+    `;
+    if (scopeGroupId) query += ` WHERE sg.id = '${scopeGroupId}'`;
+    query += ' ORDER BY sg.name';
+    const r = await db.query(query);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Toggle topup enabled/disabled for a group
+app.post('/api/admin/topup-toggle', async (req, res) => {
+  try {
+    const { userId, groupId, enabled } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
+    // Add topup_enabled column if not exists
+    await db.query('ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true').catch(() => {});
+    await db.query('UPDATE store_groups SET topup_enabled=$1 WHERE id=$2', [enabled, groupId]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Manual topup/deduct for a consumer
+app.post('/api/admin/manual-topup', async (req, res) => {
+  try {
+    const { userId, targetUserId, groupId, amount, description } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    if (roleInfo.role === 'store_admin' && roleInfo.groupId !== groupId) return res.status(403).json({ error: 'not your group' });
+    if (!targetUserId || !groupId || !amount) return res.status(400).json({ error: 'missing params' });
+
+    // Upsert wallet
+    await db.query(`
+      INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+      ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = GREATEST(0, wallets.balance + $3)
+    `, [targetUserId, groupId, parseInt(amount)]);
+
+    // Record transaction
+    const type = parseInt(amount) > 0 ? 'topup' : 'adjustment';
+    await db.query(`
+      INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+    `, [targetUserId, groupId, type, parseInt(amount), description || `管理員${parseInt(amount) > 0 ? '儲值' : '扣點'}`]);
+
+    const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [targetUserId, groupId]);
+    res.json({ success: true, balance: r.rows[0]?.balance || 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Search consumers
+app.get('/api/admin/consumers', async (req, res) => {
+  try {
+    const { userId, groupId, search } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    let query = `
+      SELECT w.line_user_id, w.group_id, w.balance, sg.name as group_name
+      FROM wallets w
+      JOIN store_groups sg ON w.group_id = sg.id
+      WHERE 1=1
+    `;
+    const params = [];
+    let idx = 1;
+    if (scopeGroupId) { query += ` AND w.group_id=$${idx++}`; params.push(scopeGroupId); }
+    if (search) { query += ` AND w.line_user_id ILIKE $${idx++}`; params.push(`%${search}%`); }
+    query += ' ORDER BY w.balance DESC LIMIT 50';
+    const r = await db.query(query, params);
+    res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -726,6 +829,7 @@ async function initDB() {
   // Add group_id column to stores if not exists
   try {
     await db.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS group_id VARCHAR(20)`);
+    await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
