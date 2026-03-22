@@ -400,6 +400,51 @@ app.get('/api/admin/dashboard', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: Admin User Management (super_admin only)
+// ═══════════════════════════════════════
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
+    const r = await db.query(`
+      SELECT ur.id, ur.line_user_id, ur.role, ur.group_id, sg.name as group_name,
+        m.line_user_id as member_uid
+      FROM user_roles ur
+      LEFT JOIN store_groups sg ON ur.group_id = sg.id
+      LEFT JOIN members m ON ur.line_user_id = m.line_user_id
+      ORDER BY ur.role DESC, sg.name
+    `);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/users', async (req, res) => {
+  try {
+    const { userId, targetUserId, role, groupId } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
+    if (!targetUserId || !role) return res.status(400).json({ error: 'targetUserId and role required' });
+    const gid = role === 'super_admin' ? null : (groupId || null);
+    await db.query(`
+      INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, $3)
+      ON CONFLICT (line_user_id, role, group_id) DO NOTHING
+    `, [targetUserId, role, gid]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/users/:id', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
+    await db.query('DELETE FROM user_roles WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
 //  API: Machines (existing, enhanced)
 // ═══════════════════════════════════════
 app.get('/api/machines/:storeId', async (req, res) => {
