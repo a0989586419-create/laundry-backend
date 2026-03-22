@@ -567,7 +567,7 @@ async function initDB() {
 
   // Seed super admin (your LINE userId — update this with your actual LINE userId)
   // You can find it in the LIFF profile. For now we seed a placeholder.
-  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ua8c4cf5b7e19281a62b0f2a4d1f7e9c3';
+  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
   await db.query(`
     INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, 'super_admin', NULL)
     ON CONFLICT (line_user_id, role, group_id) DO NOTHING
