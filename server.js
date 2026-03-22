@@ -617,7 +617,7 @@ app.post('/api/payment/request', async (req, res) => {
       packages: [{ id: orderId, amount, name: orderName || '雲管家洗衣服務', products: [{ name: orderName || '洗衣服務', quantity: 1, price: amount }] }],
       redirectUrls: {
         confirmUrl: `${SERVER_URL}/api/payment/confirm`,
-        cancelUrl: `${FRONTEND_URL}/payment-result?status=cancel&orderId=${orderId}`,
+        cancelUrl: `${FRONTEND_URL}/?status=cancel&orderId=${orderId}`,
       },
     };
     const result = await linePayRequest('POST', '/v3/payments/request', body);
@@ -635,7 +635,7 @@ app.get('/api/payment/confirm', async (req, res) => {
     const { transactionId, orderId } = req.query;
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
     const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
-    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/payment-result?status=error&msg=order_not_found`);
+    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=error&msg=order_not_found`);
     const order = orderResult.rows[0];
     const body = { amount: order.total_amount, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
@@ -648,19 +648,19 @@ app.get('/api/payment/confirm', async (req, res) => {
         ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
       `, [order.machine_id, order.duration_sec || 3600]);
       publishStartCommand(order);
-      res.redirect(`${FRONTEND_URL}/payment-result?status=success&orderId=${orderId}`);
+      res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}`);
     } else {
-      res.redirect(`${FRONTEND_URL}/payment-result?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
+      res.redirect(`${FRONTEND_URL}/?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
     }
   } catch (e) {
-    res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=error&msg=${encodeURIComponent(e.message)}`);
+    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=error&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/api/payment/cancel', async (req, res) => {
   const { orderId } = req.query;
   if (orderId) await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
-  res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=cancel&orderId=${orderId || ''}`);
+  res.redirect(`https://laundry-frontend-chi.vercel.app/?status=cancel&orderId=${orderId || ''}`);
 });
 
 // ═══════════════════════════════════════
@@ -706,7 +706,7 @@ app.post('/api/payment/create', async (req, res) => {
         packages: [{ id: orderId, amount, name: orderName, products: [{ name: orderName, quantity: 1, price: amount }] }],
         redirectUrls: {
           confirmUrl: `${SERVER_URL}/api/payment/confirm`,
-          cancelUrl: `${FRONTEND_URL}/payment-result?status=cancel&orderId=${orderId}`,
+          cancelUrl: `${FRONTEND_URL}/?status=cancel&orderId=${orderId}`,
         },
       };
       const result = await linePayRequest('POST', '/v3/payments/request', payBody);
