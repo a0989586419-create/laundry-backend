@@ -124,6 +124,14 @@ app.get('/api/user/profile', async (req, res) => {
     if (!lineUserId) return res.status(400).json({ error: 'userId required' });
 
     const member = await getOrCreateMember(lineUserId);
+    // Auto-assign super_admin if this is the admin user
+    const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+    if (lineUserId === SUPER_ADMIN_ID) {
+      await db.query(`
+        INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, 'super_admin', NULL)
+        ON CONFLICT (line_user_id, role, group_id) DO NOTHING
+      `, [lineUserId]);
+    }
     const roleInfo = await getUserRole(lineUserId);
 
     // If consumer entered via a group link, auto-associate them
@@ -333,10 +341,17 @@ app.get('/api/admin/dashboard', async (req, res) => {
     `;
     const revenue = (await db.query(revenueQuery, params)).rows[0];
 
-    // Machine status
+    // Machine status (calculate remaining time based on elapsed since last update)
     const machineQuery = `
       SELECT m.id, m.store_id, m.name, m.size, s.name as store_name,
-        COALESCE(cs.state, 'unknown') as state, COALESCE(cs.remain_sec, 0) as remain_sec
+        CASE
+          WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
+          ELSE COALESCE(cs.state, 'unknown')
+        END as state,
+        CASE
+          WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
+          ELSE 0
+        END as remain_sec
       FROM machines m
       JOIN stores s ON m.store_id = s.id
       LEFT JOIN machine_current_state cs ON m.id = cs.machine_id
@@ -389,8 +404,16 @@ app.get('/api/admin/dashboard', async (req, res) => {
 // ═══════════════════════════════════════
 app.get('/api/machines/:storeId', async (req, res) => {
   const r = await db.query(`
-    SELECT m.*, COALESCE(cs.state,'unknown') as state,
-    COALESCE(cs.remain_sec,0) as remain_sec, COALESCE(cs.progress,0) as progress,
+    SELECT m.*,
+    CASE
+      WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
+      ELSE COALESCE(cs.state,'unknown')
+    END as state,
+    CASE
+      WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
+      ELSE 0
+    END as remain_sec,
+    COALESCE(cs.progress,0) as progress,
     cs.updated_at as last_seen
     FROM machines m LEFT JOIN machine_current_state cs ON m.id=cs.machine_id
     WHERE m.store_id=$1 AND m.active=true ORDER BY m.sort_order,m.name
@@ -470,6 +493,12 @@ app.get('/api/payment/confirm', async (req, res) => {
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
     if (result.returnCode === '0000') {
       await db.query(`UPDATE orders SET status='paid', paid_at=NOW() WHERE id=$1`, [orderId]);
+      // Update machine state in DB
+      await db.query(`
+        INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+        VALUES ($1, 'running', $2, 0, NOW())
+        ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
+      `, [order.machine_id, order.duration_sec || 3600]);
       publishStartCommand(order);
       res.redirect(`${FRONTEND_URL}/payment-result?status=success&orderId=${orderId}`);
     } else {
@@ -484,6 +513,105 @@ app.get('/api/payment/cancel', async (req, res) => {
   const { orderId } = req.query;
   if (orderId) await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
   res.redirect(`https://laundry-frontend-chi.vercel.app/payment-result?status=cancel&orderId=${orderId || ''}`);
+});
+
+// ═══════════════════════════════════════
+//  API: Unified Payment Create (frontend calls this)
+// ═══════════════════════════════════════
+app.post('/api/payment/create', async (req, res) => {
+  try {
+    const { userId, storeId, machineId, machineNum, mode, amount, minutes, dryTemp, couponId } = req.body;
+    if (!userId || !storeId || !machineId || !amount) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    // Create member if not exists
+    let member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [userId])).rows[0];
+    if (!member) {
+      const id = uuid();
+      await db.query('INSERT INTO members (id,line_user_id,created_at) VALUES ($1,$2,NOW())', [id, userId]);
+      member = { id };
+    }
+
+    // Create order
+    const orderId = 'ORD' + Date.now();
+    const pulses = Math.ceil(amount / 10);
+    const modeDur = { standard: 65, small: 50, washonly: 35, soft: 65, strong: 75, dryonly: 40, dryextend: 0 };
+    const baseDur = modeDur[mode] || 0;
+    const durationSec = (baseDur + (minutes || 0)) * 60;
+
+    await db.query(
+      `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
+       VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending',NOW())`,
+      [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', amount, pulses, durationSec]
+    );
+
+    // Try LINE Pay
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    try {
+      const storeName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || '洗衣服務';
+      const machineName = machineId.includes('-d') ? `烘乾${machineNum}號` : `洗脫烘${machineNum}號(${mode})`;
+      const orderName = `${storeName} - ${machineName}`;
+      const payBody = {
+        amount, currency: 'TWD', orderId,
+        packages: [{ id: orderId, amount, name: orderName, products: [{ name: orderName, quantity: 1, price: amount }] }],
+        redirectUrls: {
+          confirmUrl: `${SERVER_URL}/api/payment/confirm`,
+          cancelUrl: `${FRONTEND_URL}/payment-result?status=cancel&orderId=${orderId}`,
+        },
+      };
+      const result = await linePayRequest('POST', '/v3/payments/request', payBody);
+      if (result.returnCode === '0000') {
+        await db.query(`UPDATE orders SET status='waiting_payment' WHERE id=$1`, [orderId]);
+        return res.json({ success: true, paymentUrl: result.info.paymentUrl.web, transactionId: result.info.transactionId, orderId });
+      }
+    } catch (linePayErr) {
+      console.warn('LINE Pay unavailable, using demo mode:', linePayErr.message);
+    }
+
+    // Demo mode: LINE Pay unavailable, complete payment directly
+    await db.query(`UPDATE orders SET status='paid', paid_at=NOW() WHERE id=$1`, [orderId]);
+
+    // Update machine_current_state in DB so admin dashboard can see it
+    const totalSec = durationSec || (minutes || 0) * 60;
+    await db.query(`
+      INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+      VALUES ($1, 'running', $2, 0, NOW())
+      ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
+    `, [machineId, totalSec]);
+
+    // Record transaction
+    const store = (await db.query('SELECT group_id FROM stores WHERE id=$1', [storeId])).rows[0];
+    if (store?.group_id) {
+      await db.query(`
+        INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+        VALUES ($1, $2, 'payment', $3, $4, NOW())
+      `, [userId, store.group_id, -amount, `${storeId} - ${mode}`]);
+    }
+
+    // Try MQTT start command
+    try { publishStartCommand({ id: orderId, store_id: storeId, machine_id: machineId, mode, temp: dryTemp || 'high', total_amount: amount }); } catch (e) {}
+
+    res.json({ success: true, orderId, demoMode: true });
+  } catch (e) {
+    console.error('payment/create error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// API: Report machine state from frontend (for cross-user visibility)
+app.post('/api/machines/state', async (req, res) => {
+  try {
+    const { machineId, state, remainSec } = req.body;
+    if (!machineId) return res.status(400).json({ error: 'machineId required' });
+    await db.query(`
+      INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+      VALUES ($1, $2, $3, 0, NOW())
+      ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
+    `, [machineId, state || 'running', remainSec || 0]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
