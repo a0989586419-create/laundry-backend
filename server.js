@@ -127,10 +127,10 @@ app.get('/api/user/profile', async (req, res) => {
     // Auto-assign super_admin if this is the admin user
     const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
     if (lineUserId === SUPER_ADMIN_ID) {
-      await db.query(`
-        INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, 'super_admin', NULL)
-        ON CONFLICT (line_user_id, role, group_id) DO NOTHING
-      `, [lineUserId]);
+      const chk = await db.query('SELECT id FROM user_roles WHERE line_user_id=$1 AND role=$2 AND group_id IS NULL', [lineUserId, 'super_admin']);
+      if (chk.rows.length === 0) {
+        await db.query('INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, NULL)', [lineUserId, 'super_admin']);
+      }
     }
     const roleInfo = await getUserRole(lineUserId);
 
@@ -661,6 +661,21 @@ app.post('/api/machines/state', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
+// Admin: cleanup duplicate roles
+app.post('/api/admin/cleanup', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
+    const result = await db.query(`
+      DELETE FROM user_roles WHERE id NOT IN (
+        SELECT MIN(id) FROM user_roles GROUP BY line_user_id, role, COALESCE(group_id, '__NULL__')
+      )
+    `);
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ═══════════════════════════════════════
 //  Database Initialization
 // ═══════════════════════════════════════
@@ -753,13 +768,25 @@ async function initDB() {
     }
   }
 
-  // Seed super admin (your LINE userId — update this with your actual LINE userId)
-  // You can find it in the LIFF profile. For now we seed a placeholder.
-  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+  // Create unique index that handles NULL group_id properly
   await db.query(`
-    INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, 'super_admin', NULL)
-    ON CONFLICT (line_user_id, role, group_id) DO NOTHING
-  `, [SUPER_ADMIN_LINE_ID]);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_roles_unique
+    ON user_roles (line_user_id, role, COALESCE(group_id, '__NULL__'))
+  `).catch(() => {});
+
+  // Clean up duplicate super_admin entries
+  await db.query(`
+    DELETE FROM user_roles WHERE id NOT IN (
+      SELECT MIN(id) FROM user_roles GROUP BY line_user_id, role, COALESCE(group_id, '__NULL__')
+    )
+  `).catch(() => {});
+
+  // Seed super admin
+  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+  const existing = await db.query('SELECT id FROM user_roles WHERE line_user_id=$1 AND role=$2 AND group_id IS NULL', [SUPER_ADMIN_LINE_ID, 'super_admin']);
+  if (existing.rows.length === 0) {
+    await db.query('INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, NULL)', [SUPER_ADMIN_LINE_ID, 'super_admin']);
+  }
 
   console.log('DB initialized with multi-tenant tables');
 }
