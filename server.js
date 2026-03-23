@@ -1127,19 +1127,26 @@ app.get('/api/coupons/mine', async (req, res) => {
 // ═══════════════════════════════════════
 app.get('/api/admin/revenue-chart', async (req, res) => {
   try {
-    const { userId, days, groupId } = req.query;
+    const { userId, days, groupId, startDate, endDate } = req.query;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
-    const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
-    const params = [numDays];
+    const params = [];
+    let dateFilter;
+    if (startDate && endDate) {
+      params.push(startDate, endDate);
+      dateFilter = `o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')`;
+    } else {
+      const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+      params.push(numDays);
+      dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    }
     let query = `
       SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
       FROM orders o JOIN stores s ON o.store_id = s.id
-      WHERE o.status IN ('paid','done','running','completed')
-      AND o.created_at >= CURRENT_DATE - make_interval(days => $1)
+      WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { query += ` AND s.group_id = $2`; params.push(scopeGroupId); }
+    if (scopeGroupId) { params.push(scopeGroupId); query += ` AND s.group_id = $${params.length}`; }
     query += ' GROUP BY DATE(o.created_at) ORDER BY date';
     const r = await db.query(query, params);
     res.json(r.rows);
@@ -1149,23 +1156,29 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
 // Revenue CSV export with store breakdown
 app.get('/api/admin/revenue-export', async (req, res) => {
   try {
-    const { userId, days, groupId } = req.query;
+    const { userId, days, groupId, startDate, endDate } = req.query;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
-    const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
-    const params = [numDays];
+    const params = [];
+    let dateFilter;
+    if (startDate && endDate) {
+      params.push(startDate, endDate);
+      dateFilter = `o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')`;
+    } else {
+      const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+      params.push(numDays);
+      dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    }
     let query = `
       SELECT DATE(o.created_at) as date, s.name as store_name,
         COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
       FROM orders o JOIN stores s ON o.store_id = s.id
-      WHERE o.status IN ('paid','done','running','completed')
-      AND o.created_at >= CURRENT_DATE - make_interval(days => $1)
+      WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { query += ` AND s.group_id = $2`; params.push(scopeGroupId); }
+    if (scopeGroupId) { params.push(scopeGroupId); query += ` AND s.group_id = $${params.length}`; }
     query += ' GROUP BY DATE(o.created_at), s.name ORDER BY date, s.name';
     const r = await db.query(query, params);
-    // Build CSV with BOM for Excel
     const BOM = '\uFEFF';
     let csv = BOM + '日期,店舖名稱,交易筆數,總金額\n';
     r.rows.forEach(row => {
