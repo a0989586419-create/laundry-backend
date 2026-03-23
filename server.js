@@ -981,6 +981,148 @@ app.delete('/api/admin/coupons/:id', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: Public Coupons (user-facing)
+// ═══════════════════════════════════════
+
+// List available coupons for purchase (no admin required)
+app.get('/api/coupons', async (req, res) => {
+  try {
+    const { groupId } = req.query;
+    let query = `SELECT c.*, sg.name as group_name FROM admin_coupons c
+      LEFT JOIN store_groups sg ON c.group_id = sg.id
+      WHERE c.active = true AND c.expiry >= CURRENT_DATE`;
+    const params = [];
+    if (groupId) { query += ` AND (c.group_id = $1 OR c.group_id IS NULL)`; params.push(groupId); }
+    query += ' ORDER BY c.category, c.created_at DESC';
+    const r = await db.query(query, params);
+    // Auto-generate description template for each coupon
+    const coupons = r.rows.map(c => {
+      const autoDesc = c.type === 'fixed'
+        ? `當實付點數達到${c.min_spend || 0}點，可使用該卷抵扣${c.discount}點`
+        : `該卷將全額抵扣應付點數`;
+      return {
+        id: String(c.id),
+        name: c.name,
+        discount: c.type === 'fixed' ? `${Math.round((1 - c.price / (c.price + c.discount * (c.max_uses || 1))) * 100)}%OFF` : `${c.discount}%OFF`,
+        price: c.price || 0,
+        originalPrice: c.type === 'fixed' ? (c.price || 0) + (c.discount * (c.max_uses || 1)) : Math.round((c.price || 0) / (1 - c.discount / 100)),
+        type: c.type === 'fixed' ? '滿減卷' : '折扣券',
+        desc: c.description || autoDesc,
+        timeSlot: c.time_slot || '全時段可用',
+        device: c.device_limit ? `${c.device_limit}，共可用${c.max_uses || 0}次` : `全機型適用，共可用${c.max_uses || 0}次`,
+        validity: c.validity || '自購買起90日內有效',
+        stores: c.store_scope ? `雲管家洗衣【${c.store_scope}】` : '雲管家洗衣【全台直營門市】',
+        usage: '於會員系統中使用『店內付款』功能，選擇該優惠卷，系統將自動扣抵點數',
+        purchaseLimit: '不限制購買次數',
+        category: c.category || 'gift',
+        groupId: c.group_id,
+        groupName: c.group_name,
+        // Raw fields for frontend use
+        rawDiscount: c.discount,
+        rawType: c.type,
+        minSpend: c.min_spend || 0,
+        maxUses: c.max_uses || 0,
+        expiry: c.expiry,
+      };
+    });
+    res.json(coupons);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Purchase a coupon (deducts points, creates user_coupon)
+app.post('/api/coupons/purchase', async (req, res) => {
+  try {
+    const { userId, couponId, groupId } = req.body;
+    if (!userId || !couponId) return res.status(400).json({ error: 'userId and couponId required' });
+    // Verify coupon exists and is active
+    const couponRes = await db.query('SELECT * FROM admin_coupons WHERE id=$1 AND active=true AND expiry >= CURRENT_DATE', [couponId]);
+    if (couponRes.rows.length === 0) return res.status(404).json({ error: 'Coupon not found or expired' });
+    const coupon = couponRes.rows[0];
+    const price = coupon.price || 0;
+    const effectiveGroupId = groupId || coupon.group_id;
+    // Check wallet balance
+    if (price > 0 && effectiveGroupId) {
+      const walletRes = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
+      const balance = walletRes.rows[0]?.balance || 0;
+      if (balance < price) return res.status(400).json({ error: 'Insufficient balance', balance, required: price });
+      // Deduct points
+      await db.query('UPDATE wallets SET balance = balance - $1 WHERE line_user_id=$2 AND group_id=$3', [price, userId, effectiveGroupId]);
+      // Record transaction
+      await db.query('INSERT INTO transactions (line_user_id, group_id, type, amount, description) VALUES ($1,$2,$3,$4,$5)',
+        [userId, effectiveGroupId, 'payment', -price, `購買優惠券: ${coupon.name}`]);
+    }
+    // Calculate expiry date from validity
+    let expiryDate = coupon.expiry;
+    const validityMatch = (coupon.validity || '').match(/(\d+)日/);
+    if (validityMatch) {
+      const days = parseInt(validityMatch[1]);
+      expiryDate = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
+    }
+    // Insert user_coupon
+    const ucRes = await db.query(`
+      INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
+      VALUES ($1, $2, $3, $4, $5, 'active') RETURNING id
+    `, [userId, couponId, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
+    res.json({ success: true, userCouponId: ucRes.rows[0].id, newBalance: price > 0 ? undefined : undefined });
+    // Return new balance if deducted
+    if (price > 0 && effectiveGroupId) {
+      const newBal = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
+      // Note: response already sent, but frontend can re-fetch
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get user's owned coupons
+app.get('/api/coupons/mine', async (req, res) => {
+  try {
+    const { userId, groupId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    let query = `
+      SELECT uc.id as user_coupon_id, uc.uses_remaining, uc.expiry_date, uc.status, uc.purchased_at,
+        c.name, c.discount, c.type, c.min_spend, c.description, c.time_slot, c.device_limit,
+        c.validity, c.store_scope, c.max_uses, c.category, c.group_id,
+        sg.name as group_name
+      FROM user_coupons uc
+      JOIN admin_coupons c ON uc.coupon_id = c.id
+      LEFT JOIN store_groups sg ON uc.group_id = sg.id
+      WHERE uc.line_user_id = $1
+    `;
+    const params = [userId];
+    if (groupId) { query += ` AND (uc.group_id = $2 OR uc.group_id IS NULL)`; params.push(groupId); }
+    query += ' ORDER BY uc.purchased_at DESC';
+    const r = await db.query(query, params);
+    const coupons = r.rows.map(c => {
+      const isExpired = new Date(c.expiry_date) < new Date();
+      const isUsedUp = c.uses_remaining <= 0;
+      return {
+        id: `uc-${c.user_coupon_id}`,
+        userCouponId: c.user_coupon_id,
+        name: c.name,
+        discount: c.discount,
+        type: c.type,
+        minSpend: c.min_spend || 0,
+        expiry: c.expiry_date ? new Date(c.expiry_date).toISOString().split('T')[0] : '',
+        used: isUsedUp,
+        category: c.category || 'coupon',
+        usesRemaining: c.uses_remaining,
+        maxUses: c.max_uses,
+        desc: c.description || (c.type === 'fixed'
+          ? `當實付點數達到${c.min_spend || 0}點，可使用該卷抵扣${c.discount}點`
+          : `該卷將全額抵扣應付點數`),
+        timeSlot: c.time_slot || '全時段可用',
+        deviceLimit: c.device_limit || '全機型適用',
+        validity: c.validity || '自購買起90日內有效',
+        storeScope: c.store_scope || '全台門市',
+        status: isExpired ? 'expired' : isUsedUp ? 'used' : 'active',
+        groupName: c.group_name,
+        purchasedAt: c.purchased_at,
+      };
+    });
+    res.json(coupons);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
 //  API: Revenue Chart
 // ═══════════════════════════════════════
 app.get('/api/admin/revenue-chart', async (req, res) => {
@@ -989,17 +1131,51 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
-    const numDays = parseInt(days) || 7;
+    const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+    const params = [numDays];
     let query = `
       SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed')
-      AND o.created_at >= CURRENT_DATE - INTERVAL '${numDays} days'
+      AND o.created_at >= CURRENT_DATE - make_interval(days => $1)
     `;
-    if (scopeGroupId) query += ` AND s.group_id = '${scopeGroupId}'`;
+    if (scopeGroupId) { query += ` AND s.group_id = $2`; params.push(scopeGroupId); }
     query += ' GROUP BY DATE(o.created_at) ORDER BY date';
-    const r = await db.query(query);
+    const r = await db.query(query, params);
     res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Revenue CSV export with store breakdown
+app.get('/api/admin/revenue-export', async (req, res) => {
+  try {
+    const { userId, days, groupId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+    const params = [numDays];
+    let query = `
+      SELECT DATE(o.created_at) as date, s.name as store_name,
+        COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
+      FROM orders o JOIN stores s ON o.store_id = s.id
+      WHERE o.status IN ('paid','done','running','completed')
+      AND o.created_at >= CURRENT_DATE - make_interval(days => $1)
+    `;
+    if (scopeGroupId) { query += ` AND s.group_id = $2`; params.push(scopeGroupId); }
+    query += ' GROUP BY DATE(o.created_at), s.name ORDER BY date, s.name';
+    const r = await db.query(query, params);
+    // Build CSV with BOM for Excel
+    const BOM = '\uFEFF';
+    let csv = BOM + '日期,店舖名稱,交易筆數,總金額\n';
+    r.rows.forEach(row => {
+      const date = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
+      csv += `${date},"${row.store_name}",${row.orders},${row.revenue}\n`;
+    });
+    const today = new Date().toISOString().split('T')[0];
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="revenue-report-${today}.csv"`);
+    res.send(csv);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1097,6 +1273,19 @@ async function initDB() {
         max_uses INT DEFAULT 0,
         category VARCHAR(20) DEFAULT 'gift',
         created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    // User coupons table (tracks purchased coupons per user)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS user_coupons (
+        id SERIAL PRIMARY KEY,
+        line_user_id VARCHAR(100) NOT NULL,
+        coupon_id INT REFERENCES admin_coupons(id) ON DELETE CASCADE,
+        group_id VARCHAR(20),
+        uses_remaining INT DEFAULT 0,
+        expiry_date DATE,
+        status VARCHAR(20) DEFAULT 'active',
+        purchased_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
     // Add new coupon columns if not exist
