@@ -409,32 +409,41 @@ app.get('/api/admin/dashboard', async (req, res) => {
 // ═══════════════════════════════════════
 app.get('/api/admin/users', async (req, res) => {
   try {
-    const { userId } = req.query;
+    const { userId, search } = req.query;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
-    const r = await db.query(`
+    let query = `
       SELECT ur.id, ur.line_user_id, ur.role, ur.group_id, sg.name as group_name,
-        m.line_user_id as member_uid
+        ur.display_name, ur.phone, ur.notes, m.picture_url
       FROM user_roles ur
       LEFT JOIN store_groups sg ON ur.group_id = sg.id
       LEFT JOIN members m ON ur.line_user_id = m.line_user_id
-      ORDER BY ur.role DESC, sg.name
-    `);
+      WHERE 1=1
+    `;
+    const params = [];
+    if (search) {
+      query += ` AND (ur.line_user_id ILIKE $1 OR ur.display_name ILIKE $1 OR ur.phone ILIKE $1)`;
+      params.push(`%${search}%`);
+    }
+    query += ' ORDER BY ur.role DESC, sg.name';
+    const r = await db.query(query, params);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/admin/users', async (req, res) => {
   try {
-    const { userId, targetUserId, role, groupId } = req.body;
+    const { userId, targetUserId, role, groupId, displayName, phone, notes } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
     if (!targetUserId || !role) return res.status(400).json({ error: 'targetUserId and role required' });
     const gid = role === 'super_admin' ? null : (groupId || null);
     await db.query(`
-      INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, $3)
-      ON CONFLICT (line_user_id, role, group_id) DO NOTHING
-    `, [targetUserId, role, gid]);
+      INSERT INTO user_roles (line_user_id, role, group_id, display_name, phone, notes)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (line_user_id, role, COALESCE(group_id, '__NULL__')) DO UPDATE
+      SET display_name=COALESCE($4, user_roles.display_name), phone=COALESCE($5, user_roles.phone), notes=COALESCE($6, user_roles.notes)
+    `, [targetUserId, role, gid, displayName || null, phone || null, notes || null]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -896,6 +905,102 @@ app.get('/api/topup/confirm', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════
+//  API: Admin Machine Control
+// ═══════════════════════════════════════
+app.post('/api/admin/machine/control', async (req, res) => {
+  try {
+    const { userId, machineId, action, durationMin } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const state = action === 'start' ? 'running' : 'idle';
+    const remainSec = action === 'start' ? (durationMin || 60) * 60 : 0;
+    await db.query(`
+      INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+      VALUES ($1, $2, $3, 0, NOW())
+      ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
+    `, [machineId, state, remainSec]);
+    res.json({ success: true, state, remainSec });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin Coupons CRUD
+// ═══════════════════════════════════════
+app.get('/api/admin/coupons', async (req, res) => {
+  try {
+    const { userId, groupId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    let query = 'SELECT c.*, sg.name as group_name FROM admin_coupons c LEFT JOIN store_groups sg ON c.group_id = sg.id WHERE 1=1';
+    const params = [];
+    if (scopeGroupId) { query += ' AND c.group_id=$1'; params.push(scopeGroupId); }
+    query += ' ORDER BY c.created_at DESC';
+    const r = await db.query(query, params);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/coupons', async (req, res) => {
+  try {
+    const { userId, groupId, name, discount, type, minSpend, expiry } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    await db.query(`
+      INSERT INTO admin_coupons (group_id, name, discount, type, min_spend, expiry, active, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
+    `, [groupId || null, name, discount, type || 'fixed', minSpend || 0, expiry || '2026-12-31']);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/coupons/:id', async (req, res) => {
+  try {
+    const { userId, name, discount, type, minSpend, expiry, active } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    await db.query(`
+      UPDATE admin_coupons SET name=COALESCE($2,name), discount=COALESCE($3,discount), type=COALESCE($4,type),
+      min_spend=COALESCE($5,min_spend), expiry=COALESCE($6,expiry), active=COALESCE($7,active) WHERE id=$1
+    `, [req.params.id, name, discount, type, minSpend, expiry, active]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/coupons/:id', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    await db.query('DELETE FROM admin_coupons WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Revenue Chart
+// ═══════════════════════════════════════
+app.get('/api/admin/revenue-chart', async (req, res) => {
+  try {
+    const { userId, days, groupId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    const numDays = parseInt(days) || 7;
+    let query = `
+      SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
+      FROM orders o JOIN stores s ON o.store_id = s.id
+      WHERE o.status IN ('paid','done','running','completed')
+      AND o.created_at >= CURRENT_DATE - INTERVAL '${numDays} days'
+    `;
+    if (scopeGroupId) query += ` AND s.group_id = '${scopeGroupId}'`;
+    query += ' GROUP BY DATE(o.created_at) ORDER BY date';
+    const r = await db.query(query);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
 // Admin: cleanup duplicate roles
@@ -966,6 +1071,24 @@ async function initDB() {
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS picture_url TEXT`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
+    // Admin user role extra fields
+    await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
+    await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS phone VARCHAR(20)`).catch(() => {});
+    await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS notes TEXT`).catch(() => {});
+    // Admin coupons table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS admin_coupons (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(20) REFERENCES store_groups(id),
+        name VARCHAR(100) NOT NULL,
+        discount INT NOT NULL DEFAULT 0,
+        type VARCHAR(20) NOT NULL DEFAULT 'fixed',
+        min_spend INT DEFAULT 0,
+        expiry DATE DEFAULT '2026-12-31',
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
