@@ -959,13 +959,17 @@ app.post('/api/admin/coupons', async (req, res) => {
 
 app.put('/api/admin/coupons/:id', async (req, res) => {
   try {
-    const { userId, name, discount, type, minSpend, expiry, active } = req.body;
+    const { userId, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query(`
       UPDATE admin_coupons SET name=COALESCE($2,name), discount=COALESCE($3,discount), type=COALESCE($4,type),
-      min_spend=COALESCE($5,min_spend), expiry=COALESCE($6,expiry), active=COALESCE($7,active) WHERE id=$1
-    `, [req.params.id, name, discount, type, minSpend, expiry, active]);
+      min_spend=COALESCE($5,min_spend), expiry=COALESCE($6,expiry), active=COALESCE($7,active),
+      price=COALESCE($8,price), description=COALESCE($9,description), time_slot=COALESCE($10,time_slot),
+      device_limit=COALESCE($11,device_limit), validity=COALESCE($12,validity), store_scope=COALESCE($13,store_scope),
+      max_uses=COALESCE($14,max_uses), category=COALESCE($15,category), group_id=COALESCE($16,group_id)
+      WHERE id=$1
+    `, [req.params.id, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
