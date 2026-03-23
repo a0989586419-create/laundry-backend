@@ -944,13 +944,15 @@ app.get('/api/admin/coupons', async (req, res) => {
 
 app.post('/api/admin/coupons', async (req, res) => {
   try {
-    const { userId, groupId, name, discount, type, minSpend, expiry } = req.body;
+    const { userId, groupId, name, discount, type, minSpend, price, expiry, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query(`
-      INSERT INTO admin_coupons (group_id, name, discount, type, min_spend, expiry, active, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
-    `, [groupId || null, name, discount, type || 'fixed', minSpend || 0, expiry || '2026-12-31']);
+      INSERT INTO admin_coupons (group_id, name, discount, type, min_spend, price, expiry, active, description, time_slot, device_limit, validity, store_scope, max_uses, category, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,true,$8,$9,$10,$11,$12,$13,$14,NOW())
+    `, [groupId||null, name, discount, type||'fixed', minSpend||0, price||0, expiry||'2026-12-31',
+        description||'', timeSlot||'全時段可用', deviceLimit||'全機型適用', validity||'自購買起90日內有效',
+        storeScope||'全台門市', maxUses||0, category||'gift']);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1084,11 +1086,23 @@ async function initDB() {
         discount INT NOT NULL DEFAULT 0,
         type VARCHAR(20) NOT NULL DEFAULT 'fixed',
         min_spend INT DEFAULT 0,
+        price INT DEFAULT 0,
         expiry DATE DEFAULT '2026-12-31',
         active BOOLEAN DEFAULT true,
+        description TEXT DEFAULT '',
+        time_slot VARCHAR(100) DEFAULT '全時段可用',
+        device_limit VARCHAR(100) DEFAULT '全機型適用',
+        validity VARCHAR(100) DEFAULT '自購買起90日內有效',
+        store_scope VARCHAR(200) DEFAULT '全台門市',
+        max_uses INT DEFAULT 0,
+        category VARCHAR(20) DEFAULT 'gift',
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
+    // Add new coupon columns if not exist
+    for (const col of ['price INT DEFAULT 0','description TEXT','time_slot VARCHAR(100)','device_limit VARCHAR(100)','validity VARCHAR(100)','store_scope VARCHAR(200)','max_uses INT DEFAULT 0','category VARCHAR(20) DEFAULT \'gift\'']) {
+      await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
+    }
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
