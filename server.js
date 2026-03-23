@@ -1136,28 +1136,67 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
     const params = [];
-    let dateFilter;
+    let dateFilter, txDateFilter;
     if (startDate && endDate) {
       params.push(startDate, endDate);
       dateFilter = `o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')`;
+      txDateFilter = `t.created_at >= $1::date AND t.created_at < ($2::date + INTERVAL '1 day')`;
     } else {
       const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
       params.push(numDays);
       dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+      txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
     }
-    let query = `
+    // Orders (consumption) data
+    let orderQuery = `
       SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { params.push(scopeGroupId); query += ` AND s.group_id = $${params.length}`; }
-    query += ' GROUP BY DATE(o.created_at) ORDER BY date';
-    const r = await db.query(query, params);
-    res.json(r.rows);
+    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + 1}`; }
+    orderQuery += ' GROUP BY DATE(o.created_at) ORDER BY date';
+    // Transactions (topup/payment) data
+    let txQuery = `
+      SELECT DATE(t.created_at) as date,
+        COALESCE(SUM(CASE WHEN t.type='topup' THEN t.amount ELSE 0 END), 0) as topup,
+        COALESCE(SUM(CASE WHEN t.type='payment' THEN ABS(t.amount) ELSE 0 END), 0) as consumption,
+        COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount > 0 THEN t.amount ELSE 0 END), 0) as manual_topup,
+        COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount < 0 THEN ABS(t.amount) ELSE 0 END), 0) as manual_deduct,
+        COUNT(CASE WHEN t.type='topup' THEN 1 END) as topup_count,
+        COUNT(CASE WHEN t.type='payment' THEN 1 END) as payment_count
+      FROM transactions t
+      WHERE ${txDateFilter}
+    `;
+    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
+    txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
+
+    const orderParams = scopeGroupId ? [...params, scopeGroupId] : params;
+    const [orderRes, txRes] = await Promise.all([
+      db.query(orderQuery, orderParams),
+      db.query(txQuery, orderParams),
+    ]);
+    // Merge by date
+    const dateMap = {};
+    orderRes.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+    });
+    txRes.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      dateMap[d].topup = parseInt(r.topup) || 0;
+      dateMap[d].consumption = parseInt(r.consumption) || 0;
+      dateMap[d].manualTopup = parseInt(r.manual_topup) || 0;
+      dateMap[d].manualDeduct = parseInt(r.manual_deduct) || 0;
+      dateMap[d].topupCount = parseInt(r.topup_count) || 0;
+      dateMap[d].paymentCount = parseInt(r.payment_count) || 0;
+    });
+    const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
+    res.json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Revenue CSV export with store breakdown
+// Revenue CSV export with store breakdown + financial summary
 app.get('/api/admin/revenue-export', async (req, res) => {
   try {
     const { userId, days, groupId, startDate, endDate } = req.query;
@@ -1165,30 +1204,103 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
     const params = [];
-    let dateFilter;
+    let dateFilter, txDateFilter;
     if (startDate && endDate) {
       params.push(startDate, endDate);
       dateFilter = `o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')`;
+      txDateFilter = `t.created_at >= $1::date AND t.created_at < ($2::date + INTERVAL '1 day')`;
     } else {
       const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
       params.push(numDays);
       dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+      txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
     }
-    let query = `
+    // Store-level orders
+    let orderQuery = `
       SELECT DATE(o.created_at) as date, s.name as store_name,
         COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { params.push(scopeGroupId); query += ` AND s.group_id = $${params.length}`; }
-    query += ' GROUP BY DATE(o.created_at), s.name ORDER BY date, s.name';
-    const r = await db.query(query, params);
+    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + 1}`; }
+    orderQuery += ' GROUP BY DATE(o.created_at), s.name ORDER BY date, s.name';
+    // Daily transaction summary
+    let txQuery = `
+      SELECT DATE(t.created_at) as date,
+        COALESCE(SUM(CASE WHEN t.type='topup' THEN t.amount ELSE 0 END), 0) as topup,
+        COALESCE(SUM(CASE WHEN t.type='payment' THEN ABS(t.amount) ELSE 0 END), 0) as consumption,
+        COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount > 0 THEN t.amount ELSE 0 END), 0) as manual_topup,
+        COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount < 0 THEN ABS(t.amount) ELSE 0 END), 0) as manual_deduct,
+        COUNT(CASE WHEN t.type='topup' THEN 1 END) as topup_count
+      FROM transactions t WHERE ${txDateFilter}
+    `;
+    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
+    txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
+
+    const qParams = scopeGroupId ? [...params, scopeGroupId] : params;
+    const [orderRes, txRes] = await Promise.all([
+      db.query(orderQuery, qParams),
+      db.query(txQuery, qParams),
+    ]);
+    const txMap = {};
+    txRes.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      txMap[d] = r;
+    });
+
     const BOM = '\uFEFF';
-    let csv = BOM + '日期,店舖名稱,交易筆數,總金額\n';
-    r.rows.forEach(row => {
+    let csv = BOM + '=== 悠洗洗衣 營收報表 ===\n';
+    csv += `報表產生時間,${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}\n`;
+    const periodLabel = startDate && endDate ? `${startDate} ~ ${endDate}` : `近 ${params[0]} 天`;
+    csv += `查詢區間,${periodLabel}\n\n`;
+
+    // Summary section
+    const totalRevenue = orderRes.rows.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
+    const totalOrders = orderRes.rows.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
+    const totalTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.topup) || 0), 0);
+    const totalConsumption = txRes.rows.reduce((s, r) => s + (parseInt(r.consumption) || 0), 0);
+    const totalManualTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_topup) || 0), 0);
+    const totalManualDeduct = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_deduct) || 0), 0);
+    const totalTopupCount = txRes.rows.reduce((s, r) => s + (parseInt(r.topup_count) || 0), 0);
+
+    csv += '【期間總覽】\n';
+    csv += `項目,金額/數量\n`;
+    csv += `機台營業總額,${totalRevenue}\n`;
+    csv += `消費交易筆數,${totalOrders}\n`;
+    csv += `線上儲值總額,${totalTopup}\n`;
+    csv += `儲值筆數,${totalTopupCount}\n`;
+    csv += `消費點數總額,${totalConsumption}\n`;
+    csv += `手動加值總額,${totalManualTopup}\n`;
+    csv += `手動扣款總額,${totalManualDeduct}\n`;
+    csv += `淨儲值(儲值-消費),${totalTopup - totalConsumption}\n\n`;
+
+    // Daily transaction summary
+    csv += '【每日金流摘要】\n';
+    csv += '日期,機台營收,消費筆數,線上儲值,儲值筆數,消費點數,手動加值,手動扣款\n';
+    const allDates = new Set([
+      ...orderRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
+      ...txRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
+    ]);
+    [...allDates].sort().forEach(d => {
+      const dayOrders = orderRes.rows.filter(r => {
+        const rd = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+        return rd === d;
+      });
+      const dayRev = dayOrders.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
+      const dayOrdCnt = dayOrders.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
+      const tx = txMap[d] || {};
+      csv += `${d},${dayRev},${dayOrdCnt},${parseInt(tx.topup)||0},${parseInt(tx.topup_count)||0},${parseInt(tx.consumption)||0},${parseInt(tx.manual_topup)||0},${parseInt(tx.manual_deduct)||0}\n`;
+    });
+    csv += '\n';
+
+    // Store breakdown
+    csv += '【門市明細】\n';
+    csv += '日期,店舖名稱,交易筆數,營收金額\n';
+    orderRes.rows.forEach(row => {
       const date = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
       csv += `${date},"${row.store_name}",${row.orders},${row.revenue}\n`;
     });
+
     const today = new Date().toISOString().split('T')[0];
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="revenue-report-${today}.csv"`);
