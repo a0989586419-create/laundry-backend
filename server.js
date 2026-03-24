@@ -43,20 +43,81 @@ mqttClient.on('message', async (topic, payload) => {
   } catch (e) { console.error(e.message); }
 });
 
-// ===== MQTT Publish Start Command =====
-function publishStartCommand(order) {
+// ===== ThingsBoard RPC Helper =====
+let tbToken = null;
+let tbTokenExpiry = 0;
+
+async function getTBToken() {
+  if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
+  const res = await fetch('http://vps3.monsterstore.tw:8080/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'sl6963693171@gmail.com', password: 's85010805' }),
+  });
+  const data = await res.json();
+  tbToken = data.token;
+  tbTokenExpiry = Date.now() + 3600000; // 1 hour
+  return tbToken;
+}
+
+async function getTBDeviceId(deviceName) {
+  const token = await getTBToken();
+  const res = await fetch(`http://vps3.monsterstore.tw:8080/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
+    headers: { 'X-Authorization': `Bearer ${token}` },
+  });
+  const data = await res.json();
+  return data.data?.[0]?.id?.id || null;
+}
+
+async function sendThingsBoardRPC(deviceName, method, params = {}) {
+  const token = await getTBToken();
+  const deviceId = await getTBDeviceId(deviceName);
+  if (!deviceId) throw new Error(`Device ${deviceName} not found in ThingsBoard`);
+  const res = await fetch(`http://vps3.monsterstore.tw:8080/api/rpc/oneway/${deviceId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ method, params }),
+  });
+  if (!res.ok) throw new Error(`TB RPC failed: ${res.status}`);
+  return true;
+}
+
+// ===== MQTT Publish Start Command (ThingsBoard primary, HiveMQ fallback) =====
+async function publishStartCommand(order) {
   const { id: orderId, store_id, machine_id, mode, temp, total_amount } = order;
   const washModeMap = { standard: 1, small: 2, washonly: 3, soft: 4, strong: 5, dryonly: 0 };
   const dryModeMap = { high: 1, mid: 2, low: 3 };
   const washMode = washModeMap[mode] ?? 1;
   const dryMode = mode === 'washonly' ? 0 : (dryModeMap[temp] ?? 1);
   const coins = Math.ceil(total_amount / 10);
-  const topic = `laundry/${store_id}/${machine_id}/command`;
-  const payload = JSON.stringify({ cmd: 'start', orderId, wash_mode: washMode, dry_mode: dryMode, coins, amount: total_amount });
-  mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
-    if (err) console.error('MQTT publish error:', err);
-    else console.log(`MQTT start → ${topic}`, payload);
-  });
+  const mqttPayload = { cmd: 'start', orderId, wash_mode: washMode, dry_mode: dryMode, coins, amount: total_amount };
+
+  try {
+    // Primary: Send via ThingsBoard RPC
+    await sendThingsBoardRPC(machine_id, 'startMachine', {
+      orderId,
+      mode: washMode,
+      dry_mode: dryMode,
+      coins,
+      amount: total_amount,
+    });
+    console.log(`[TB RPC] startMachine sent to ${machine_id}`);
+    // Also keep HiveMQ as fallback
+    if (mqttClient?.connected) {
+      const topic = `laundry/${store_id}/${machine_id}/command`;
+      mqttClient.publish(topic, JSON.stringify(mqttPayload), { qos: 1 });
+    }
+  } catch (e) {
+    console.error('[TB RPC] Error:', e.message);
+    // Fallback to HiveMQ only
+    if (mqttClient?.connected) {
+      const topic = `laundry/${store_id}/${machine_id}/command`;
+      mqttClient.publish(topic, JSON.stringify(mqttPayload), { qos: 1 }, (err) => {
+        if (err) console.error('MQTT publish error:', err);
+        else console.log(`MQTT fallback start -> ${topic}`);
+      });
+    }
+  }
 }
 
 // ===== LINE Pay =====
@@ -915,48 +976,111 @@ app.post('/api/admin/machine/control', async (req, res) => {
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
 
-    // Skip step - send skip command to machine via MQTT
+    // Skip step - send via ThingsBoard RPC (HiveMQ fallback)
     if (action === 'skip_step') {
       const sid = storeId || 'unknown';
-      const topic = `laundry/${sid}/${machineId}/command`;
-      const payload = JSON.stringify({ cmd: 'skip_step' });
-      mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
-        if (err) console.error('MQTT skip_step error:', err);
-        else console.log(`MQTT skip_step -> ${topic}`);
-      });
+      try {
+        await sendThingsBoardRPC(machineId, 'skipStep', {});
+        console.log(`[TB RPC] skipStep sent to ${machineId}`);
+      } catch (e) {
+        console.error('[TB RPC] skipStep error:', e.message);
+      }
+      // HiveMQ fallback
+      if (mqttClient?.connected) {
+        const topic = `laundry/${sid}/${machineId}/command`;
+        mqttClient.publish(topic, JSON.stringify({ cmd: 'skip_step' }), { qos: 1 });
+      }
       return res.json({ success: true, message: '已發送跳步指令' });
     }
 
-    // Clear coins - record coin count and reset
+    // Clear coins - record coin count and reset via ThingsBoard RPC
     if (action === 'clear_coins') {
       const sid = storeId || 'unknown';
-      // Get current coin count from machine cache
       const cached = machineCache[machineId] || {};
       const previousCount = cached.coinCount || 0;
-      // Record to coin_records table
       await db.query(
         `INSERT INTO coin_records (store_id, machine_id, coin_count, cleared_by, cleared_at) VALUES ($1, $2, $3, $4, NOW())`,
         [sid, machineId, previousCount, userId]
       );
-      // Send clear command to machine via MQTT
-      const topic = `laundry/${sid}/${machineId}/command`;
-      const payload = JSON.stringify({ cmd: 'clear_coins' });
-      mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
-        if (err) console.error('MQTT clear_coins error:', err);
-        else console.log(`MQTT clear_coins -> ${topic}`);
-      });
+      try {
+        await sendThingsBoardRPC(machineId, 'clearCoins', {});
+        console.log(`[TB RPC] clearCoins sent to ${machineId}`);
+      } catch (e) {
+        console.error('[TB RPC] clearCoins error:', e.message);
+      }
+      // HiveMQ fallback
+      if (mqttClient?.connected) {
+        const topic = `laundry/${sid}/${machineId}/command`;
+        mqttClient.publish(topic, JSON.stringify({ cmd: 'clear_coins' }), { qos: 1 });
+      }
       return res.json({ success: true, message: '錢箱已清零', previousCount });
     }
 
-    // Original start/stop logic
+    // Start/stop logic via ThingsBoard RPC
     const state = action === 'start' ? 'running' : 'idle';
     const remainSec = action === 'start' ? (durationMin || 60) * 60 : 0;
+    try {
+      const rpcMethod = action === 'start' ? 'startMachine' : 'stopMachine';
+      await sendThingsBoardRPC(machineId, rpcMethod, { minutes: durationMin || 60 });
+      console.log(`[TB RPC] ${rpcMethod} sent to ${machineId}`);
+    } catch (e) {
+      console.error(`[TB RPC] ${action} error:`, e.message);
+      // HiveMQ fallback
+      if (mqttClient?.connected) {
+        const sid = storeId || 'unknown';
+        const topic = `laundry/${sid}/${machineId}/command`;
+        mqttClient.publish(topic, JSON.stringify({ cmd: action, durationMin }), { qos: 1 });
+      }
+    }
     await db.query(`
       INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
       VALUES ($1, $2, $3, 0, NOW())
       ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
     `, [machineId, state, remainSec]);
     res.json({ success: true, state, remainSec });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Machine State Update (from IoT / ThingsBoard webhook)
+// ═══════════════════════════════════════
+app.post('/api/machines/state/update', async (req, res) => {
+  const { storeId, machineId, status, remaining, mode, temperature, rpm, power, waterLevel, coinCount, coinTotal } = req.body;
+  if (!machineId) return res.status(400).json({ error: 'machineId required' });
+  try {
+    await db.query(`
+      INSERT INTO machine_current_state (store_id, machine_id, status, remaining, mode, temperature, rpm, power, water_level, coin_count, coin_total, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      ON CONFLICT (store_id, machine_id) DO UPDATE SET
+        status=EXCLUDED.status, remaining=EXCLUDED.remaining, mode=EXCLUDED.mode,
+        temperature=EXCLUDED.temperature, rpm=EXCLUDED.rpm, power=EXCLUDED.power,
+        water_level=EXCLUDED.water_level, coin_count=EXCLUDED.coin_count, coin_total=EXCLUDED.coin_total,
+        updated_at=NOW()
+    `, [storeId || '', machineId, status || 'unknown', remaining || 0, mode || '', temperature || 0, rpm || 0, power || 0, waterLevel || 0, coinCount || 0, coinTotal || 0]);
+    // Also update legacy machine_id-only row for backward compatibility
+    await db.query(`
+      INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+      VALUES ($1, $2, $3, 0, NOW())
+      ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, updated_at=NOW()
+    `, [machineId, status || 'unknown', remaining || 0]).catch(() => {});
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Machine Notify (queue notification)
+// ═══════════════════════════════════════
+app.post('/api/machine/notify', async (req, res) => {
+  try {
+    const { machineId, storeId, remaining, status } = req.body;
+    // Find store name
+    const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [storeId || machineId?.split('-')[0]]);
+    const storeName = storeRes.rows[0]?.name || storeId;
+    const machineNum = machineId?.includes('-d') ? `烘乾${machineId.split('-d')[1]}號` : `洗脫烘${machineId.split('-m')[1]}號`;
+    // TODO: In future, integrate LINE Messaging API push notifications
+    // For now, just record the notification
+    console.log(`[NOTIFY] ${storeName} ${machineNum} remaining: ${remaining}s status: ${status}`);
+    res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1736,6 +1860,17 @@ async function initDB() {
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS picture_url TEXT`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
+    // machine_current_state: add new IoT telemetry columns
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS store_id VARCHAR(20) DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'unknown'`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS remaining INT DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS mode VARCHAR(30) DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS temperature NUMERIC DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS rpm INT DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS power NUMERIC DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS water_level NUMERIC DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS coin_count INT DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS coin_total INT DEFAULT 0`).catch(() => {});
     // Admin user role extra fields
     await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS phone VARCHAR(20)`).catch(() => {});
