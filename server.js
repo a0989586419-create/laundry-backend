@@ -911,9 +911,44 @@ app.get('/api/topup/confirm', async (req, res) => {
 // ═══════════════════════════════════════
 app.post('/api/admin/machine/control', async (req, res) => {
   try {
-    const { userId, machineId, action, durationMin } = req.body;
+    const { userId, machineId, storeId, action, durationMin } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+
+    // Skip step - send skip command to machine via MQTT
+    if (action === 'skip_step') {
+      const sid = storeId || 'unknown';
+      const topic = `laundry/${sid}/${machineId}/command`;
+      const payload = JSON.stringify({ cmd: 'skip_step' });
+      mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
+        if (err) console.error('MQTT skip_step error:', err);
+        else console.log(`MQTT skip_step -> ${topic}`);
+      });
+      return res.json({ success: true, message: '已發送跳步指令' });
+    }
+
+    // Clear coins - record coin count and reset
+    if (action === 'clear_coins') {
+      const sid = storeId || 'unknown';
+      // Get current coin count from machine cache
+      const cached = machineCache[machineId] || {};
+      const previousCount = cached.coinCount || 0;
+      // Record to coin_records table
+      await db.query(
+        `INSERT INTO coin_records (store_id, machine_id, coin_count, cleared_by, cleared_at) VALUES ($1, $2, $3, $4, NOW())`,
+        [sid, machineId, previousCount, userId]
+      );
+      // Send clear command to machine via MQTT
+      const topic = `laundry/${sid}/${machineId}/command`;
+      const payload = JSON.stringify({ cmd: 'clear_coins' });
+      mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
+        if (err) console.error('MQTT clear_coins error:', err);
+        else console.log(`MQTT clear_coins -> ${topic}`);
+      });
+      return res.json({ success: true, message: '錢箱已清零', previousCount });
+    }
+
+    // Original start/stop logic
     const state = action === 'start' ? 'running' : 'idle';
     const remainSec = action === 'start' ? (durationMin || 60) * 60 : 0;
     await db.query(`
@@ -1291,6 +1326,82 @@ app.get('/api/coupons/mine', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: Coin Insert (called by edge controller)
+// ═══════════════════════════════════════
+app.post('/api/machine/coin-insert', async (req, res) => {
+  try {
+    const { storeId, machineId, amount, coinType } = req.body;
+    if (!storeId || !machineId || !amount) return res.status(400).json({ error: 'storeId, machineId, amount required' });
+    const coinVal = parseInt(amount) || 0;
+    const ct = coinType || '10';
+    // Record as coin_payment order
+    const orderId = 'COIN-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    await db.query(
+      `INSERT INTO orders (id, store_id, machine_id, total_amount, status, type, paid_at, created_at) VALUES ($1,$2,$3,$4,'paid','coin_payment',NOW(),NOW())`,
+      [orderId, storeId, machineId, coinVal]
+    );
+    // Update machine cache coin counters
+    if (!machineCache[machineId]) machineCache[machineId] = {};
+    machineCache[machineId].coinCount = (machineCache[machineId].coinCount || 0) + (ct === '50' ? 1 : 1);
+    machineCache[machineId].coinTotal = (machineCache[machineId].coinTotal || 0) + coinVal;
+    console.log(`Coin insert: ${storeId}/${machineId} +${coinVal} (${ct}元)`);
+    res.json({ success: true, orderId, coinCount: machineCache[machineId].coinCount, coinTotal: machineCache[machineId].coinTotal });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: Coin Revenue Statistics
+// ═══════════════════════════════════════
+app.get('/api/admin/coin-revenue', async (req, res) => {
+  try {
+    const { userId, days, groupId, storeId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+
+    // Build WHERE clause
+    const params = [numDays];
+    let where = `o.type = 'coin_payment' AND o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    if (storeId) {
+      params.push(storeId);
+      where += ` AND o.store_id = $${params.length}`;
+    } else if (scopeGroupId) {
+      params.push(scopeGroupId);
+      where += ` AND s.group_id = $${params.length}`;
+    }
+
+    // Total coins and amount
+    const totalQ = await db.query(
+      `SELECT COUNT(*) as total_coins, COALESCE(SUM(o.total_amount), 0) as total_amount FROM orders o LEFT JOIN stores s ON o.store_id = s.id WHERE ${where}`, params
+    );
+    const totalCoins = parseInt(totalQ.rows[0].total_coins) || 0;
+    const totalAmount = parseInt(totalQ.rows[0].total_amount) || 0;
+
+    // By store
+    const byStoreQ = await db.query(
+      `SELECT s.name as store_name, COUNT(*) as coins, COALESCE(SUM(o.total_amount), 0) as amount FROM orders o LEFT JOIN stores s ON o.store_id = s.id WHERE ${where} GROUP BY s.name ORDER BY amount DESC`, params
+    );
+
+    // By date
+    const byDateQ = await db.query(
+      `SELECT DATE(o.created_at) as date, COUNT(*) as coins, COALESCE(SUM(o.total_amount), 0) as amount FROM orders o LEFT JOIN stores s ON o.store_id = s.id WHERE ${where} GROUP BY DATE(o.created_at) ORDER BY date`, params
+    );
+
+    res.json({
+      totalCoins,
+      totalAmount,
+      byStore: byStoreQ.rows.map(r => ({ storeName: r.store_name, coins: parseInt(r.coins), amount: parseInt(r.amount) })),
+      byDate: byDateQ.rows.map(r => ({
+        date: r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0],
+        coins: parseInt(r.coins),
+        amount: parseInt(r.amount)
+      }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
 //  API: Revenue Chart
 // ═══════════════════════════════════════
 app.get('/api/admin/revenue-chart', async (req, res) => {
@@ -1347,25 +1458,47 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       txQuery += ` AND t.group_id = $${txParams.length}`;
     }
     txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
-    const [orderRes, txRes] = await Promise.all([
+    // Coin revenue query (coin_payment orders)
+    const coinParams = [...params];
+    let coinDateFilter = dateFilter.replace(/o\./g, 'co.');
+    let coinQuery = `
+      SELECT DATE(co.created_at) as date, COALESCE(SUM(co.total_amount), 0) as coin_revenue, COUNT(*) as coin_count
+      FROM orders co LEFT JOIN stores cs ON co.store_id = cs.id
+      WHERE co.type = 'coin_payment' AND ${coinDateFilter}
+    `;
+    if (storeId) {
+      coinParams.push(storeId);
+      coinQuery += ` AND co.store_id = $${coinParams.length}`;
+    } else if (scopeGroupId) {
+      coinParams.push(scopeGroupId);
+      coinQuery += ` AND cs.group_id = $${coinParams.length}`;
+    }
+    coinQuery += ' GROUP BY DATE(co.created_at) ORDER BY date';
+    const [orderRes, txRes, coinRes] = await Promise.all([
       db.query(orderQuery, orderParams),
       db.query(txQuery, txParams),
+      db.query(coinQuery, coinParams),
     ]);
     // Merge by date
     const dateMap = {};
     orderRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
     });
     txRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
       dateMap[d].topup = parseInt(r.topup) || 0;
       dateMap[d].consumption = parseInt(r.consumption) || 0;
       dateMap[d].manualTopup = parseInt(r.manual_topup) || 0;
       dateMap[d].manualDeduct = parseInt(r.manual_deduct) || 0;
       dateMap[d].topupCount = parseInt(r.topup_count) || 0;
       dateMap[d].paymentCount = parseInt(r.payment_count) || 0;
+    });
+    coinRes.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
+      dateMap[d].coinRevenue = parseInt(r.coin_revenue) || 0;
     });
     const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
     res.json(result);
@@ -1416,16 +1549,34 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
     txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
 
+    // Coin revenue query for export
+    const coinExportParams = [...params];
+    let coinExportDateFilter = dateFilter.replace(/o\./g, 'co.');
+    let coinExportQuery = `
+      SELECT DATE(co.created_at) as date, COALESCE(SUM(co.total_amount), 0) as coin_revenue, COUNT(*) as coin_count
+      FROM orders co LEFT JOIN stores cs ON co.store_id = cs.id
+      WHERE co.type = 'coin_payment' AND ${coinExportDateFilter}
+    `;
+    if (scopeGroupId) { coinExportQuery += ` AND cs.group_id = $${coinExportParams.length + 1}`; coinExportParams.push(scopeGroupId); }
+    if (storeId) { coinExportQuery += ` AND co.store_id = $${coinExportParams.length + 1}`; coinExportParams.push(storeId); }
+    coinExportQuery += ' GROUP BY DATE(co.created_at) ORDER BY date';
+
     const orderParams = [...params, ...orderExtraParams];
     const txParams = scopeGroupId ? [...params, scopeGroupId] : params;
-    const [orderRes, txRes] = await Promise.all([
+    const [orderRes, txRes, coinExportRes] = await Promise.all([
       db.query(orderQuery, orderParams),
       db.query(txQuery, txParams),
+      db.query(coinExportQuery, coinExportParams),
     ]);
     const txMap = {};
     txRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
       txMap[d] = r;
+    });
+    const coinMap = {};
+    coinExportRes.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      coinMap[d] = r;
     });
 
     const BOM = '\uFEFF';
@@ -1442,11 +1593,13 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     const totalManualTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_topup) || 0), 0);
     const totalManualDeduct = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_deduct) || 0), 0);
     const totalTopupCount = txRes.rows.reduce((s, r) => s + (parseInt(r.topup_count) || 0), 0);
+    const totalCoinRevenue = coinExportRes.rows.reduce((s, r) => s + (parseInt(r.coin_revenue) || 0), 0);
 
     csv += '【期間總覽】\n';
     csv += `項目,金額/數量\n`;
     csv += `機台營業總額,${totalRevenue}\n`;
     csv += `消費交易筆數,${totalOrders}\n`;
+    csv += `投幣營收總額,${totalCoinRevenue}\n`;
     csv += `線上儲值總額,${totalTopup}\n`;
     csv += `儲值筆數,${totalTopupCount}\n`;
     csv += `消費點數總額,${totalConsumption}\n`;
@@ -1456,10 +1609,11 @@ app.get('/api/admin/revenue-export', async (req, res) => {
 
     // Daily transaction summary
     csv += '【每日金流摘要】\n';
-    csv += '日期,機台營收,消費筆數,線上儲值,儲值筆數,消費點數,手動加值,手動扣款\n';
+    csv += '日期,機台營收,消費筆數,投幣金額,線上儲值,儲值筆數,消費點數,手動加值,手動扣款\n';
     const allDates = new Set([
       ...orderRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
       ...txRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
+      ...coinExportRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
     ]);
     [...allDates].sort().forEach(d => {
       const dayOrders = orderRes.rows.filter(r => {
@@ -1469,7 +1623,8 @@ app.get('/api/admin/revenue-export', async (req, res) => {
       const dayRev = dayOrders.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
       const dayOrdCnt = dayOrders.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
       const tx = txMap[d] || {};
-      csv += `${d},${dayRev},${dayOrdCnt},${parseInt(tx.topup)||0},${parseInt(tx.topup_count)||0},${parseInt(tx.consumption)||0},${parseInt(tx.manual_topup)||0},${parseInt(tx.manual_deduct)||0}\n`;
+      const coin = coinMap[d] || {};
+      csv += `${d},${dayRev},${dayOrdCnt},${parseInt(coin.coin_revenue)||0},${parseInt(tx.topup)||0},${parseInt(tx.topup_count)||0},${parseInt(tx.consumption)||0},${parseInt(tx.manual_topup)||0},${parseInt(tx.manual_deduct)||0}\n`;
     });
     csv += '\n';
 
@@ -1646,6 +1801,19 @@ async function initDB() {
       )
     `).catch(() => {});
     await db.query(`ALTER TABLE announcements ADD COLUMN IF NOT EXISTS tag VARCHAR(20) DEFAULT ''`).catch(() => {});
+    // Coin records table for tracking coin box clears
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS coin_records (
+        id SERIAL PRIMARY KEY,
+        store_id VARCHAR(20),
+        machine_id VARCHAR(30),
+        coin_count INT DEFAULT 0,
+        cleared_by VARCHAR(100),
+        cleared_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    // Add type column to orders for distinguishing coin_payment vs normal orders
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS type VARCHAR(30) DEFAULT 'online'`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
