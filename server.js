@@ -37,7 +37,36 @@ mqttClient.on('message', async (topic, payload) => {
     if (type === 'status') {
       machineCache[machineId] = { ...data, updatedAt: new Date().toISOString() };
       if (data.state === 'done') {
+        // Find running orders for this machine to notify users
+        const runningOrders = await db.query(
+          `SELECT o.id, mb.line_user_id, s.name as store_name, m.name as machine_name
+           FROM orders o
+           JOIN members mb ON o.member_id = mb.id
+           JOIN stores s ON o.store_id = s.id
+           JOIN machines m ON o.machine_id = m.id
+           WHERE o.machine_id = $1 AND o.status = 'running'`, [machineId]
+        );
         await db.query(`UPDATE orders SET status='done', completed_at=NOW() WHERE machine_id=$1 AND status='running'`, [machineId]);
+        // Send LINE push to each user with a running order on this machine
+        for (const ord of runningOrders.rows) {
+          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', {
+            type: 'bubble',
+            body: {
+              type: 'box', layout: 'vertical',
+              contents: [
+                { type: 'text', text: '洗衣完成!', weight: 'bold', size: 'xl', color: '#3A3A8C' },
+                { type: 'text', text: `${ord.store_name} ${ord.machine_name}`, margin: 'md', color: '#666666' },
+                { type: 'text', text: '请尽快取回衣物', margin: 'md', color: '#E5B94C', weight: 'bold' },
+              ]
+            },
+            footer: {
+              type: 'box', layout: 'vertical',
+              contents: [
+                { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
+              ]
+            }
+          }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
+        }
       }
     }
   } catch (e) { console.error(e.message); }
@@ -80,6 +109,40 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
   });
   if (!res.ok) throw new Error(`TB RPC failed: ${res.status}`);
   return true;
+}
+
+// ===== LINE Messaging API Push Notifications =====
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
+
+async function sendLinePush(userId, messages) {
+  if (!LINE_CHANNEL_ACCESS_TOKEN) {
+    console.log('[LINE Push] No token configured, skipping push');
+    return false;
+  }
+  try {
+    const res = await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({ to: userId, messages }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) console.error('[LINE Push] Error:', data);
+    return res.ok;
+  } catch (e) {
+    console.error('[LINE Push] Failed:', e.message);
+    return false;
+  }
+}
+
+async function sendLineText(userId, text) {
+  return sendLinePush(userId, [{ type: 'text', text }]);
+}
+
+async function sendLineFlexMessage(userId, altText, contents) {
+  return sendLinePush(userId, [{ type: 'flex', altText, contents }]);
 }
 
 // ===== MQTT Publish Start Command (ThingsBoard primary, HiveMQ fallback) =====
@@ -786,6 +849,14 @@ app.get('/api/payment/confirm', async (req, res) => {
         ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
       `, [order.machine_id, order.duration_sec || 3600]);
       publishStartCommand(order);
+      // LINE Push: payment success
+      const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
+      if (memberRow) {
+        const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [order.store_id])).rows[0]?.name || order.store_id;
+        const mName = order.machine_id.includes('-d') ? `烘乾機` : `洗脫烘`;
+        const mins = Math.ceil((order.duration_sec || 3600) / 60);
+        sendLineText(memberRow.line_user_id, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`).catch(() => {});
+      }
       res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}`);
     } else {
       res.redirect(`${FRONTEND_URL}/?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
@@ -879,6 +950,14 @@ app.post('/api/payment/create', async (req, res) => {
     // Try MQTT start command
     try { publishStartCommand({ id: orderId, store_id: storeId, machine_id: machineId, mode, temp: dryTemp || 'high', total_amount: amount }); } catch (e) {}
 
+    // LINE Push: payment success (demo mode)
+    {
+      const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || storeId;
+      const mName = machineId.includes('-d') ? `烘乾${machineNum || ''}號` : `洗脫烘${machineNum || ''}號`;
+      const mins = Math.ceil((durationSec || (minutes || 0) * 60) / 60);
+      sendLineText(userId, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`).catch(() => {});
+    }
+
     res.json({ success: true, orderId, demoMode: true });
   } catch (e) {
     console.error('payment/create error:', e);
@@ -941,6 +1020,8 @@ app.post('/api/topup/linepay', async (req, res) => {
       VALUES ($1, $2, 'topup', $3, $4, NOW())
     `, [userId, groupId, amount, `儲值 +${amount}`]);
     const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
+    // LINE Push: topup success
+    sendLineText(userId, `儲值成功!\n${groupName} 已儲值 NT$${amount}\n目前餘額：NT$${wr.rows[0]?.balance || 0}`).catch(() => {});
     res.json({ success: true, demoMode: true, balance: wr.rows[0]?.balance || 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -962,6 +1043,10 @@ app.get('/api/topup/confirm', async (req, res) => {
         INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
         VALUES ($1, $2, 'topup', $3, $4, NOW())
       `, [userId, groupId, amountInt, `LINE Pay 儲值 +${amountInt}`]);
+      // LINE Push: topup success
+      const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
+      const grName = (await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId])).rows[0]?.name || '';
+      sendLineText(userId, `儲值成功!\n${grName} 已儲值 NT$${amountInt}\n目前餘額：NT$${walletRow?.balance || amountInt}`).catch(() => {});
       res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}`);
     } else {
       res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
@@ -1077,14 +1162,57 @@ app.post('/api/machines/state/update', async (req, res) => {
 app.post('/api/machine/notify', async (req, res) => {
   try {
     const { machineId, storeId, remaining, status } = req.body;
+    const resolvedStoreId = storeId || machineId?.split('-')[0];
     // Find store name
-    const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [storeId || machineId?.split('-')[0]]);
-    const storeName = storeRes.rows[0]?.name || storeId;
+    const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [resolvedStoreId]);
+    const storeName = storeRes.rows[0]?.name || resolvedStoreId;
     const machineNum = machineId?.includes('-d') ? `烘乾${machineId.split('-d')[1]}號` : `洗脫烘${machineId.split('-m')[1]}號`;
-    // TODO: In future, integrate LINE Messaging API push notifications
-    // For now, just record the notification
+
     console.log(`[NOTIFY] ${storeName} ${machineNum} remaining: ${remaining}s status: ${status}`);
-    res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}` });
+
+    // Find users who have recent orders (last 2 hours) at this store for this machine
+    const recentUsers = await db.query(
+      `SELECT DISTINCT mb.line_user_id
+       FROM orders o
+       JOIN members mb ON o.member_id = mb.id
+       WHERE o.machine_id = $1
+         AND o.status IN ('paid', 'running')
+         AND o.created_at > NOW() - INTERVAL '2 hours'`,
+      [machineId]
+    );
+
+    let pushedCount = 0;
+    const remainMin = Math.ceil((parseInt(remaining) || 0) / 60);
+
+    if (status === 'done' || parseInt(remaining) <= 0) {
+      // Machine done: send completion Flex Message
+      for (const u of recentUsers.rows) {
+        sendLineFlexMessage(u.line_user_id, '洗衣完成通知', {
+          type: 'bubble',
+          body: {
+            type: 'box', layout: 'vertical',
+            contents: [
+              { type: 'text', text: '洗衣完成!', weight: 'bold', size: 'xl', color: '#3A3A8C' },
+              { type: 'text', text: `${storeName} ${machineNum}`, margin: 'md', color: '#666666' },
+              { type: 'text', text: '請盡快取回衣物', margin: 'md', color: '#E5B94C', weight: 'bold' },
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical',
+            contents: [
+              { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
+            ]
+          }
+        }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+      }
+    } else if (remainMin > 0 && remainMin <= 5) {
+      // Almost done: send reminder
+      for (const u of recentUsers.rows) {
+        sendLineText(u.line_user_id, `您在 ${storeName} 的 ${machineNum} 即將完成（剩餘 ${remainMin} 分鐘），可以準備前往取衣了!`).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+      }
+    }
+
+    res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}`, pushedCount, usersFound: recentUsers.rows.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2095,6 +2223,72 @@ app.get('/api/admin/referral-stats', async (req, res) => {
     });
   } catch (e) {
     console.error('admin referral-stats error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin Manual Push Notification
+// ═══════════════════════════════════════
+app.post('/api/notifications/send', async (req, res) => {
+  try {
+    const { userId: adminId, targetUserId, targetGroupId, message, type } = req.body;
+    if (!adminId || !message) return res.status(400).json({ error: 'Missing adminId or message' });
+
+    // Verify admin permission
+    const roleInfo = await getUserRole(adminId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    let targets = [];
+    if (targetUserId) {
+      // Single user push
+      targets = [targetUserId];
+    } else if (targetGroupId) {
+      // Group push: find all users who have a wallet in this group (active consumers)
+      const usersRes = await db.query(
+        'SELECT DISTINCT line_user_id FROM wallets WHERE group_id = $1 AND balance >= 0',
+        [targetGroupId]
+      );
+      targets = usersRes.rows.map(r => r.line_user_id);
+    } else {
+      return res.status(400).json({ error: 'Provide targetUserId or targetGroupId' });
+    }
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const uid of targets) {
+      let ok = false;
+      if (type === 'promo') {
+        // Promotional Flex Message
+        ok = await sendLineFlexMessage(uid, message, {
+          type: 'bubble',
+          body: {
+            type: 'box', layout: 'vertical',
+            contents: [
+              { type: 'text', text: '雲管家優惠通知', weight: 'bold', size: 'lg', color: '#3A3A8C' },
+              { type: 'separator', margin: 'md' },
+              { type: 'text', text: message, margin: 'md', wrap: true, color: '#333333' },
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical',
+            contents: [
+              { type: 'button', action: { type: 'uri', label: '立即查看', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
+            ]
+          }
+        });
+      } else {
+        ok = await sendLineText(uid, message);
+      }
+      if (ok) successCount++; else failCount++;
+    }
+
+    res.json({ success: true, totalTargets: targets.length, successCount, failCount });
+  } catch (e) {
+    console.error('notifications/send error:', e);
     res.status(500).json({ error: e.message });
   }
 });
