@@ -1375,7 +1375,7 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
 // Revenue CSV export with store breakdown + financial summary
 app.get('/api/admin/revenue-export', async (req, res) => {
   try {
-    const { userId, days, groupId, startDate, endDate } = req.query;
+    const { userId, days, groupId, startDate, endDate, storeId } = req.query;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
@@ -1391,15 +1391,18 @@ app.get('/api/admin/revenue-export', async (req, res) => {
       dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
       txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
     }
-    // Store-level orders
+    // Store-level orders (with machine breakdown)
     let orderQuery = `
       SELECT DATE(o.created_at) as date, s.name as store_name,
+        COALESCE(o.machine_id, 'unknown') as machine_id,
         COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + 1}`; }
-    orderQuery += ' GROUP BY DATE(o.created_at), s.name ORDER BY date, s.name';
+    const orderExtraParams = [];
+    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + orderExtraParams.length + 1}`; orderExtraParams.push(scopeGroupId); }
+    if (storeId) { orderQuery += ` AND o.store_id = $${params.length + orderExtraParams.length + 1}`; orderExtraParams.push(storeId); }
+    orderQuery += ' GROUP BY DATE(o.created_at), s.name, o.machine_id ORDER BY date, s.name, o.machine_id';
     // Daily transaction summary
     let txQuery = `
       SELECT DATE(t.created_at) as date,
@@ -1413,10 +1416,11 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
     txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
 
-    const qParams = scopeGroupId ? [...params, scopeGroupId] : params;
+    const orderParams = [...params, ...orderExtraParams];
+    const txParams = scopeGroupId ? [...params, scopeGroupId] : params;
     const [orderRes, txRes] = await Promise.all([
-      db.query(orderQuery, qParams),
-      db.query(txQuery, qParams),
+      db.query(orderQuery, orderParams),
+      db.query(txQuery, txParams),
     ]);
     const txMap = {};
     txRes.rows.forEach(r => {
@@ -1469,25 +1473,27 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     });
     csv += '\n';
 
-    // Store breakdown
+    // Store breakdown (with machine detail)
     csv += '【門市明細】\n';
-    csv += '日期,店舖名稱,交易筆數,營收金額\n';
+    csv += '日期,店舖名稱,機台編號,交易筆數,營收金額\n';
     orderRes.rows.forEach(row => {
       const date = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
-      csv += `${date},"${row.store_name}",${row.orders},${row.revenue}\n`;
+      csv += `${date},"${row.store_name}","${row.machine_id}",${row.orders},${row.revenue}\n`;
     });
     csv += '\n';
 
-    // Per-machine revenue breakdown
+    // Per-machine revenue breakdown (aggregate across dates)
     let machineQuery = `
       SELECT o.machine_id, s.name as store_name, COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { machineQuery += ` AND s.group_id = $${params.length + 1}`; }
+    const machineExtraParams = [];
+    if (scopeGroupId) { machineQuery += ` AND s.group_id = $${params.length + machineExtraParams.length + 1}`; machineExtraParams.push(scopeGroupId); }
+    if (storeId) { machineQuery += ` AND o.store_id = $${params.length + machineExtraParams.length + 1}`; machineExtraParams.push(storeId); }
     machineQuery += ' GROUP BY o.machine_id, s.name ORDER BY s.name, o.machine_id';
     try {
-      const machineRes = await db.query(machineQuery, qParams);
+      const machineRes = await db.query(machineQuery, [...params, ...machineExtraParams]);
       if (machineRes.rows.length > 0) {
         csv += '【機台營收明細】\n';
         csv += '機台編號,所屬門市,交易筆數,營收金額\n';
@@ -1571,6 +1577,7 @@ async function initDB() {
   // Add group_id column to stores if not exists
   try {
     await db.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS group_id VARCHAR(20)`);
+    await db.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS machine_id VARCHAR(20)').catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS picture_url TEXT`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
