@@ -1013,6 +1013,95 @@ app.delete('/api/admin/coupons/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ========== Announcements API ==========
+
+// Public: get published announcements
+app.get('/api/announcements', async (req, res) => {
+  try {
+    const { groupId } = req.query;
+    let query = 'SELECT * FROM announcements WHERE published = true';
+    const params = [];
+    if (groupId) {
+      params.push(groupId);
+      query += ` AND (group_id = $${params.length} OR group_id IS NULL)`;
+    }
+    query += ' ORDER BY sort_order ASC, created_at DESC';
+    const result = await db.query(query, params);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: get all announcements (including unpublished)
+app.get('/api/admin/announcements', async (req, res) => {
+  try {
+    const { userId, groupId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    let query = 'SELECT * FROM announcements';
+    const params = [];
+    if (groupId) {
+      params.push(groupId);
+      query += ` WHERE group_id = $${params.length}`;
+    }
+    query += ' ORDER BY sort_order ASC, created_at DESC';
+    const result = await db.query(query, params);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: create announcement
+app.post('/api/admin/announcements', async (req, res) => {
+  try {
+    const { userId, title, content, imageUrl, linkUrl, groupId, published, sortOrder, tag } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    const result = await db.query(`
+      INSERT INTO announcements (group_id, title, content, image_url, link_url, published, sort_order, tag)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `, [groupId || null, title, content || '', imageUrl || '', linkUrl || '', published !== false, sortOrder || 0, tag || '']);
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: update announcement
+app.put('/api/admin/announcements/:id', async (req, res) => {
+  try {
+    const { userId, title, content, imageUrl, linkUrl, groupId, published, sortOrder, tag } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const result = await db.query(`
+      UPDATE announcements SET
+        title = COALESCE($2, title),
+        content = COALESCE($3, content),
+        image_url = COALESCE($4, image_url),
+        link_url = COALESCE($5, link_url),
+        group_id = $6,
+        published = COALESCE($7, published),
+        sort_order = COALESCE($8, sort_order),
+        tag = COALESCE($9, tag),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [req.params.id, title, content, imageUrl, linkUrl, groupId || null, published, sortOrder, tag]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'announcement not found' });
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: delete announcement
+app.delete('/api/admin/announcements/:id', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const result = await db.query('DELETE FROM announcements WHERE id=$1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'announcement not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Redeem coupon by code
 app.post('/api/coupons/redeem', async (req, res) => {
   try {
@@ -1530,6 +1619,22 @@ async function initDB() {
       await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
     }
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
+    // Announcements table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS announcements (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(20) REFERENCES store_groups(id),
+        title VARCHAR(200) NOT NULL,
+        content TEXT DEFAULT '',
+        image_url TEXT DEFAULT '',
+        link_url TEXT DEFAULT '',
+        published BOOLEAN DEFAULT true,
+        sort_order INT DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    await db.query(`ALTER TABLE announcements ADD COLUMN IF NOT EXISTS tag VARCHAR(20) DEFAULT ''`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
