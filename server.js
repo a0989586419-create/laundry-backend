@@ -1223,8 +1223,7 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
     }
     // Orders (machine revenue + single-pay via LINE Pay)
     let orderQuery = `
-      SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders,
-        COALESCE(SUM(CASE WHEN o.payment_method = 'linepay_single' THEN o.total_amount ELSE 0 END), 0) as single_pay
+      SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
@@ -1264,11 +1263,11 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
     const dateMap = {};
     orderRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, singlePay: parseInt(r.single_pay) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
     });
     txRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, singlePay: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
       dateMap[d].topup = parseInt(r.topup) || 0;
       dateMap[d].consumption = parseInt(r.consumption) || 0;
       dateMap[d].manualTopup = parseInt(r.manual_topup) || 0;
