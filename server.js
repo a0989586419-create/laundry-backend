@@ -104,14 +104,14 @@ async function getOrCreateMember(lineUserId) {
 
 // ===== Helper: get user role =====
 async function getUserRole(lineUserId) {
-  const r = await db.query('SELECT role, group_id FROM user_roles WHERE line_user_id=$1', [lineUserId]);
-  if (r.rows.length === 0) return { role: 'consumer', groupId: null };
+  const r = await db.query('SELECT role, group_id, permissions FROM user_roles WHERE line_user_id=$1', [lineUserId]);
+  if (r.rows.length === 0) return { role: 'consumer', groupId: null, permissions: {} };
   // super_admin has group_id = NULL
   const adminRow = r.rows.find(row => row.role === 'super_admin');
-  if (adminRow) return { role: 'super_admin', groupId: null, allGroups: r.rows };
+  if (adminRow) return { role: 'super_admin', groupId: null, allGroups: r.rows, permissions: { revenue: true, coupons: true, members: true, machines: true, topup: true, news: true, roles: true } };
   const storeAdminRow = r.rows.find(row => row.role === 'store_admin');
-  if (storeAdminRow) return { role: 'store_admin', groupId: storeAdminRow.group_id, allGroups: r.rows };
-  return { role: 'consumer', groupId: null, allGroups: r.rows };
+  if (storeAdminRow) return { role: 'store_admin', groupId: storeAdminRow.group_id, allGroups: r.rows, permissions: storeAdminRow.permissions || {} };
+  return { role: 'consumer', groupId: null, allGroups: r.rows, permissions: {} };
 }
 
 // ═══════════════════════════════════════
@@ -186,6 +186,7 @@ app.get('/api/user/profile', async (req, res) => {
       managedGroupId: roleInfo.groupId,
       groups,
       wallets,
+      permissions: roleInfo.permissions,
     });
   } catch (e) {
     console.error('profile error:', e);
@@ -433,17 +434,17 @@ app.get('/api/admin/users', async (req, res) => {
 
 app.post('/api/admin/users', async (req, res) => {
   try {
-    const { userId, targetUserId, role, groupId, displayName, phone, notes } = req.body;
+    const { userId, targetUserId, role, groupId, displayName, phone, notes, permissions } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
     if (!targetUserId || !role) return res.status(400).json({ error: 'targetUserId and role required' });
     const gid = role === 'super_admin' ? null : (groupId || null);
     await db.query(`
-      INSERT INTO user_roles (line_user_id, role, group_id, display_name, phone, notes)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO user_roles (line_user_id, role, group_id, display_name, phone, notes, permissions)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       ON CONFLICT (line_user_id, role, COALESCE(group_id, '__NULL__')) DO UPDATE
-      SET display_name=COALESCE($4, user_roles.display_name), phone=COALESCE($5, user_roles.phone), notes=COALESCE($6, user_roles.notes)
-    `, [targetUserId, role, gid, displayName || null, phone || null, notes || null]);
+      SET display_name=COALESCE($4, user_roles.display_name), phone=COALESCE($5, user_roles.phone), notes=COALESCE($6, user_roles.notes), permissions=COALESCE($7, user_roles.permissions)
+    `, [targetUserId, role, gid, displayName || null, phone || null, notes || null, JSON.stringify(permissions || {})]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1311,17 +1312,25 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
     }
     // Orders (machine revenue + single-pay via LINE Pay)
+    // When storeId is provided, filter orders by store_id (specific store)
+    // Otherwise when scopeGroupId exists, filter orders by group_id (all stores in group)
+    const orderParams = [...params];
     let orderQuery = `
       SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    const extraFilters = [];
-    if (storeId) { extraFilters.push(`o.store_id = $${params.length + extraFilters.length + 1}`); }
-    else if (scopeGroupId) { extraFilters.push(`s.group_id = $${params.length + extraFilters.length + 1}`); }
-    if (extraFilters.length > 0) orderQuery += ` AND ${extraFilters.join(' AND ')}`;
+    if (storeId) {
+      orderParams.push(storeId);
+      orderQuery += ` AND o.store_id = $${orderParams.length}`;
+    } else if (scopeGroupId) {
+      orderParams.push(scopeGroupId);
+      orderQuery += ` AND s.group_id = $${orderParams.length}`;
+    }
     orderQuery += ' GROUP BY DATE(o.created_at) ORDER BY date';
     // Transactions (topup/payment)
+    // Transactions always filter by group_id (never storeId) because topup balance is shared across group
+    const txParams = [...params];
     let txQuery = `
       SELECT DATE(t.created_at) as date,
         COALESCE(SUM(CASE WHEN t.type='topup' THEN t.amount ELSE 0 END), 0) as topup,
@@ -1333,17 +1342,11 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       FROM transactions t
       WHERE ${txDateFilter}
     `;
-    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + (storeId ? 1 : (scopeGroupId ? 1 : 0)) + 1}`; }
-    else if (storeId) {
-      // For individual store, find its group_id
-      txQuery += ` AND t.group_id = (SELECT group_id FROM stores WHERE id = $${params.length + 2})`;
+    if (scopeGroupId) {
+      txParams.push(scopeGroupId);
+      txQuery += ` AND t.group_id = $${txParams.length}`;
     }
     txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
-
-    const orderFilterVal = storeId || scopeGroupId;
-    const orderParams = orderFilterVal ? [...params, orderFilterVal] : params;
-    const txFilterVal = scopeGroupId || storeId;
-    const txParams = txFilterVal ? [...params, txFilterVal] : params;
     const [orderRes, txRes] = await Promise.all([
       db.query(orderQuery, orderParams),
       db.query(txQuery, txParams),
@@ -1365,7 +1368,8 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       dateMap[d].paymentCount = parseInt(r.payment_count) || 0;
     });
     const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
-    res.json(result);
+    const isChainStore = !!(scopeGroupId && storeId);
+    res.json({ data: result, isChainStore });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1575,6 +1579,7 @@ async function initDB() {
     await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS phone VARCHAR(20)`).catch(() => {});
     await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS notes TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`).catch(() => {});
     // Admin coupons table
     await db.query(`
       CREATE TABLE IF NOT EXISTS admin_coupons (
