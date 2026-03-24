@@ -1205,7 +1205,7 @@ app.get('/api/coupons/mine', async (req, res) => {
 // ═══════════════════════════════════════
 app.get('/api/admin/revenue-chart', async (req, res) => {
   try {
-    const { userId, days, groupId, startDate, endDate } = req.query;
+    const { userId, days, groupId, startDate, endDate, storeId } = req.query;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
@@ -1221,15 +1221,19 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
       txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
     }
-    // Orders (consumption) data
+    // Orders (machine revenue + single-pay via LINE Pay)
     let orderQuery = `
-      SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders
+      SELECT DATE(o.created_at) as date, COALESCE(SUM(o.total_amount), 0) as revenue, COUNT(*) as orders,
+        COALESCE(SUM(CASE WHEN o.payment_method = 'linepay_single' THEN o.total_amount ELSE 0 END), 0) as single_pay
       FROM orders o JOIN stores s ON o.store_id = s.id
       WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
     `;
-    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + 1}`; }
+    const extraFilters = [];
+    if (storeId) { extraFilters.push(`o.store_id = $${params.length + extraFilters.length + 1}`); }
+    else if (scopeGroupId) { extraFilters.push(`s.group_id = $${params.length + extraFilters.length + 1}`); }
+    if (extraFilters.length > 0) orderQuery += ` AND ${extraFilters.join(' AND ')}`;
     orderQuery += ' GROUP BY DATE(o.created_at) ORDER BY date';
-    // Transactions (topup/payment) data
+    // Transactions (topup/payment)
     let txQuery = `
       SELECT DATE(t.created_at) as date,
         COALESCE(SUM(CASE WHEN t.type='topup' THEN t.amount ELSE 0 END), 0) as topup,
@@ -1241,23 +1245,30 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       FROM transactions t
       WHERE ${txDateFilter}
     `;
-    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
+    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + (storeId ? 1 : (scopeGroupId ? 1 : 0)) + 1}`; }
+    else if (storeId) {
+      // For individual store, find its group_id
+      txQuery += ` AND t.group_id = (SELECT group_id FROM stores WHERE id = $${params.length + 2})`;
+    }
     txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
 
-    const orderParams = scopeGroupId ? [...params, scopeGroupId] : params;
+    const orderFilterVal = storeId || scopeGroupId;
+    const orderParams = orderFilterVal ? [...params, orderFilterVal] : params;
+    const txFilterVal = scopeGroupId || storeId;
+    const txParams = txFilterVal ? [...params, txFilterVal] : params;
     const [orderRes, txRes] = await Promise.all([
       db.query(orderQuery, orderParams),
-      db.query(txQuery, orderParams),
+      db.query(txQuery, txParams),
     ]);
     // Merge by date
     const dateMap = {};
     orderRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, singlePay: parseInt(r.single_pay) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
     });
     txRes.rows.forEach(r => {
       const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
+      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, singlePay: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0 };
       dateMap[d].topup = parseInt(r.topup) || 0;
       dateMap[d].consumption = parseInt(r.consumption) || 0;
       dateMap[d].manualTopup = parseInt(r.manual_topup) || 0;
@@ -1374,6 +1385,26 @@ app.get('/api/admin/revenue-export', async (req, res) => {
       const date = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
       csv += `${date},"${row.store_name}",${row.orders},${row.revenue}\n`;
     });
+    csv += '\n';
+
+    // Per-machine revenue breakdown
+    let machineQuery = `
+      SELECT o.machine_id, s.name as store_name, COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue
+      FROM orders o JOIN stores s ON o.store_id = s.id
+      WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}
+    `;
+    if (scopeGroupId) { machineQuery += ` AND s.group_id = $${params.length + 1}`; }
+    machineQuery += ' GROUP BY o.machine_id, s.name ORDER BY s.name, o.machine_id';
+    try {
+      const machineRes = await db.query(machineQuery, qParams);
+      if (machineRes.rows.length > 0) {
+        csv += '【機台營收明細】\n';
+        csv += '機台編號,所屬門市,交易筆數,營收金額\n';
+        machineRes.rows.forEach(row => {
+          csv += `"${row.machine_id || '未知'}","${row.store_name}",${row.orders},${row.revenue}\n`;
+        });
+      }
+    } catch (e) { /* machine_id column might not exist */ }
 
     const today = new Date().toISOString().split('T')[0];
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
