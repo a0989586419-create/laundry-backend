@@ -240,6 +240,9 @@ app.get('/api/user/profile', async (req, res) => {
     const wallets = {};
     wr.rows.forEach(w => { wallets[w.group_id] = w.balance; });
 
+    // Get member level info
+    const memberLevel = await getMemberLevel(lineUserId);
+
     res.json({
       memberId: member.id,
       lineUserId,
@@ -248,6 +251,7 @@ app.get('/api/user/profile', async (req, res) => {
       groups,
       wallets,
       permissions: roleInfo.permissions,
+      memberLevel,
     });
   } catch (e) {
     console.error('profile error:', e);
@@ -1789,6 +1793,312 @@ app.get('/api/admin/revenue-export', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════
+//  API: Member Level System
+// ═══════════════════════════════════════
+
+// Helper: calculate member level from total spent
+async function getMemberLevel(lineUserId) {
+  try {
+    // Sum all spending transactions (type = 'payment' or 'deduct' are negative amounts, topup are positive)
+    const spentResult = await db.query(
+      `SELECT COALESCE(SUM(ABS(amount)), 0) as total_spent
+       FROM transactions WHERE line_user_id = $1 AND type IN ('payment', 'deduct')`,
+      [lineUserId]
+    );
+    const totalSpent = parseInt(spentResult.rows[0].total_spent) || 0;
+
+    // Get all levels ordered by min_points desc to find the highest matching level
+    const levels = await db.query('SELECT * FROM member_levels ORDER BY min_points DESC');
+    let currentLevel = levels.rows[levels.rows.length - 1]; // default: lowest level
+    let nextLevel = null;
+
+    for (let i = 0; i < levels.rows.length; i++) {
+      if (totalSpent >= levels.rows[i].min_points) {
+        currentLevel = levels.rows[i];
+        nextLevel = i > 0 ? levels.rows[i - 1] : null;
+        break;
+      }
+    }
+
+    const pointsToNext = nextLevel ? nextLevel.min_points - totalSpent : 0;
+
+    return {
+      level: {
+        name: currentLevel.name,
+        icon: currentLevel.icon,
+        discount_percent: currentLevel.discount_percent,
+        benefits: currentLevel.benefits,
+      },
+      totalSpent,
+      nextLevel: nextLevel ? { name: nextLevel.name, icon: nextLevel.icon, min_points: nextLevel.min_points } : null,
+      pointsToNext: Math.max(0, pointsToNext),
+    };
+  } catch (e) {
+    return {
+      level: { name: '普通會員', icon: '🌱', discount_percent: 0, benefits: '基本會員權益' },
+      totalSpent: 0,
+      nextLevel: { name: '銅牌會員', icon: '🥉', min_points: 500 },
+      pointsToNext: 500,
+    };
+  }
+}
+
+app.get('/api/member/level', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const result = await getMemberLevel(userId);
+    res.json(result);
+  } catch (e) {
+    console.error('member level error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Referral Code System
+// ═══════════════════════════════════════
+
+// Helper: generate referral code YP + 6 random alphanumeric
+function generateReferralCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // removed confusing chars 0OI1
+  let code = 'YP';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+app.get('/api/member/referral', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Get or create referral code
+    let codeRow = await db.query('SELECT * FROM referral_codes WHERE line_user_id = $1', [userId]);
+    if (codeRow.rows.length === 0) {
+      // Generate unique code with retry
+      let code;
+      let attempts = 0;
+      while (attempts < 10) {
+        code = generateReferralCode();
+        try {
+          await db.query(
+            'INSERT INTO referral_codes (line_user_id, code) VALUES ($1, $2)',
+            [userId, code]
+          );
+          break;
+        } catch (e) {
+          attempts++;
+          if (attempts >= 10) throw new Error('Failed to generate unique referral code');
+        }
+      }
+      codeRow = await db.query('SELECT * FROM referral_codes WHERE line_user_id = $1', [userId]);
+    }
+
+    const referralCode = codeRow.rows[0];
+
+    // Get referral records
+    const records = await db.query(
+      `SELECT rr.referred_id, rr.reward_given, rr.created_at,
+              m.display_name
+       FROM referral_records rr
+       LEFT JOIN members m ON m.line_user_id = rr.referred_id
+       WHERE rr.referrer_id = $1
+       ORDER BY rr.created_at DESC`,
+      [userId]
+    );
+
+    const totalReward = referralCode.uses * referralCode.reward_points;
+
+    res.json({
+      code: referralCode.code,
+      uses: referralCode.uses,
+      rewardPoints: referralCode.reward_points,
+      totalReward,
+      records: records.rows.map(r => ({
+        referredId: r.referred_id,
+        displayName: r.display_name || '匿名用戶',
+        rewardGiven: r.reward_given,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (e) {
+    console.error('referral get error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/member/referral/use', async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) return res.status(400).json({ error: 'userId and code required' });
+
+    // Find the referral code
+    const codeResult = await db.query('SELECT * FROM referral_codes WHERE code = $1', [code.toUpperCase()]);
+    if (codeResult.rows.length === 0) {
+      return res.status(404).json({ error: '推薦碼不存在' });
+    }
+
+    const referralCode = codeResult.rows[0];
+
+    // Cannot refer yourself
+    if (referralCode.line_user_id === userId) {
+      return res.status(400).json({ error: '不能使用自己的推薦碼' });
+    }
+
+    // Check if already used by this user
+    const existing = await db.query(
+      'SELECT id FROM referral_records WHERE referred_id = $1',
+      [userId]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: '您已經使用過推薦碼了' });
+    }
+
+    const rewardPoints = referralCode.reward_points;
+    const referrerId = referralCode.line_user_id;
+
+    // Record the referral
+    await db.query(
+      'INSERT INTO referral_records (referrer_id, referred_id, code, reward_given) VALUES ($1, $2, $3, true)',
+      [referrerId, userId, code.toUpperCase()]
+    );
+
+    // Increment uses
+    await db.query('UPDATE referral_codes SET uses = uses + 1 WHERE code = $1', [code.toUpperCase()]);
+
+    // Reward both users: add to all their wallets
+    // Get all group wallets for referrer
+    const referrerWallets = await db.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [referrerId]);
+    for (const w of referrerWallets.rows) {
+      await db.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
+        [rewardPoints, referrerId, w.group_id]);
+      await db.query(
+        `INSERT INTO transactions (line_user_id, group_id, type, amount, description)
+         VALUES ($1, $2, 'referral_reward', $3, $4)`,
+        [referrerId, w.group_id, rewardPoints, `推薦獎勵 (被推薦人使用推薦碼 ${code.toUpperCase()})`]
+      );
+    }
+
+    // Get all group wallets for referred user
+    const referredWallets = await db.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [userId]);
+    for (const w of referredWallets.rows) {
+      await db.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
+        [rewardPoints, userId, w.group_id]);
+      await db.query(
+        `INSERT INTO transactions (line_user_id, group_id, type, amount, description)
+         VALUES ($1, $2, 'referral_bonus', $3, $4)`,
+        [userId, w.group_id, rewardPoints, `新用戶推薦碼獎勵 (NT$${rewardPoints})`]
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `推薦碼使用成功！您和推薦人各獲得 NT$${rewardPoints} 獎勵`,
+      reward: rewardPoints,
+    });
+  } catch (e) {
+    console.error('referral use error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin - Member Levels
+// ═══════════════════════════════════════
+
+app.get('/api/admin/member-levels', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const result = await db.query('SELECT * FROM member_levels ORDER BY min_points ASC');
+    res.json(result.rows);
+  } catch (e) {
+    console.error('admin member-levels error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/admin/member-levels/:id', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const { name, min_points, discount_percent, benefits, icon } = req.body;
+    const result = await db.query(
+      `UPDATE member_levels SET
+        name = COALESCE($1, name),
+        min_points = COALESCE($2, min_points),
+        discount_percent = COALESCE($3, discount_percent),
+        benefits = COALESCE($4, benefits),
+        icon = COALESCE($5, icon)
+       WHERE id = $6 RETURNING *`,
+      [name, min_points, discount_percent, benefits, icon, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Level not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('admin update member-level error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin - Referral Stats
+// ═══════════════════════════════════════
+
+app.get('/api/admin/referral-stats', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const totalReferrals = await db.query('SELECT COUNT(*) FROM referral_records');
+    const totalRewards = await db.query(
+      `SELECT COALESCE(SUM(rc.uses * rc.reward_points), 0) as total
+       FROM referral_codes rc WHERE rc.uses > 0`
+    );
+    const topReferrers = await db.query(
+      `SELECT rc.line_user_id, rc.code, rc.uses, rc.reward_points,
+              (rc.uses * rc.reward_points) as total_reward,
+              m.display_name
+       FROM referral_codes rc
+       LEFT JOIN members m ON m.line_user_id = rc.line_user_id
+       WHERE rc.uses > 0
+       ORDER BY rc.uses DESC
+       LIMIT 20`
+    );
+
+    res.json({
+      totalReferrals: parseInt(totalReferrals.rows[0].count),
+      totalRewards: parseInt(totalRewards.rows[0].total),
+      topReferrers: topReferrers.rows.map(r => ({
+        lineUserId: r.line_user_id,
+        displayName: r.display_name || '匿名用戶',
+        code: r.code,
+        uses: r.uses,
+        rewardPoints: r.reward_points,
+        totalReward: parseInt(r.total_reward),
+      })),
+    });
+  } catch (e) {
+    console.error('admin referral-stats error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
 // Admin: cleanup duplicate roles
@@ -1949,6 +2259,43 @@ async function initDB() {
     `).catch(() => {});
     // Add type column to orders for distinguishing coin_payment vs normal orders
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS type VARCHAR(30) DEFAULT 'online'`).catch(() => {});
+
+    // Member levels table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS member_levels (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(50) NOT NULL,
+        min_points INT DEFAULT 0,
+        discount_percent INT DEFAULT 0,
+        benefits TEXT DEFAULT '',
+        icon VARCHAR(10) DEFAULT '',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Referral codes table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS referral_codes (
+        id SERIAL PRIMARY KEY,
+        line_user_id VARCHAR(100) NOT NULL,
+        code VARCHAR(20) UNIQUE NOT NULL,
+        uses INT DEFAULT 0,
+        reward_points INT DEFAULT 50,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Referral records table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS referral_records (
+        id SERIAL PRIMARY KEY,
+        referrer_id VARCHAR(100) NOT NULL,
+        referred_id VARCHAR(100) NOT NULL,
+        code VARCHAR(20) NOT NULL,
+        reward_given BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
@@ -2009,6 +2356,19 @@ async function initDB() {
   const existing = await db.query('SELECT id FROM user_roles WHERE line_user_id=$1 AND role=$2 AND group_id IS NULL', [SUPER_ADMIN_LINE_ID, 'super_admin']);
   if (existing.rows.length === 0) {
     await db.query('INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, NULL)', [SUPER_ADMIN_LINE_ID, 'super_admin']);
+  }
+
+  // Seed member levels (if empty)
+  const levelCount = await db.query('SELECT COUNT(*) FROM member_levels');
+  if (parseInt(levelCount.rows[0].count) === 0) {
+    await db.query(`
+      INSERT INTO member_levels (name, min_points, discount_percent, benefits, icon) VALUES
+        ('普通會員', 0, 0, '基本會員權益', '🌱'),
+        ('銅牌會員', 500, 3, '消費享3%折扣', '🥉'),
+        ('銀牌會員', 2000, 5, '消費享5%折扣、生日優惠', '🥈'),
+        ('金牌會員', 5000, 8, '消費享8%折扣、生日優惠、專屬客服', '🥇'),
+        ('鑽石會員', 10000, 12, '消費享12%折扣、生日優惠、專屬客服、免費烘乾券', '💎')
+    `).catch(() => {});
   }
 
   console.log('DB initialized with multi-tenant tables');
