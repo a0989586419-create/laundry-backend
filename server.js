@@ -1368,8 +1368,7 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       dateMap[d].paymentCount = parseInt(r.payment_count) || 0;
     });
     const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
-    const isChainStore = !!(scopeGroupId && storeId);
-    res.json({ data: result, isChainStore });
+    res.json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
