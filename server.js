@@ -944,15 +944,15 @@ app.get('/api/admin/coupons', async (req, res) => {
 
 app.post('/api/admin/coupons', async (req, res) => {
   try {
-    const { userId, groupId, name, discount, type, minSpend, price, expiry, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, autoDistribute, notes, refundPolicy } = req.body;
+    const { userId, groupId, name, discount, type, minSpend, price, expiry, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, autoDistribute, notes, refundPolicy, redeemCode } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     const couponRes = await db.query(`
-      INSERT INTO admin_coupons (group_id, name, discount, type, min_spend, price, expiry, active, description, time_slot, device_limit, validity, store_scope, max_uses, category, notes, refund_policy, created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,true,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW()) RETURNING id
+      INSERT INTO admin_coupons (group_id, name, discount, type, min_spend, price, expiry, active, description, time_slot, device_limit, validity, store_scope, max_uses, category, notes, refund_policy, redeem_code, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,true,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()) RETURNING id
     `, [groupId||null, name, discount, type||'fixed', minSpend||0, price||0, expiry||'2026-12-31',
         description||'', timeSlot||'全時段可用', deviceLimit||'全機型適用', validity||'自購買起90日內有效',
-        storeScope||'全台門市', maxUses||0, category||'gift', notes||'', refundPolicy||'']);
+        storeScope||'全台門市', maxUses||0, category||'gift', notes||'', refundPolicy||'', redeemCode||'']);
     const couponId = couponRes.rows[0].id;
     // Auto-distribute to all members of the group
     if (autoDistribute) {
@@ -987,7 +987,7 @@ app.post('/api/admin/coupons', async (req, res) => {
 
 app.put('/api/admin/coupons/:id', async (req, res) => {
   try {
-    const { userId, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId, notes, refundPolicy } = req.body;
+    const { userId, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId, notes, refundPolicy, redeemCode } = req.body;
     const roleInfo = await getUserRole(userId);
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query(`
@@ -996,9 +996,9 @@ app.put('/api/admin/coupons/:id', async (req, res) => {
       price=COALESCE($8,price), description=COALESCE($9,description), time_slot=COALESCE($10,time_slot),
       device_limit=COALESCE($11,device_limit), validity=COALESCE($12,validity), store_scope=COALESCE($13,store_scope),
       max_uses=COALESCE($14,max_uses), category=COALESCE($15,category), group_id=COALESCE($16,group_id),
-      notes=COALESCE($17,notes), refund_policy=COALESCE($18,refund_policy)
+      notes=COALESCE($17,notes), refund_policy=COALESCE($18,refund_policy), redeem_code=COALESCE($19,redeem_code)
       WHERE id=$1
-    `, [req.params.id, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId, notes, refundPolicy]);
+    `, [req.params.id, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId, notes, refundPolicy, redeemCode]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1010,6 +1010,46 @@ app.delete('/api/admin/coupons/:id', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query('DELETE FROM admin_coupons WHERE id=$1', [req.params.id]);
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Redeem coupon by code
+app.post('/api/coupons/redeem', async (req, res) => {
+  try {
+    const { userId, code, groupId } = req.body;
+    if (!userId || !code) return res.status(400).json({ error: 'userId and code required' });
+    // Find coupon by redeem_code
+    const couponRes = await db.query(
+      `SELECT * FROM admin_coupons WHERE UPPER(redeem_code) = UPPER($1) AND active = true AND expiry >= CURRENT_DATE AND redeem_code != ''`,
+      [code.trim()]
+    );
+    if (couponRes.rows.length === 0) return res.status(404).json({ error: '無效的兌換碼' });
+    const coupon = couponRes.rows[0];
+    // Check if already redeemed by this user
+    const existing = await db.query(
+      'SELECT id FROM user_coupons WHERE line_user_id = $1 AND coupon_id = $2',
+      [userId, coupon.id]
+    );
+    if (existing.rows.length > 0) return res.status(400).json({ error: '您已經兌換過此優惠券' });
+    // Calculate expiry
+    let expiryDate = coupon.expiry;
+    const validityMatch = (coupon.validity || '').match(/(\d+)日/);
+    if (validityMatch) {
+      expiryDate = new Date(Date.now() + parseInt(validityMatch[1]) * 86400000).toISOString().split('T')[0];
+    }
+    const effectiveGroupId = groupId || coupon.group_id;
+    // Insert user_coupon
+    await db.query(`
+      INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
+      VALUES ($1, $2, $3, $4, $5, 'active')
+    `, [userId, coupon.id, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
+    res.json({
+      success: true,
+      coupon: {
+        name: coupon.name, discount: coupon.discount, type: coupon.type,
+        expiry: expiryDate, category: coupon.category || 'coupon',
+      },
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1441,6 +1481,7 @@ async function initDB() {
     // Add new columns if not exist
     await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS refund_policy TEXT DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS redeem_code VARCHAR(50) DEFAULT ''`).catch(() => {});
     // User coupons table (tracks purchased coupons per user)
     await db.query(`
       CREATE TABLE IF NOT EXISTS user_coupons (
