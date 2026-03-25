@@ -1483,14 +1483,14 @@ app.post('/api/machine/notify', async (req, res) => {
     const remainMin = Math.ceil((parseInt(remaining) || 0) / 60);
 
     if (status === 'done' || parseInt(remaining) <= 0) {
-      // Machine done: send completion Flex Message
       for (const u of targetUsers) {
-        sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum, supportUrl), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}${fallbackUsed ? ' (fallback)' : ''}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+        const ok = await sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum, supportUrl), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}${fallbackUsed ? ' (fallback)' : ''}` });
+        if (ok) pushedCount++;
       }
     } else if (remainMin > 0 && remainMin <= 5) {
-      // Almost done: send reminder
       for (const u of targetUsers) {
-        sendLineFlexMessage(u.line_user_id, '即將完成提醒', buildAlmostDoneFlexMessage(storeName, machineNum, remainMin, supportUrl), { pushType: 'auto_reminder', storeId: resolvedStoreId, description: `即將完成提醒 ${storeName} ${machineNum} 剩${remainMin}分${fallbackUsed ? ' (fallback)' : ''}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+        const ok = await sendLineFlexMessage(u.line_user_id, '即將完成提醒', buildAlmostDoneFlexMessage(storeName, machineNum, remainMin, supportUrl), { pushType: 'auto_reminder', storeId: resolvedStoreId, description: `即將完成提醒 ${storeName} ${machineNum} 剩${remainMin}分${fallbackUsed ? ' (fallback)' : ''}` });
+        if (ok) pushedCount++;
       }
     }
 
