@@ -841,7 +841,7 @@ app.get('/api/payment/confirm', async (req, res) => {
     const body = { amount: order.total_amount, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
     if (result.returnCode === '0000') {
-      await db.query(`UPDATE orders SET status='paid', paid_at=NOW() WHERE id=$1`, [orderId]);
+      await db.query(`UPDATE orders SET status='paid', paid_at=NOW(), payment_method='linepay' WHERE id=$1`, [orderId]);
       // Update machine state in DB
       await db.query(`
         INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
@@ -1593,7 +1593,7 @@ app.post('/api/machine/coin-insert', async (req, res) => {
     // Record as coin_payment order
     const orderId = 'COIN-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
     await db.query(
-      `INSERT INTO orders (id, store_id, machine_id, total_amount, status, type, paid_at, created_at) VALUES ($1,$2,$3,$4,'paid','coin_payment',NOW(),NOW())`,
+      `INSERT INTO orders (id, store_id, machine_id, total_amount, status, type, payment_method, paid_at, created_at) VALUES ($1,$2,$3,$4,'paid','coin_payment','coin',NOW(),NOW())`,
       [orderId, storeId, machineId, coinVal]
     );
     // Update machine cache coin counters
@@ -1730,20 +1730,42 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       coinQuery += ` AND cs.group_id = $${coinParams.length}`;
     }
     coinQuery += ' GROUP BY DATE(co.created_at) ORDER BY date';
-    const [orderRes, txRes, coinRes] = await Promise.all([
+    // Single-pay query (LINE Pay / Apple Pay direct payment, not wallet)
+    const spParams = [...params];
+    let spDateFilter = dateFilter.replace(/o\./g, 'sp.');
+    let spQuery = `
+      SELECT DATE(sp.created_at) as date, COALESCE(SUM(sp.total_amount), 0) as single_pay, COUNT(*) as single_pay_count
+      FROM orders sp LEFT JOIN stores ss ON sp.store_id = ss.id
+      WHERE sp.status IN ('paid','done','running','completed')
+        AND sp.payment_method IN ('linepay','applepay','creditcard')
+        AND COALESCE(sp.type, 'online') != 'coin_payment'
+        AND ${spDateFilter}
+    `;
+    if (storeId) {
+      spParams.push(storeId);
+      spQuery += ` AND sp.store_id = $${spParams.length}`;
+    } else if (scopeGroupId) {
+      spParams.push(scopeGroupId);
+      spQuery += ` AND ss.group_id = $${spParams.length}`;
+    }
+    spQuery += ' GROUP BY DATE(sp.created_at) ORDER BY date';
+    const [orderRes, txRes, coinRes, spRes] = await Promise.all([
       db.query(orderQuery, orderParams),
       db.query(txQuery, txParams),
       db.query(coinQuery, coinParams),
+      db.query(spQuery, spParams),
     ]);
     // Merge by date
+    const emptyDay = () => ({ revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0, coinCount: 0, singlePay: 0, singlePayCount: 0 });
     const dateMap = {};
+    const toD = r => r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
     orderRes.rows.forEach(r => {
-      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      dateMap[d] = { date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
+      const d = toD(r);
+      dateMap[d] = { ...emptyDay(), date: d, revenue: parseInt(r.revenue) || 0, orders: parseInt(r.orders) || 0 };
     });
     txRes.rows.forEach(r => {
-      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
+      const d = toD(r);
+      if (!dateMap[d]) dateMap[d] = { ...emptyDay(), date: d };
       dateMap[d].topup = parseInt(r.topup) || 0;
       dateMap[d].consumption = parseInt(r.consumption) || 0;
       dateMap[d].manualTopup = parseInt(r.manual_topup) || 0;
@@ -1752,9 +1774,16 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
       dateMap[d].paymentCount = parseInt(r.payment_count) || 0;
     });
     coinRes.rows.forEach(r => {
-      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      if (!dateMap[d]) dateMap[d] = { date: d, revenue: 0, orders: 0, topup: 0, consumption: 0, manualTopup: 0, manualDeduct: 0, topupCount: 0, paymentCount: 0, coinRevenue: 0 };
+      const d = toD(r);
+      if (!dateMap[d]) dateMap[d] = { ...emptyDay(), date: d };
       dateMap[d].coinRevenue = parseInt(r.coin_revenue) || 0;
+      dateMap[d].coinCount = parseInt(r.coin_count) || 0;
+    });
+    spRes.rows.forEach(r => {
+      const d = toD(r);
+      if (!dateMap[d]) dateMap[d] = { ...emptyDay(), date: d };
+      dateMap[d].singlePay = parseInt(r.single_pay) || 0;
+      dateMap[d].singlePayCount = parseInt(r.single_pay_count) || 0;
     });
     const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
     res.json(result);
@@ -1799,7 +1828,8 @@ app.get('/api/admin/revenue-export', async (req, res) => {
         COALESCE(SUM(CASE WHEN t.type='payment' THEN ABS(t.amount) ELSE 0 END), 0) as consumption,
         COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount > 0 THEN t.amount ELSE 0 END), 0) as manual_topup,
         COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount < 0 THEN ABS(t.amount) ELSE 0 END), 0) as manual_deduct,
-        COUNT(CASE WHEN t.type='topup' THEN 1 END) as topup_count
+        COUNT(CASE WHEN t.type='topup' THEN 1 END) as topup_count,
+        COUNT(CASE WHEN t.type='payment' THEN 1 END) as payment_count
       FROM transactions t WHERE ${txDateFilter}
     `;
     if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
@@ -1817,31 +1847,38 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     if (storeId) { coinExportQuery += ` AND co.store_id = $${coinExportParams.length + 1}`; coinExportParams.push(storeId); }
     coinExportQuery += ' GROUP BY DATE(co.created_at) ORDER BY date';
 
+    // Single-pay query for export (LINE Pay / Apple Pay direct payment)
+    const spExportParams = [...params];
+    let spExportDateFilter = dateFilter.replace(/o\./g, 'sp.');
+    let spExportQuery = `
+      SELECT DATE(sp.created_at) as date, COALESCE(SUM(sp.total_amount), 0) as single_pay, COUNT(*) as single_pay_count
+      FROM orders sp LEFT JOIN stores ss ON sp.store_id = ss.id
+      WHERE sp.status IN ('paid','done','running','completed')
+        AND sp.payment_method IN ('linepay','applepay','creditcard')
+        AND COALESCE(sp.type, 'online') != 'coin_payment'
+        AND ${spExportDateFilter}
+    `;
+    if (scopeGroupId) { spExportQuery += ` AND ss.group_id = $${spExportParams.length + 1}`; spExportParams.push(scopeGroupId); }
+    if (storeId) { spExportQuery += ` AND sp.store_id = $${spExportParams.length + 1}`; spExportParams.push(storeId); }
+    spExportQuery += ' GROUP BY DATE(sp.created_at) ORDER BY date';
+
     const orderParams = [...params, ...orderExtraParams];
     const txParams = scopeGroupId ? [...params, scopeGroupId] : params;
-    const [orderRes, txRes, coinExportRes] = await Promise.all([
+    const [orderRes, txRes, coinExportRes, spExportRes] = await Promise.all([
       db.query(orderQuery, orderParams),
       db.query(txQuery, txParams),
       db.query(coinExportQuery, coinExportParams),
+      db.query(spExportQuery, spExportParams),
     ]);
+    const toD = r => r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
     const txMap = {};
-    txRes.rows.forEach(r => {
-      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      txMap[d] = r;
-    });
+    txRes.rows.forEach(r => { txMap[toD(r)] = r; });
     const coinMap = {};
-    coinExportRes.rows.forEach(r => {
-      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-      coinMap[d] = r;
-    });
+    coinExportRes.rows.forEach(r => { coinMap[toD(r)] = r; });
+    const spMap = {};
+    spExportRes.rows.forEach(r => { spMap[toD(r)] = r; });
 
-    const BOM = '\uFEFF';
-    let csv = BOM + '=== 悠洗洗衣 營收報表 ===\n';
-    csv += `報表產生時間,${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}\n`;
-    const periodLabel = startDate && endDate ? `${startDate} ~ ${endDate}` : `近 ${params[0]} 天`;
-    csv += `查詢區間,${periodLabel}\n\n`;
-
-    // Summary section
+    // Compute totals
     const totalRevenue = orderRes.rows.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
     const totalOrders = orderRes.rows.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
     const totalTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.topup) || 0), 0);
@@ -1849,47 +1886,60 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     const totalManualTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_topup) || 0), 0);
     const totalManualDeduct = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_deduct) || 0), 0);
     const totalTopupCount = txRes.rows.reduce((s, r) => s + (parseInt(r.topup_count) || 0), 0);
+    const totalPaymentCount = txRes.rows.reduce((s, r) => s + (parseInt(r.payment_count) || 0), 0);
     const totalCoinRevenue = coinExportRes.rows.reduce((s, r) => s + (parseInt(r.coin_revenue) || 0), 0);
+    const totalCoinCount = coinExportRes.rows.reduce((s, r) => s + (parseInt(r.coin_count) || 0), 0);
+    const totalSinglePay = spExportRes.rows.reduce((s, r) => s + (parseInt(r.single_pay) || 0), 0);
+    const totalSinglePayCount = spExportRes.rows.reduce((s, r) => s + (parseInt(r.single_pay_count) || 0), 0);
 
-    csv += '【期間總覽】\n';
-    csv += `項目,金額/數量\n`;
-    csv += `機台營業總額,${totalRevenue}\n`;
-    csv += `消費交易筆數,${totalOrders}\n`;
-    csv += `投幣營收總額,${totalCoinRevenue}\n`;
-    csv += `線上儲值總額,${totalTopup}\n`;
+    const BOM = '\uFEFF';
+    const periodLabel = startDate && endDate ? `${startDate} ~ ${endDate}` : `近 ${params[0]} 天`;
+    const genTime = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+    let csv = BOM;
+    csv += '=== 雲管家營收報表 ===\n';
+    csv += `報表期間:,${periodLabel}\n`;
+    csv += `產生時間:,${genTime}\n\n`;
+
+    csv += '=== 營收摘要 ===\n';
+    csv += `項目,金額\n`;
+    csv += `機台營業總額,$${totalRevenue}\n`;
+    csv += `儲值點數消費,$${totalConsumption}\n`;
+    csv += `單次線上支付,$${totalSinglePay}\n`;
+    csv += `現金投幣收入,$${totalCoinRevenue}\n`;
+    csv += `線上儲值總額,$${totalTopup}\n`;
+    csv += `手動加值,$${totalManualTopup}\n`;
+    csv += `手動扣款,$${totalManualDeduct}\n`;
+    csv += `淨儲值,$${totalTopup - totalConsumption + totalManualTopup - totalManualDeduct}\n`;
+    csv += `總交易筆數,${totalOrders}\n`;
     csv += `儲值筆數,${totalTopupCount}\n`;
-    csv += `消費點數總額,${totalConsumption}\n`;
-    csv += `手動加值總額,${totalManualTopup}\n`;
-    csv += `手動扣款總額,${totalManualDeduct}\n`;
-    csv += `淨儲值(儲值-消費),${totalTopup - totalConsumption}\n\n`;
+    csv += `消費筆數(點數),${totalPaymentCount}\n`;
+    csv += `投幣筆數,${totalCoinCount}\n`;
+    csv += `單次支付筆數,${totalSinglePayCount}\n\n`;
 
     // Daily transaction summary
-    csv += '【每日金流摘要】\n';
-    csv += '日期,機台營收,消費筆數,投幣金額,線上儲值,儲值筆數,消費點數,手動加值,手動扣款\n';
+    csv += '=== 每日明細 ===\n';
+    csv += '日期,機台營收,儲值消費,單次支付,投幣金額,線上儲值,儲值筆數,消費筆數,投幣筆數,單次支付筆數\n';
     const allDates = new Set([
-      ...orderRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
-      ...txRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
-      ...coinExportRes.rows.map(r => (r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0])),
+      ...orderRes.rows.map(r => toD(r)),
+      ...txRes.rows.map(r => toD(r)),
+      ...coinExportRes.rows.map(r => toD(r)),
+      ...spExportRes.rows.map(r => toD(r)),
     ]);
     [...allDates].sort().forEach(d => {
-      const dayOrders = orderRes.rows.filter(r => {
-        const rd = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
-        return rd === d;
-      });
+      const dayOrders = orderRes.rows.filter(r => toD(r) === d);
       const dayRev = dayOrders.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
-      const dayOrdCnt = dayOrders.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
       const tx = txMap[d] || {};
       const coin = coinMap[d] || {};
-      csv += `${d},${dayRev},${dayOrdCnt},${parseInt(coin.coin_revenue)||0},${parseInt(tx.topup)||0},${parseInt(tx.topup_count)||0},${parseInt(tx.consumption)||0},${parseInt(tx.manual_topup)||0},${parseInt(tx.manual_deduct)||0}\n`;
+      const sp = spMap[d] || {};
+      csv += `${d},${dayRev},${parseInt(tx.consumption)||0},${parseInt(sp.single_pay)||0},${parseInt(coin.coin_revenue)||0},${parseInt(tx.topup)||0},${parseInt(tx.topup_count)||0},${parseInt(tx.payment_count)||0},${parseInt(coin.coin_count)||0},${parseInt(sp.single_pay_count)||0}\n`;
     });
     csv += '\n';
 
     // Store breakdown (with machine detail)
-    csv += '【門市明細】\n';
+    csv += '=== 機台明細 ===\n';
     csv += '日期,店舖名稱,機台編號,交易筆數,營收金額\n';
     orderRes.rows.forEach(row => {
-      const date = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
-      csv += `${date},"${row.store_name}","${row.machine_id}",${row.orders},${row.revenue}\n`;
+      csv += `${toD(row)},"${row.store_name}","${row.machine_id}",${row.orders},${row.revenue}\n`;
     });
     csv += '\n';
 
@@ -1906,7 +1956,7 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     try {
       const machineRes = await db.query(machineQuery, [...params, ...machineExtraParams]);
       if (machineRes.rows.length > 0) {
-        csv += '【機台營收明細】\n';
+        csv += '=== 機台營收彙總 ===\n';
         csv += '機台編號,所屬門市,交易筆數,營收金額\n';
         machineRes.rows.forEach(row => {
           csv += `"${row.machine_id || '未知'}","${row.store_name}",${row.orders},${row.revenue}\n`;
@@ -2453,6 +2503,8 @@ async function initDB() {
     `).catch(() => {});
     // Add type column to orders for distinguishing coin_payment vs normal orders
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS type VARCHAR(30) DEFAULT 'online'`).catch(() => {});
+    // Add payment_method column to orders for distinguishing wallet vs linepay vs coin
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(30) DEFAULT 'wallet'`).catch(() => {});
 
     // Member levels table
     await db.query(`
