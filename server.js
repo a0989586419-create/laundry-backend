@@ -250,7 +250,7 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
           { type: 'text', text: '!', size: 'xxl', color: '#E67E22', weight: 'bold' },
-          { type: 'text', text: '運轉完成通知訊息', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
+          { type: 'text', text: '洗衣完成', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
         ]},
         { type: 'separator', margin: 'lg' },
         { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！！', size: 'md', wrap: true, margin: 'lg' },
