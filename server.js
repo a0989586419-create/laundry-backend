@@ -46,6 +46,7 @@ if (mqttClient) {
 
 const machineCache = {};
 
+if (mqttClient) {
 mqttClient.on('connect', () => {
   console.log('MQTT connected');
   mqttClient.subscribe('laundry/+/+/status', { qos: 1 });
@@ -86,6 +87,15 @@ mqttClient.on('message', async (topic, payload) => {
     }
   } catch (e) { console.error(e.message); }
 });
+} // end if (mqttClient)
+
+// ===== IoT API Key middleware for device endpoints =====
+const IOT_API_KEY = process.env.IOT_API_KEY || 'ypure-iot-2026-default-key';
+function requireIotApiKey(req, res, next) {
+  const key = req.headers['x-api-key'] || req.query.apiKey;
+  if (key !== IOT_API_KEY) return res.status(401).json({ error: 'Invalid or missing API key' });
+  next();
+}
 
 // ===== ThingsBoard RPC Helper =====
 let tbToken = null;
@@ -96,7 +106,7 @@ async function getTBToken() {
   const res = await fetch('http://vps3.monsterstore.tw:8080/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: 'sl6963693171@gmail.com', password: 's85010805' }),
+    body: JSON.stringify({ username: process.env.TB_USERNAME || 'sl6963693171@gmail.com', password: process.env.TB_PASSWORD || 's85010805' }),
   });
   const data = await res.json();
   tbToken = data.token;
@@ -594,8 +604,10 @@ app.get('/api/store-groups/:groupId', async (req, res) => {
 });
 
 app.get('/api/stores', async (req, res) => {
-  const r = await db.query('SELECT s.*, sg.name as group_name, sg.type as group_type FROM stores s LEFT JOIN store_groups sg ON s.group_id=sg.id ORDER BY s.name');
-  res.json(r.rows);
+  try {
+    const r = await db.query('SELECT s.*, sg.name as group_name, sg.type as group_type FROM stores s LEFT JOIN store_groups sg ON s.group_id=sg.id ORDER BY s.name');
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════
@@ -611,50 +623,62 @@ app.get('/api/wallet/:groupId', async (req, res) => {
 });
 
 app.post('/api/wallet/topup', async (req, res) => {
+  const client = await db.connect();
   try {
-    const { userId, groupId, amount } = req.body;
+    const { userId, groupId, amount, _internal } = req.body;
     if (!userId || !groupId || !amount) return res.status(400).json({ error: 'userId, groupId, amount required' });
     if (amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
 
+    await client.query('BEGIN');
     // Upsert wallet
-    await db.query(`
+    await client.query(`
       INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
       ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
     `, [userId, groupId, amount]);
-
     // Record transaction
-    await db.query(`
+    await client.query(`
       INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
       VALUES ($1, $2, 'topup', $3, $4, NOW())
     `, [userId, groupId, amount, `Topup +${amount}`]);
+    await client.query('COMMIT');
 
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
     res.json({ success: true, balance: r.rows[0].balance });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
 });
 
 app.post('/api/wallet/deduct', async (req, res) => {
+  const client = await db.connect();
   try {
     const { userId, groupId, amount, description } = req.body;
     if (!userId || !groupId || !amount) return res.status(400).json({ error: 'missing params' });
 
-    // Check balance
-    const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
-    const balance = wr.rows[0]?.balance || 0;
-    if (balance < amount) return res.status(400).json({ error: 'insufficient balance', balance });
-
-    // Deduct
-    await db.query(`UPDATE wallets SET balance = balance - $3 WHERE line_user_id=$1 AND group_id=$2`, [userId, groupId, amount]);
-
+    await client.query('BEGIN');
+    // Atomic deduct with balance check in single statement
+    const deductResult = await client.query(
+      `UPDATE wallets SET balance = balance - $3 WHERE line_user_id=$1 AND group_id=$2 AND balance >= $3 RETURNING balance`,
+      [userId, groupId, amount]
+    );
+    if (deductResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
+      return res.status(400).json({ error: 'insufficient balance', balance: wr.rows[0]?.balance || 0 });
+    }
     // Record transaction
-    await db.query(`
+    await client.query(`
       INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
       VALUES ($1, $2, 'payment', $3, $4, NOW())
     `, [userId, groupId, -amount, description || 'Payment']);
+    await client.query('COMMIT');
 
-    const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
-    res.json({ success: true, balance: r.rows[0].balance });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ success: true, balance: deductResult.rows[0].balance });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
 });
 
 // ═══════════════════════════════════════
@@ -1258,7 +1282,7 @@ app.post('/api/payment/create', async (req, res) => {
 });
 
 // API: Report machine state from frontend (for cross-user visibility)
-app.post('/api/machines/state', async (req, res) => {
+app.post('/api/machines/state', requireIotApiKey, async (req, res) => {
   try {
     const { machineId, state, remainSec } = req.body;
     if (!machineId) return res.status(400).json({ error: 'machineId required' });
@@ -1286,11 +1310,13 @@ app.post('/api/topup/linepay', async (req, res) => {
     const groupName = gr.rows[0]?.name || '洗衣服務';
 
     try {
+      // Store topup order in DB for tamper-proof confirm
+      await db.query(`INSERT INTO orders (id, store_id, member_id, machine_id, mode, amount, status, created_at) VALUES ($1, 'topup', $2, $3, 'topup', $4, 'pending', NOW()) ON CONFLICT DO NOTHING`, [orderId, userId, groupId, amount]);
       const payBody = {
         amount, currency: 'TWD', orderId,
         packages: [{ id: orderId, amount, name: `${groupName} 儲值`, products: [{ name: `${groupName} 點數儲值 ${amount}點`, quantity: 1, price: amount }] }],
         redirectUrls: {
-          confirmUrl: `${SERVER_URL}/api/topup/confirm?userId=${encodeURIComponent(userId)}&groupId=${groupId}&amount=${amount}`,
+          confirmUrl: `${SERVER_URL}/api/topup/confirm?orderId=${orderId}`,
           cancelUrl: `${FRONTEND_URL}/?status=cancel`,
         },
       };
@@ -1327,9 +1353,23 @@ app.post('/api/topup/linepay', async (req, res) => {
 
 app.get('/api/topup/confirm', async (req, res) => {
   try {
-    const { transactionId, userId, groupId, amount } = req.query;
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
-    const amountInt = parseInt(amount);
+    const { transactionId, orderId, userId: legacyUserId, groupId: legacyGroupId, amount: legacyAmount } = req.query;
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-chi.vercel.app';
+
+    // Retrieve order from DB (tamper-proof) or fallback to legacy URL params
+    let userId, groupId, amountInt;
+    if (orderId) {
+      const orderRow = (await db.query('SELECT member_id, machine_id, amount FROM orders WHERE id=$1 AND status=$2', [orderId, 'pending'])).rows[0];
+      if (!orderRow) return res.redirect(`${FRONTEND_URL}/?status=topup_fail&reason=order_not_found`);
+      userId = orderRow.member_id;
+      groupId = orderRow.machine_id; // stored groupId in machine_id field for topup orders
+      amountInt = orderRow.amount;
+      await db.query('UPDATE orders SET status=$1 WHERE id=$2', ['confirming', orderId]);
+    } else {
+      // Legacy fallback for old URLs
+      userId = legacyUserId; groupId = legacyGroupId; amountInt = parseInt(legacyAmount);
+    }
+
     const body = { amount: amountInt, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
     if (result.returnCode === '0000') {
@@ -1435,7 +1475,7 @@ app.post('/api/admin/machine/control', async (req, res) => {
 // ═══════════════════════════════════════
 //  API: Machine State Update (from IoT / ThingsBoard webhook)
 // ═══════════════════════════════════════
-app.post('/api/machines/state/update', async (req, res) => {
+app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
   const { storeId, machineId, status, remaining, mode, temperature, rpm, power, waterLevel, coinCount, coinTotal } = req.body;
   if (!machineId) return res.status(400).json({ error: 'machineId required' });
   try {
@@ -1461,7 +1501,7 @@ app.post('/api/machines/state/update', async (req, res) => {
 // ═══════════════════════════════════════
 //  API: Machine Notify (queue notification)
 // ═══════════════════════════════════════
-app.post('/api/machine/notify', async (req, res) => {
+app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
   try {
     const { machineId, storeId, remaining, status } = req.body;
     const resolvedStoreId = storeId || machineId?.split('-')[0];
@@ -1888,7 +1928,7 @@ app.get('/api/coupons/mine', async (req, res) => {
 // ═══════════════════════════════════════
 //  API: Coin Insert (called by edge controller)
 // ═══════════════════════════════════════
-app.post('/api/machine/coin-insert', async (req, res) => {
+app.post('/api/machine/coin-insert', requireIotApiKey, async (req, res) => {
   try {
     const { storeId, machineId, amount, coinType } = req.body;
     if (!storeId || !machineId || !amount) return res.status(400).json({ error: 'storeId, machineId, amount required' });
@@ -1902,7 +1942,7 @@ app.post('/api/machine/coin-insert', async (req, res) => {
     );
     // Update machine cache coin counters
     if (!machineCache[machineId]) machineCache[machineId] = {};
-    machineCache[machineId].coinCount = (machineCache[machineId].coinCount || 0) + (ct === '50' ? 1 : 1);
+    machineCache[machineId].coinCount = (machineCache[machineId].coinCount || 0) + (ct === '50' ? 5 : 1);
     machineCache[machineId].coinTotal = (machineCache[machineId].coinTotal || 0) + coinVal;
     console.log(`Coin insert: ${storeId}/${machineId} +${coinVal} (${ct}元)`);
     res.json({ success: true, orderId, coinCount: machineCache[machineId].coinCount, coinTotal: machineCache[machineId].coinTotal });
