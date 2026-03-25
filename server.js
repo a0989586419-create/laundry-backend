@@ -173,72 +173,62 @@ async function sendLineFlexMessage(userId, altText, contents, options = {}) {
   return sendLinePush(userId, [{ type: 'flex', altText, contents }], options);
 }
 
-// ===== Flex Message Template Builders =====
+// ===== Flex Message Template Builders (ODay-inspired clean style) =====
 const LIFF_URL = 'https://liff.line.me/2009552592-xkDKSJ1Y';
 const BRAND_PRIMARY = '#3A3A8C';
 const BRAND_GOLD = '#E5B94C';
+const GREEN = '#2ECC71';
+const RED = '#E74C3C';
 
 function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, discount, finalAmount, orderId, paymentMethod, minutes }) {
   return {
     type: 'bubble',
-    size: 'giga',
-    header: {
-      type: 'box', layout: 'vertical',
-      backgroundColor: BRAND_PRIMARY,
-      paddingAll: '20px',
-      contents: [
-        { type: 'text', text: '雲管家', color: BRAND_GOLD, size: 'sm', weight: 'bold' },
-        { type: 'text', text: '付款成功', color: '#FFFFFF', size: 'xl', weight: 'bold', margin: 'sm' },
-      ]
-    },
     body: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: storeName || '門市', size: 'lg', weight: 'bold' },
-        { type: 'text', text: machineName || '機器', color: '#888888', size: 'sm', margin: 'sm' },
+        { type: 'text', text: '收據', color: GREEN, size: 'sm', weight: 'bold' },
+        { type: 'text', text: `${storeName || '雲管家'}`, size: 'lg', weight: 'bold' },
+        { type: 'text', text: machineName || '', color: '#888888', size: 'sm' },
         { type: 'separator', margin: 'lg' },
         { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-          { type: 'text', text: modeName || '標準洗衣', flex: 3, size: 'md' },
-          { type: 'text', text: `$${amount || 0}`, flex: 2, size: 'md', align: 'end', weight: 'bold' },
+          { type: 'text', text: modeName || '洗衣+烘乾(標準)', flex: 5, size: 'md', weight: 'bold' },
+          { type: 'text', text: `$ ${amount || 0}`, flex: 3, size: 'md', align: 'end' },
         ]},
-        { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
-          { type: 'text', text: '優惠折抵', flex: 3, size: 'sm', color: BRAND_GOLD },
-          { type: 'text', text: `-$${discount || 0}`, flex: 2, size: 'sm', align: 'end', color: BRAND_GOLD },
+        { type: 'box', layout: 'horizontal', contents: [
+          { type: 'text', text: '使用店家點數折抵', flex: 5, size: 'sm', color: GREEN },
+          { type: 'text', text: `-${discount || 0}`, flex: 3, size: 'sm', align: 'end', color: GREEN },
+        ]},
+        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+          { type: 'text', text: '付款金額', flex: 5, size: 'md', weight: 'bold' },
+          { type: 'text', text: `NT $ ${finalAmount || amount || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: GREEN },
         ]},
         { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-          { type: 'text', text: '付款金額', flex: 3, size: 'md', weight: 'bold' },
-          { type: 'text', text: `NT$ ${finalAmount || amount || 0}`, flex: 2, size: 'xl', align: 'end', weight: 'bold', color: BRAND_PRIMARY },
-        ]},
-        { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm', contents: [
+        { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '訂單編號', size: 'xs', color: '#AAAAAA', flex: 2 },
-            { type: 'text', text: `#${orderId || '---'}`, size: 'xs', color: '#AAAAAA', flex: 3, align: 'end' },
+            { type: 'text', text: '訂單編號', size: 'xs', color: '#AAAAAA', flex: 3 },
+            { type: 'text', text: `#${orderId || '---'}`, size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '交易時間', size: 'xs', color: '#AAAAAA', flex: 2 },
-            { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAAAAA', flex: 3, align: 'end' },
+            { type: 'text', text: '交易時間', size: 'xs', color: '#AAAAAA', flex: 3 },
+            { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '付款方式', size: 'xs', color: '#AAAAAA', flex: 2 },
-            { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#AAAAAA', flex: 3, align: 'end' },
+            { type: 'text', text: '付款方式', size: 'xs', color: '#AAAAAA', flex: 3 },
+            { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
           ]},
         ]},
-        { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-          { type: 'text', text: '預計完成', size: 'sm', color: BRAND_GOLD, weight: 'bold', flex: 2 },
-          { type: 'text', text: `約 ${minutes || 65} 分鐘`, size: 'sm', color: BRAND_GOLD, flex: 3, align: 'end' },
+        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+          { type: 'text', text: `預計 ${minutes || 65} 分鐘完成`, size: 'sm', color: RED, weight: 'bold' },
         ]},
       ]
     },
     footer: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
-      spacing: 'sm',
+      type: 'box', layout: 'horizontal', paddingAll: '16px', spacing: 'md',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看運轉狀態', uri: LIFF_URL }, style: 'primary', color: BRAND_PRIMARY, height: 'sm' },
-        { type: 'button', action: { type: 'uri', label: '聯繫客服', uri: LIFF_URL }, style: 'secondary', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'link', height: 'sm', flex: 1 },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'link', height: 'sm', flex: 1 },
       ]
     }
   };
@@ -247,43 +237,35 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
 function buildCompleteFlexMessage(storeName, machineName) {
   return {
     type: 'bubble',
-    size: 'giga',
-    header: {
-      type: 'box', layout: 'vertical',
-      backgroundColor: BRAND_GOLD,
-      paddingAll: '20px',
-      contents: [
-        { type: 'box', layout: 'horizontal', contents: [
-          { type: 'text', text: '\u26A1', size: 'xxl' },
-          { type: 'text', text: '運轉完成通知', size: 'xl', weight: 'bold', color: BRAND_PRIMARY, margin: 'sm' },
-        ]},
-      ]
-    },
     body: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！', size: 'md', wrap: true },
+        { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#FFF3CD', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '!', color: '#F39C12', size: 'lg', weight: 'bold', align: 'center' },
+          ]},
+          { type: 'text', text: '運轉完成通知訊息', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
+        ]},
         { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm', contents: [
+        { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！！', size: 'md', wrap: true, margin: 'lg' },
+        { type: 'separator', margin: 'lg' },
+        { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
+            { type: 'text', text: '門市', size: 'sm', color: '#888', flex: 2 },
             { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
+            { type: 'text', text: '機器', size: 'sm', color: '#888', flex: 2 },
             { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
           ]},
         ]},
-        { type: 'text', text: '提醒：請盡快取回衣物，避免佔用機器', size: 'xs', color: '#999999', margin: 'lg', wrap: true },
+        { type: 'text', text: '提醒：本訊息內容由店家發送。', size: 'xs', color: '#AAAAAA', margin: 'lg' },
       ]
     },
     footer: {
-      type: 'box', layout: 'horizontal',
-      paddingAll: '20px',
-      spacing: 'sm',
+      type: 'box', layout: 'vertical', paddingAll: '16px',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: LIFF_URL }, style: 'primary', color: BRAND_PRIMARY, height: 'sm', flex: 1 },
+        { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
       ]
     }
   };
@@ -292,46 +274,31 @@ function buildCompleteFlexMessage(storeName, machineName) {
 function buildTopupFlexMessage({ groupName, amount, balance }) {
   return {
     type: 'bubble',
-    size: 'giga',
-    header: {
-      type: 'box', layout: 'vertical',
-      backgroundColor: BRAND_PRIMARY,
-      paddingAll: '20px',
-      contents: [
-        { type: 'text', text: '雲管家', color: BRAND_GOLD, size: 'sm', weight: 'bold' },
-        { type: 'text', text: '儲值成功', color: '#FFFFFF', size: 'xl', weight: 'bold', margin: 'sm' },
-      ]
-    },
     body: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: groupName || '洗衣服務', size: 'lg', weight: 'bold' },
-        { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+        { type: 'text', text: '儲值成功', color: GREEN, size: 'sm', weight: 'bold' },
+        { type: 'text', text: groupName || '雲管家', size: 'lg', weight: 'bold' },
+        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
           { type: 'text', text: '儲值金額', flex: 3, size: 'md' },
-          { type: 'text', text: `+NT$ ${amount}`, flex: 2, size: 'lg', align: 'end', weight: 'bold', color: '#27AE60' },
+          { type: 'text', text: `+NT$ ${amount}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: GREEN },
         ]},
-        { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
           { type: 'text', text: '目前餘額', flex: 3, size: 'md', weight: 'bold' },
-          { type: 'text', text: `NT$ ${balance || 0}`, flex: 2, size: 'xl', align: 'end', weight: 'bold', color: BRAND_PRIMARY },
+          { type: 'text', text: `NT$ ${balance || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold' },
         ]},
-        { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm', contents: [
-          { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '交易時間', size: 'xs', color: '#AAAAAA', flex: 2 },
-            { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAAAAA', flex: 3, align: 'end' },
-          ]},
+        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+          { type: 'text', text: '交易時間', size: 'xs', color: '#AAA', flex: 3 },
+          { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAA', flex: 5, align: 'end' },
         ]},
       ]
     },
     footer: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
-      spacing: 'sm',
+      type: 'box', layout: 'vertical', paddingAll: '16px',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '立即使用', uri: LIFF_URL }, style: 'primary', color: BRAND_PRIMARY, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '立即使用', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
       ]
     }
   };
@@ -340,46 +307,37 @@ function buildTopupFlexMessage({ groupName, amount, balance }) {
 function buildAlmostDoneFlexMessage(storeName, machineName, remainMin) {
   return {
     type: 'bubble',
-    size: 'giga',
-    header: {
-      type: 'box', layout: 'vertical',
-      backgroundColor: '#FFF3CD',
-      paddingAll: '20px',
-      contents: [
-        { type: 'box', layout: 'horizontal', contents: [
-          { type: 'text', text: '\u23F0', size: 'xxl' },
-          { type: 'text', text: '即將完成提醒', size: 'xl', weight: 'bold', color: '#856404', margin: 'sm' },
-        ]},
-      ]
-    },
     body: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: `您的洗衣即將完成，可以準備前往取衣了！`, size: 'md', wrap: true },
-        { type: 'separator', margin: 'lg' },
-        { type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm', contents: [
+        { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#FFF3CD', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '!', color: '#F39C12', size: 'lg', weight: 'bold', align: 'center' },
+          ]},
+          { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
+        ]},
+        { type: 'separator', margin: 'md' },
+        { type: 'text', text: '您的洗衣即將完成，可以準備前往取衣了！', size: 'md', wrap: true, margin: 'md' },
+        { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
+            { type: 'text', text: '門市', size: 'sm', color: '#888', flex: 2 },
             { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
+            { type: 'text', text: '機器', size: 'sm', color: '#888', flex: 2 },
             { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
           ]},
         ]},
-        { type: 'box', layout: 'horizontal', margin: 'lg', paddingAll: '12px', backgroundColor: '#FFF3CD', cornerRadius: '8px', contents: [
+        { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '12px', backgroundColor: '#FFF3CD', cornerRadius: '8px', contents: [
           { type: 'text', text: '剩餘時間', size: 'sm', color: '#856404', flex: 2, weight: 'bold' },
           { type: 'text', text: `約 ${remainMin} 分鐘`, size: 'lg', color: '#856404', flex: 3, align: 'end', weight: 'bold' },
         ]},
       ]
     },
     footer: {
-      type: 'box', layout: 'horizontal',
-      paddingAll: '20px',
-      spacing: 'sm',
+      type: 'box', layout: 'vertical', paddingAll: '16px',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看狀態', uri: LIFF_URL }, style: 'primary', color: BRAND_PRIMARY, height: 'sm', flex: 1 },
+        { type: 'button', action: { type: 'uri', label: '查看狀態', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
       ]
     }
   };
@@ -387,39 +345,22 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin) {
 
 function buildPromoFlexMessage(message, options = {}) {
   const { title, imageUrl } = options;
-  const bodyContents = [];
-  // Hero image if provided
-  const hero = imageUrl ? {
-    type: 'image', url: imageUrl, size: 'full', aspectRatio: '20:13', aspectMode: 'cover',
-  } : null;
-  if (title) bodyContents.push({ type: 'text', text: title, weight: 'bold', size: 'lg', margin: 'md' });
-  bodyContents.push({ type: 'box', layout: 'vertical', paddingAll: '16px', backgroundColor: '#F8F6FF', cornerRadius: '12px', margin: 'lg', contents: [
-    { type: 'text', text: message, wrap: true, size: 'md', color: '#333333' },
-  ]});
+  const hero = imageUrl ? { type: 'image', url: imageUrl, size: 'full', aspectRatio: '20:13', aspectMode: 'cover' } : null;
   const bubble = {
     type: 'bubble',
-    size: 'giga',
-    header: {
-      type: 'box', layout: 'vertical',
-      backgroundColor: BRAND_PRIMARY,
-      paddingAll: '20px',
+    body: {
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: '雲管家', color: BRAND_GOLD, size: 'sm', weight: 'bold' },
-        { type: 'text', text: title || '優惠通知', color: '#FFFFFF', size: 'xl', weight: 'bold', margin: 'sm' },
+        { type: 'text', text: title || '雲管家通知', size: 'lg', weight: 'bold' },
+        { type: 'separator', margin: 'md' },
+        { type: 'text', text: message, wrap: true, size: 'md', color: '#555555', margin: 'md' },
       ]
     },
-    body: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
-      contents: bodyContents,
-    },
     footer: {
-      type: 'box', layout: 'vertical',
-      paddingAll: '20px',
-      spacing: 'sm',
+      type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
         { type: 'button', action: { type: 'uri', label: '立即查看', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
-        { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: LIFF_URL }, style: 'secondary', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
   };
