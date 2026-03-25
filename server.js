@@ -81,7 +81,7 @@ mqttClient.on('message', async (topic, payload) => {
         }
         // Send LINE push to each user with a running order on this machine
         for (const ord of runningOrders.rows) {
-          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(ord.store_name, ord.machine_name, mqttSupportUrl, mqttSupportPhone), { pushType: 'auto_complete', storeId: parts[1], description: `MQTT洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
+          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(ord.store_name, ord.machine_name, mqttSupportUrl, mqttSupportPhone, ord.group_id), { pushType: 'auto_complete', storeId: parts[1], description: `MQTT洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
         }
       }
     }
@@ -268,7 +268,8 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
   };
 }
 
-function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPhone) {
+function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPhone, groupId) {
+  const machineStatusUrl = groupId ? `${LIFF_WASH}&group=${groupId}` : LIFF_WASH;
   return {
     type: 'bubble',
     body: {
@@ -297,7 +298,7 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPho
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看機器狀態', uri: machineStatusUrl }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -1546,7 +1547,7 @@ app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
 
     if (status === 'done' || parseInt(remaining) <= 0) {
       for (const u of targetUsers) {
-        const ok = await sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum, supportUrl, supportPhone), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}${fallbackUsed ? ' (fallback)' : ''}` });
+        const ok = await sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum, supportUrl, supportPhone, storeGroupId), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}${fallbackUsed ? ' (fallback)' : ''}` });
         if (ok) pushedCount++;
       }
     } else if (remainMin > 0 && remainMin <= 5) {
