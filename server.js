@@ -249,7 +249,7 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'text', text: '\u26A0\uFE0F', size: 'xxl' },
+          { type: 'text', text: '!', size: 'xxl', color: '#E67E22', weight: 'bold' },
           { type: 'text', text: '運轉完成通知訊息', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
         ]},
         { type: 'separator', margin: 'lg' },
@@ -319,7 +319,7 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'text', text: '\u26A0\uFE0F', size: 'xxl' },
+          { type: 'text', text: '!', size: 'xxl', color: '#E67E22', weight: 'bold' },
           { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
         ]},
         { type: 'separator', margin: 'md' },
