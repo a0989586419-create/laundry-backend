@@ -65,7 +65,7 @@ mqttClient.on('message', async (topic, payload) => {
                 { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
               ]
             }
-          }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
+          }, { pushType: 'auto_complete', storeId: parts[1], description: `MQTT洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
         }
       }
     }
@@ -114,11 +114,13 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
 // ===== LINE Messaging API Push Notifications =====
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
 
-async function sendLinePush(userId, messages) {
+async function sendLinePush(userId, messages, options = {}) {
+  // options: { groupId, storeId, pushType, triggeredBy, description }
   if (!LINE_CHANNEL_ACCESS_TOKEN) {
     console.log('[LINE Push] No token configured, skipping push');
     return false;
   }
+  let success = false;
   try {
     const res = await fetch('https://api.line.me/v2/bot/message/push', {
       method: 'POST',
@@ -130,19 +132,39 @@ async function sendLinePush(userId, messages) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) console.error('[LINE Push] Error:', data);
-    return res.ok;
+    success = res.ok;
   } catch (e) {
     console.error('[LINE Push] Failed:', e.message);
-    return false;
+    success = false;
   }
+
+  // Record push log
+  try {
+    await db.query(`
+      INSERT INTO push_logs (group_id, store_id, push_type, recipient_count, message_count, triggered_by, target_user_id, description, success)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `, [
+      options.groupId || null,
+      options.storeId || null,
+      options.pushType || 'unknown',
+      1,
+      messages.length,
+      options.triggeredBy || 'system',
+      userId,
+      options.description || '',
+      success
+    ]);
+  } catch (e) { console.error('[Push Log] Error:', e.message); }
+
+  return success;
 }
 
-async function sendLineText(userId, text) {
-  return sendLinePush(userId, [{ type: 'text', text }]);
+async function sendLineText(userId, text, options = {}) {
+  return sendLinePush(userId, [{ type: 'text', text }], options);
 }
 
-async function sendLineFlexMessage(userId, altText, contents) {
-  return sendLinePush(userId, [{ type: 'flex', altText, contents }]);
+async function sendLineFlexMessage(userId, altText, contents, options = {}) {
+  return sendLinePush(userId, [{ type: 'flex', altText, contents }], options);
 }
 
 // ===== MQTT Publish Start Command (ThingsBoard primary, HiveMQ fallback) =====
@@ -855,7 +877,7 @@ app.get('/api/payment/confirm', async (req, res) => {
         const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [order.store_id])).rows[0]?.name || order.store_id;
         const mName = order.machine_id.includes('-d') ? `烘乾機` : `洗脫烘`;
         const mins = Math.ceil((order.duration_sec || 3600) / 60);
-        sendLineText(memberRow.line_user_id, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`).catch(() => {});
+        sendLineText(memberRow.line_user_id, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`, { pushType: 'auto_payment', storeId: order.store_id, description: `LINE Pay付款成功 ${sName} ${mName}` }).catch(() => {});
       }
       res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}`);
     } else {
@@ -955,7 +977,7 @@ app.post('/api/payment/create', async (req, res) => {
       const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || storeId;
       const mName = machineId.includes('-d') ? `烘乾${machineNum || ''}號` : `洗脫烘${machineNum || ''}號`;
       const mins = Math.ceil((durationSec || (minutes || 0) * 60) / 60);
-      sendLineText(userId, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`).catch(() => {});
+      sendLineText(userId, `付款成功!\n${sName} ${mName}\n洗程已開始，預計 ${mins} 分鐘完成。\n完成後會通知您取衣。`, { pushType: 'auto_payment', storeId: storeId, groupId: store?.group_id, description: `Demo付款成功 ${sName} ${mName}` }).catch(() => {});
     }
 
     res.json({ success: true, orderId, demoMode: true });
@@ -1021,7 +1043,7 @@ app.post('/api/topup/linepay', async (req, res) => {
     `, [userId, groupId, amount, `儲值 +${amount}`]);
     const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
     // LINE Push: topup success
-    sendLineText(userId, `儲值成功!\n${groupName} 已儲值 NT$${amount}\n目前餘額：NT$${wr.rows[0]?.balance || 0}`).catch(() => {});
+    sendLineText(userId, `儲值成功!\n${groupName} 已儲值 NT$${amount}\n目前餘額：NT$${wr.rows[0]?.balance || 0}`, { pushType: 'auto_topup', groupId: groupId, description: `Demo儲值成功 ${groupName} NT$${amount}` }).catch(() => {});
     res.json({ success: true, demoMode: true, balance: wr.rows[0]?.balance || 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1046,7 +1068,7 @@ app.get('/api/topup/confirm', async (req, res) => {
       // LINE Push: topup success
       const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
       const grName = (await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId])).rows[0]?.name || '';
-      sendLineText(userId, `儲值成功!\n${grName} 已儲值 NT$${amountInt}\n目前餘額：NT$${walletRow?.balance || amountInt}`).catch(() => {});
+      sendLineText(userId, `儲值成功!\n${grName} 已儲值 NT$${amountInt}\n目前餘額：NT$${walletRow?.balance || amountInt}`, { pushType: 'auto_topup', groupId: groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
       res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}`);
     } else {
       res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
@@ -1203,12 +1225,12 @@ app.post('/api/machine/notify', async (req, res) => {
               { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
             ]
           }
-        }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+        }, { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
       }
     } else if (remainMin > 0 && remainMin <= 5) {
       // Almost done: send reminder
       for (const u of recentUsers.rows) {
-        sendLineText(u.line_user_id, `您在 ${storeName} 的 ${machineNum} 即將完成（剩餘 ${remainMin} 分鐘），可以準備前往取衣了!`).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+        sendLineText(u.line_user_id, `您在 ${storeName} 的 ${machineNum} 即將完成（剩餘 ${remainMin} 分鐘），可以準備前往取衣了!`, { pushType: 'auto_reminder', storeId: resolvedStoreId, description: `即將完成提醒 ${storeName} ${machineNum} 剩${remainMin}分` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
       }
     }
 
@@ -2309,8 +2331,10 @@ app.post('/api/notifications/send', async (req, res) => {
     let successCount = 0;
     let failCount = 0;
 
+    const pushType = type === 'promo' ? 'manual_promo' : 'manual_text';
     for (const uid of targets) {
       let ok = false;
+      const pushOpts = { pushType, groupId: targetGroupId || null, triggeredBy: adminId, description: message.substring(0, 200) };
       if (type === 'promo') {
         // Promotional Flex Message
         ok = await sendLineFlexMessage(uid, message, {
@@ -2329,9 +2353,9 @@ app.post('/api/notifications/send', async (req, res) => {
               { type: 'button', action: { type: 'uri', label: '立即查看', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y' }, style: 'primary', color: '#E5B94C' }
             ]
           }
-        });
+        }, pushOpts);
       } else {
-        ok = await sendLineText(uid, message);
+        ok = await sendLineText(uid, message, pushOpts);
       }
       if (ok) successCount++; else failCount++;
     }
@@ -2339,6 +2363,238 @@ app.post('/api/notifications/send', async (req, res) => {
     res.json({ success: true, totalTargets: targets.length, successCount, failCount });
   } catch (e) {
     console.error('notifications/send error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin Push Stats (LINE billing tracking)
+// ═══════════════════════════════════════
+
+// LINE Messaging API pricing (Taiwan 2026)
+const LINE_PUSH_PRICING = {
+  plans: [
+    { name: 'free', monthlyFee: 0, included: 200, overageRate: 0 },
+    { name: 'light', monthlyFee: 800, included: 4000, overageRate: 0.2 },
+    { name: 'standard', monthlyFee: 4000, included: 25000, overageRate: 0.16 },
+    { name: 'pro', monthlyFee: 10000, included: 100000, overageRate: 0.1 },
+  ],
+  defaultPlan: 'light',
+};
+
+const PUSH_TYPE_LABELS = {
+  auto_payment: '付款通知',
+  auto_complete: '完成通知',
+  auto_reminder: '取衣提醒',
+  auto_topup: '儲值通知',
+  manual_text: '手動文字',
+  manual_promo: '促銷推播',
+  unknown: '其他',
+};
+
+app.get('/api/admin/push-stats', async (req, res) => {
+  try {
+    const { userId, days, groupId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    const numDays = Math.min(Math.max(parseInt(days) || 30, 1), 365);
+
+    // Build WHERE clause
+    const params = [numDays];
+    let where = `pl.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    if (scopeGroupId) {
+      params.push(scopeGroupId);
+      where += ` AND pl.group_id = $${params.length}`;
+    }
+
+    // Summary totals
+    const summaryQ = await db.query(`
+      SELECT
+        COUNT(*) as total_pushes,
+        COALESCE(SUM(pl.message_count), 0) as total_messages,
+        COUNT(CASE WHEN pl.push_type LIKE 'auto_%' THEN 1 END) as auto_count,
+        COUNT(CASE WHEN pl.push_type LIKE 'manual_%' THEN 1 END) as manual_count
+      FROM push_logs pl
+      WHERE ${where}
+    `, params);
+    const summary = summaryQ.rows[0];
+    const totalMessages = parseInt(summary.total_messages) || 0;
+
+    // Calculate estimated cost based on current plan
+    const plan = LINE_PUSH_PRICING.plans.find(p => p.name === LINE_PUSH_PRICING.defaultPlan);
+    const freeQuota = plan.included;
+    const usedQuota = totalMessages;
+    const remainingFree = Math.max(0, freeQuota - usedQuota);
+    const paidMessages = Math.max(0, usedQuota - freeQuota);
+    const overageCost = paidMessages * plan.overageRate;
+    // Pro-rate monthly fee across groups if needed
+    const estimatedCost = overageCost;
+
+    // By group
+    const byGroupQ = await db.query(`
+      SELECT pl.group_id, sg.name as group_name,
+        COUNT(*) as pushes,
+        COALESCE(SUM(pl.message_count), 0) as messages
+      FROM push_logs pl
+      LEFT JOIN store_groups sg ON pl.group_id = sg.id
+      WHERE ${where}
+      GROUP BY pl.group_id, sg.name
+      ORDER BY messages DESC
+    `, params);
+
+    // Calculate cost per group (pro-rate by message count)
+    const byGroup = byGroupQ.rows.map(r => {
+      const msgs = parseInt(r.messages) || 0;
+      const ratio = totalMessages > 0 ? msgs / totalMessages : 0;
+      const groupMonthlyShare = Math.round(plan.monthlyFee * ratio);
+      const groupOverage = Math.round(overageCost * ratio);
+      return {
+        groupId: r.group_id,
+        groupName: r.group_name || '(未歸屬)',
+        pushes: parseInt(r.pushes),
+        messages: msgs,
+        cost: groupMonthlyShare + groupOverage,
+      };
+    });
+
+    // By type
+    const byTypeQ = await db.query(`
+      SELECT pl.push_type, COUNT(*) as count
+      FROM push_logs pl
+      WHERE ${where}
+      GROUP BY pl.push_type
+      ORDER BY count DESC
+    `, params);
+    const byType = byTypeQ.rows.map(r => ({
+      type: r.push_type,
+      count: parseInt(r.count),
+      label: PUSH_TYPE_LABELS[r.push_type] || r.push_type,
+    }));
+
+    // By date
+    const byDateQ = await db.query(`
+      SELECT DATE(pl.created_at) as date,
+        COUNT(*) as pushes,
+        COALESCE(SUM(pl.message_count), 0) as messages
+      FROM push_logs pl
+      WHERE ${where}
+      GROUP BY DATE(pl.created_at)
+      ORDER BY date
+    `, params);
+    const byDate = byDateQ.rows.map(r => ({
+      date: r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0],
+      pushes: parseInt(r.pushes),
+      messages: parseInt(r.messages),
+    }));
+
+    res.json({
+      summary: {
+        totalPushes: parseInt(summary.total_pushes) || 0,
+        totalMessages,
+        autoCount: parseInt(summary.auto_count) || 0,
+        manualCount: parseInt(summary.manual_count) || 0,
+        estimatedCost: Math.round(estimatedCost),
+      },
+      byGroup,
+      byType,
+      byDate,
+      pricing: {
+        plan: LINE_PUSH_PRICING.defaultPlan,
+        monthlyFee: plan.monthlyFee,
+        freeQuota,
+        usedQuota,
+        remainingFree,
+        paidMessages,
+        pricePerMessage: plan.overageRate,
+        overageCost: Math.round(overageCost),
+      },
+    });
+  } catch (e) {
+    console.error('push-stats error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Push usage CSV export
+app.get('/api/admin/push-export', async (req, res) => {
+  try {
+    const { userId, days, groupId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    const numDays = Math.min(Math.max(parseInt(days) || 30, 1), 365);
+
+    const params = [numDays];
+    let where = `pl.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    if (scopeGroupId) {
+      params.push(scopeGroupId);
+      where += ` AND pl.group_id = $${params.length}`;
+    }
+
+    // Daily breakdown by group and type
+    const detailQ = await db.query(`
+      SELECT DATE(pl.created_at) as date,
+        pl.group_id, sg.name as group_name,
+        pl.push_type,
+        COUNT(*) as pushes,
+        COALESCE(SUM(pl.message_count), 0) as messages,
+        COUNT(CASE WHEN pl.success = true THEN 1 END) as success_count,
+        COUNT(CASE WHEN pl.success = false THEN 1 END) as fail_count
+      FROM push_logs pl
+      LEFT JOIN store_groups sg ON pl.group_id = sg.id
+      WHERE ${where}
+      GROUP BY DATE(pl.created_at), pl.group_id, sg.name, pl.push_type
+      ORDER BY date, sg.name, pl.push_type
+    `, params);
+
+    const plan = LINE_PUSH_PRICING.plans.find(p => p.name === LINE_PUSH_PRICING.defaultPlan);
+
+    const BOM = '\uFEFF';
+    const today = new Date().toISOString().split('T')[0];
+    const genTime = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+    let csv = BOM;
+    csv += '=== LINE 推播用量報表 ===\n';
+    csv += `報表期間:,近 ${numDays} 天\n`;
+    csv += `產生時間:,${genTime}\n`;
+    csv += `方案:,${LINE_PUSH_PRICING.defaultPlan} (月費 NT$${plan.monthlyFee}, 含 ${plan.included} 則, 超額 NT$${plan.overageRate}/則)\n\n`;
+
+    // Summary
+    const totalMessages = detailQ.rows.reduce((s, r) => s + (parseInt(r.messages) || 0), 0);
+    const paidMessages = Math.max(0, totalMessages - plan.included);
+    csv += '=== 摘要 ===\n';
+    csv += `總推播則數,${totalMessages}\n`;
+    csv += `免費額度,${plan.included}\n`;
+    csv += `已用額度,${totalMessages}\n`;
+    csv += `剩餘免費,${Math.max(0, plan.included - totalMessages)}\n`;
+    csv += `超額則數,${paidMessages}\n`;
+    csv += `超額費用,NT$${Math.round(paidMessages * plan.overageRate)}\n\n`;
+
+    // Detail
+    csv += '=== 每日明細 ===\n';
+    csv += '日期,門市集團,推播類型,推播次數,訊息則數,成功,失敗,預估費用\n';
+    detailQ.rows.forEach(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+      const msgs = parseInt(r.messages) || 0;
+      const ratio = totalMessages > 0 ? msgs / totalMessages : 0;
+      const cost = Math.round((paidMessages * plan.overageRate) * ratio);
+      const typeLabel = PUSH_TYPE_LABELS[r.push_type] || r.push_type;
+      csv += `${d},"${r.group_name || '(未歸屬)'}","${typeLabel}",${r.pushes},${msgs},${r.success_count},${r.fail_count},NT$${cost}\n`;
+    });
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="push-usage-report-${today}.csv"`);
+    res.send(csv);
+  } catch (e) {
+    console.error('push-export error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2542,6 +2798,26 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
+
+    // Push logs table (LINE push billing tracking)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS push_logs (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(20),
+        store_id VARCHAR(20),
+        push_type VARCHAR(30) NOT NULL,
+        recipient_count INT DEFAULT 1,
+        message_count INT DEFAULT 1,
+        triggered_by VARCHAR(100),
+        target_user_id VARCHAR(100),
+        description TEXT,
+        success BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    // Index for faster queries on push_logs
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_created_at ON push_logs (created_at)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_group_id ON push_logs (group_id)`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
