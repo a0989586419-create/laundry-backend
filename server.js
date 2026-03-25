@@ -1521,6 +1521,15 @@ app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
 
     console.log(`[NOTIFY] ${storeName} ${machineNum} remaining: ${remaining}s status: ${status}`);
 
+    // Update machine_current_state so frontend reflects actual status
+    const dbState = (status === 'done' || parseInt(remaining) <= 0) ? 'idle' : (status || 'running');
+    const dbRemain = (status === 'done' || parseInt(remaining) <= 0) ? 0 : (parseInt(remaining) || 0);
+    await db.query(`
+      INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+      VALUES ($1, $2, $3, 0, NOW())
+      ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
+    `, [machineId, dbState, dbRemain]).catch(e => console.error('[NOTIFY] DB state update error:', e.message));
+
     // Find users who have recent orders (last 2 hours) at this store for this machine
     const recentUsers = await db.query(
       `SELECT DISTINCT mb.line_user_id
