@@ -385,8 +385,18 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin) {
   };
 }
 
-function buildPromoFlexMessage(message) {
-  return {
+function buildPromoFlexMessage(message, options = {}) {
+  const { title, imageUrl } = options;
+  const bodyContents = [];
+  // Hero image if provided
+  const hero = imageUrl ? {
+    type: 'image', url: imageUrl, size: 'full', aspectRatio: '20:13', aspectMode: 'cover',
+  } : null;
+  if (title) bodyContents.push({ type: 'text', text: title, weight: 'bold', size: 'lg', margin: 'md' });
+  bodyContents.push({ type: 'box', layout: 'vertical', paddingAll: '16px', backgroundColor: '#F8F6FF', cornerRadius: '12px', margin: 'lg', contents: [
+    { type: 'text', text: message, wrap: true, size: 'md', color: '#333333' },
+  ]});
+  const bubble = {
     type: 'bubble',
     size: 'giga',
     header: {
@@ -395,17 +405,13 @@ function buildPromoFlexMessage(message) {
       paddingAll: '20px',
       contents: [
         { type: 'text', text: '雲管家', color: BRAND_GOLD, size: 'sm', weight: 'bold' },
-        { type: 'text', text: '優惠通知', color: '#FFFFFF', size: 'xl', weight: 'bold', margin: 'sm' },
+        { type: 'text', text: title || '優惠通知', color: '#FFFFFF', size: 'xl', weight: 'bold', margin: 'sm' },
       ]
     },
     body: {
       type: 'box', layout: 'vertical',
       paddingAll: '20px',
-      contents: [
-        { type: 'box', layout: 'vertical', paddingAll: '16px', backgroundColor: '#F8F6FF', cornerRadius: '12px', contents: [
-          { type: 'text', text: message, wrap: true, size: 'md', color: '#333333' },
-        ]},
-      ]
+      contents: bodyContents,
     },
     footer: {
       type: 'box', layout: 'vertical',
@@ -417,6 +423,8 @@ function buildPromoFlexMessage(message) {
       ]
     }
   };
+  if (hero) bubble.hero = hero;
+  return bubble;
 }
 
 // ===== MQTT Publish Start Command (ThingsBoard primary, HiveMQ fallback) =====
@@ -2550,7 +2558,7 @@ app.get('/api/admin/referral-stats', async (req, res) => {
 // ═══════════════════════════════════════
 app.post('/api/notifications/send', async (req, res) => {
   try {
-    const { userId: adminId, targetUserId, targetGroupId, message, type } = req.body;
+    const { userId: adminId, targetUserId, targetGroupId, message, type, title, imageUrl } = req.body;
     if (!adminId || !message) return res.status(400).json({ error: 'Missing adminId or message' });
 
     // Verify admin permission
@@ -2583,7 +2591,7 @@ app.post('/api/notifications/send', async (req, res) => {
       const pushOpts = { pushType, groupId: targetGroupId || null, triggeredBy: adminId, description: message.substring(0, 200) };
       if (type === 'promo') {
         // Promotional Flex Message
-        ok = await sendLineFlexMessage(uid, message, buildPromoFlexMessage(message), pushOpts);
+        ok = await sendLineFlexMessage(uid, title || message, buildPromoFlexMessage(message, { title, imageUrl }), pushOpts);
       } else {
         ok = await sendLineText(uid, message, pushOpts);
       }
