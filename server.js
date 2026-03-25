@@ -11,6 +11,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 app.use(cors());
@@ -248,9 +249,7 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#FFF3CD', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
-            { type: 'text', text: '!', color: '#F39C12', size: 'lg', weight: 'bold', align: 'center' },
-          ]},
+          { type: 'text', text: '\u26A0\uFE0F', size: 'xxl' },
           { type: 'text', text: '運轉完成通知訊息', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
         ]},
         { type: 'separator', margin: 'lg' },
@@ -320,9 +319,7 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#FFF3CD', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
-            { type: 'text', text: '!', color: '#F39C12', size: 'lg', weight: 'bold', align: 'center' },
-          ]},
+          { type: 'text', text: '\u26A0\uFE0F', size: 'xxl' },
           { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
         ]},
         { type: 'separator', margin: 'md' },
