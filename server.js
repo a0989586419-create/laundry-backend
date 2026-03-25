@@ -182,6 +182,8 @@ async function sendLineFlexMessage(userId, altText, contents, options = {}) {
 
 // ===== Flex Message Template Builders (ODay-inspired clean style) =====
 const LIFF_URL = 'https://liff.line.me/2009552592-xkDKSJ1Y';
+const LIFF_WASH = LIFF_URL + '?tab=wash';
+const LIFF_PROFILE = LIFF_URL + '?tab=profile';
 const BRAND_PRIMARY = '#3A3A8C';
 const BRAND_GOLD = '#E5B94C';
 const GREEN = '#2ECC71';
@@ -234,8 +236,8 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'link', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'link', height: 'sm' },
         { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
@@ -271,7 +273,7 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
@@ -305,7 +307,7 @@ function buildTopupFlexMessage({ groupName, amount, balance, supportUrl }) {
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
@@ -343,7 +345,7 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
