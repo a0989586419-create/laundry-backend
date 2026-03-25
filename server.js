@@ -260,8 +260,7 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'link', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看機器狀態', uri: groupId ? `${LIFF_WASH}&group=${groupId}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -370,7 +369,7 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看機器狀態', uri: groupId ? `${LIFF_WASH}&group=${groupId}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
