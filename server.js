@@ -2552,7 +2552,7 @@ app.put('/api/admin/member-levels/:id', async (req, res) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const roleInfo = await getUserRole(userId);
-    if (roleInfo.role !== 'super_admin') {
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
       return res.status(403).json({ error: 'forbidden' });
     }
     const { name, min_points, discount_percent, benefits, icon } = req.body;
@@ -2572,6 +2572,22 @@ app.put('/api/admin/member-levels/:id', async (req, res) => {
     console.error('admin update member-level error:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// API: Admin - Update Referral Reward Points
+app.put('/api/admin/referral-reward', async (req, res) => {
+  try {
+    const { userId, rewardPoints } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    if (!rewardPoints || rewardPoints < 0) return res.status(400).json({ error: 'invalid rewardPoints' });
+    // Update all future referral codes' reward (existing codes keep their original reward)
+    await db.query('UPDATE referral_codes SET reward_points = $1 WHERE uses = 0', [rewardPoints]);
+    res.json({ success: true, message: `Referral reward updated to ${rewardPoints} points for unused codes` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════
