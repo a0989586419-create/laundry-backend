@@ -61,7 +61,7 @@ mqttClient.on('message', async (topic, payload) => {
       if (data.state === 'done') {
         // Find running orders for this machine to notify users
         const runningOrders = await db.query(
-          `SELECT o.id, mb.line_user_id, s.name as store_name, m.name as machine_name
+          `SELECT o.id, mb.line_user_id, s.name as store_name, m.name as machine_name, s.group_id
            FROM orders o
            JOIN members mb ON o.member_id = mb.id
            JOIN stores s ON o.store_id = s.id
@@ -69,9 +69,15 @@ mqttClient.on('message', async (topic, payload) => {
            WHERE o.machine_id = $1 AND o.status = 'running'`, [machineId]
         );
         await db.query(`UPDATE orders SET status='done', completed_at=NOW() WHERE machine_id=$1 AND status='running'`, [machineId]);
+        // Lookup support URL for the store group
+        let mqttSupportUrl = '';
+        if (runningOrders.rows.length > 0 && runningOrders.rows[0].group_id) {
+          const sgRes = await db.query('SELECT support_url FROM store_groups WHERE id=$1', [runningOrders.rows[0].group_id]);
+          mqttSupportUrl = sgRes.rows[0]?.support_url || '';
+        }
         // Send LINE push to each user with a running order on this machine
         for (const ord of runningOrders.rows) {
-          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(ord.store_name, ord.machine_name), { pushType: 'auto_complete', storeId: parts[1], description: `MQTT洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
+          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(ord.store_name, ord.machine_name, mqttSupportUrl), { pushType: 'auto_complete', storeId: parts[1], description: `MQTT洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[LINE Push] MQTT done notify error:', e.message));
         }
       }
     }
@@ -180,7 +186,7 @@ const BRAND_GOLD = '#E5B94C';
 const GREEN = '#2ECC71';
 const RED = '#E74C3C';
 
-function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, discount, finalAmount, orderId, paymentMethod, minutes }) {
+function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, discount, finalAmount, orderId, paymentMethod, minutes, supportUrl }) {
   return {
     type: 'bubble',
     body: {
@@ -225,16 +231,17 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
       ]
     },
     footer: {
-      type: 'box', layout: 'horizontal', paddingAll: '16px', spacing: 'md',
+      type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'link', height: 'sm', flex: 1 },
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'link', height: 'sm', flex: 1 },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'link', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
   };
 }
 
-function buildCompleteFlexMessage(storeName, machineName) {
+function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
   return {
     type: 'bubble',
     body: {
@@ -263,15 +270,16 @@ function buildCompleteFlexMessage(storeName, machineName) {
       ]
     },
     footer: {
-      type: 'box', layout: 'vertical', paddingAll: '16px',
+      type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '開啟雲管家', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
   };
 }
 
-function buildTopupFlexMessage({ groupName, amount, balance }) {
+function buildTopupFlexMessage({ groupName, amount, balance, supportUrl }) {
   return {
     type: 'bubble',
     body: {
@@ -296,15 +304,16 @@ function buildTopupFlexMessage({ groupName, amount, balance }) {
       ]
     },
     footer: {
-      type: 'box', layout: 'vertical', paddingAll: '16px',
+      type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '立即使用', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
   };
 }
 
-function buildAlmostDoneFlexMessage(storeName, machineName, remainMin) {
+function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUrl) {
   return {
     type: 'bubble',
     body: {
@@ -335,9 +344,10 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin) {
       ]
     },
     footer: {
-      type: 'box', layout: 'vertical', paddingAll: '16px',
+      type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看狀態', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: LIFF_URL }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '聯繫客服人員', uri: supportUrl || LIFF_URL }, style: 'link', height: 'sm' },
       ]
     }
   };
@@ -737,6 +747,12 @@ app.get('/api/admin/dashboard', async (req, res) => {
       : `SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'topup'`;
     const topupTotal = (await db.query(topupQuery, scopeGroupId ? [scopeGroupId] : [])).rows[0];
 
+    // Store groups with support info
+    const groupsQuery = scopeGroupId
+      ? `SELECT id, name, type, phone, topup_enabled, support_url, support_phone FROM store_groups WHERE id = $1`
+      : `SELECT id, name, type, phone, topup_enabled, support_url, support_phone FROM store_groups ORDER BY name`;
+    const storeGroups = (await db.query(groupsQuery, scopeGroupId ? [scopeGroupId] : [])).rows;
+
     res.json({
       revenue: {
         today: parseInt(revenue.today_revenue),
@@ -749,11 +765,26 @@ app.get('/api/admin/dashboard', async (req, res) => {
       consumerCount: parseInt(consumers.count),
       recentTransactions: recentTx,
       totalTopup: parseInt(topupTotal.total),
+      storeGroups,
     });
   } catch (e) {
     console.error('dashboard error:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ═══════════════════════════════════════
+//  API: Admin Store Group Support Settings
+// ═══════════════════════════════════════
+app.put('/api/admin/store-group/:id/support', async (req, res) => {
+  try {
+    const { userId, supportUrl, supportPhone } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    await db.query('UPDATE store_groups SET support_url=$1, support_phone=$2 WHERE id=$3', [supportUrl || '', supportPhone || '', req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════
@@ -1075,14 +1106,20 @@ app.get('/api/payment/confirm', async (req, res) => {
       // LINE Push: payment success
       const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
       if (memberRow) {
-        const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [order.store_id])).rows[0]?.name || order.store_id;
+        const storeRow = (await db.query('SELECT name, group_id FROM stores WHERE id=$1', [order.store_id])).rows[0];
+        const sName = storeRow?.name || order.store_id;
+        let paymentSupportUrl = '';
+        if (storeRow?.group_id) {
+          const sgr = (await db.query('SELECT support_url FROM store_groups WHERE id=$1', [storeRow.group_id])).rows[0];
+          paymentSupportUrl = sgr?.support_url || '';
+        }
         const mName = order.machine_id.includes('-d') ? `烘乾機` : `洗脫烘`;
         const mins = Math.ceil((order.duration_sec || 3600) / 60);
         const modeLabels = { standard: '標準洗衣', small: '少量快洗', washonly: '單洗程', soft: '柔洗', strong: '強力洗', dryonly: '單烘乾', dryextend: '加烘' };
         sendLineFlexMessage(memberRow.line_user_id, '付款成功', buildPaymentFlexMessage({
           storeName: sName, machineName: mName, modeName: modeLabels[order.mode] || order.mode || '標準洗衣',
           amount: order.total_amount, discount: 0, finalAmount: order.total_amount,
-          orderId: orderId, paymentMethod: 'LINE Pay', minutes: mins
+          orderId: orderId, paymentMethod: 'LINE Pay', minutes: mins, supportUrl: paymentSupportUrl
         }), { pushType: 'auto_payment', storeId: order.store_id, description: `LINE Pay付款成功 ${sName} ${mName}` }).catch(() => {});
       }
       res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}`);
@@ -1181,13 +1218,18 @@ app.post('/api/payment/create', async (req, res) => {
     // LINE Push: payment success (demo mode)
     {
       const sName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || storeId;
+      let demoSupportUrl = '';
+      if (store?.group_id) {
+        const sgr = (await db.query('SELECT support_url FROM store_groups WHERE id=$1', [store.group_id])).rows[0];
+        demoSupportUrl = sgr?.support_url || '';
+      }
       const mName = machineId.includes('-d') ? `烘乾${machineNum || ''}號` : `洗脫烘${machineNum || ''}號`;
       const mins = Math.ceil((durationSec || (minutes || 0) * 60) / 60);
       const modeLabels = { standard: '標準洗衣', small: '少量快洗', washonly: '單洗程', soft: '柔洗', strong: '強力洗', dryonly: '單烘乾', dryextend: '加烘' };
       sendLineFlexMessage(userId, '付款成功', buildPaymentFlexMessage({
         storeName: sName, machineName: mName, modeName: modeLabels[mode] || mode || '標準洗衣',
         amount: amount, discount: 0, finalAmount: amount,
-        orderId: orderId, paymentMethod: '錢包付款', minutes: mins
+        orderId: orderId, paymentMethod: '錢包付款', minutes: mins, supportUrl: demoSupportUrl
       }), { pushType: 'auto_payment', storeId: storeId, groupId: store?.group_id, description: `Demo付款成功 ${sName} ${mName}` }).catch(() => {});
     }
 
@@ -1254,7 +1296,12 @@ app.post('/api/topup/linepay', async (req, res) => {
     `, [userId, groupId, amount, `儲值 +${amount}`]);
     const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
     // LINE Push: topup success
-    sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: groupName, amount: amount, balance: wr.rows[0]?.balance || 0 }), { pushType: 'auto_topup', groupId: groupId, description: `Demo儲值成功 ${groupName} NT$${amount}` }).catch(() => {});
+    let topupSupportUrl = '';
+    if (groupId) {
+      const sgr = (await db.query('SELECT support_url FROM store_groups WHERE id=$1', [groupId])).rows[0];
+      topupSupportUrl = sgr?.support_url || '';
+    }
+    sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: groupName, amount: amount, balance: wr.rows[0]?.balance || 0, supportUrl: topupSupportUrl }), { pushType: 'auto_topup', groupId: groupId, description: `Demo儲值成功 ${groupName} NT$${amount}` }).catch(() => {});
     res.json({ success: true, demoMode: true, balance: wr.rows[0]?.balance || 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1278,8 +1325,10 @@ app.get('/api/topup/confirm', async (req, res) => {
       `, [userId, groupId, amountInt, `LINE Pay 儲值 +${amountInt}`]);
       // LINE Push: topup success
       const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
-      const grName = (await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId])).rows[0]?.name || '';
-      sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt }), { pushType: 'auto_topup', groupId: groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
+      const grRow = (await db.query('SELECT name, support_url FROM store_groups WHERE id=$1', [groupId])).rows[0];
+      const grName = grRow?.name || '';
+      const linePayTopupSupportUrl = grRow?.support_url || '';
+      sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt, supportUrl: linePayTopupSupportUrl }), { pushType: 'auto_topup', groupId: groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
       res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}`);
     } else {
       res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
@@ -1396,9 +1445,15 @@ app.post('/api/machine/notify', async (req, res) => {
   try {
     const { machineId, storeId, remaining, status } = req.body;
     const resolvedStoreId = storeId || machineId?.split('-')[0];
-    // Find store name
-    const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [resolvedStoreId]);
+    // Find store name and group support URL
+    const storeRes = await db.query('SELECT s.name, s.group_id FROM stores s WHERE s.id=$1', [resolvedStoreId]);
     const storeName = storeRes.rows[0]?.name || resolvedStoreId;
+    const storeGroupId = storeRes.rows[0]?.group_id;
+    let supportUrl = '';
+    if (storeGroupId) {
+      const sgRes = await db.query('SELECT support_url FROM store_groups WHERE id=$1', [storeGroupId]);
+      supportUrl = sgRes.rows[0]?.support_url || '';
+    }
     const machineNum = machineId?.includes('-d') ? `烘乾${machineId.split('-d')[1]}號` : `洗脫烘${machineId.split('-m')[1]}號`;
 
     console.log(`[NOTIFY] ${storeName} ${machineNum} remaining: ${remaining}s status: ${status}`);
@@ -1414,22 +1469,32 @@ app.post('/api/machine/notify', async (req, res) => {
       [machineId]
     );
 
+    // Fallback: if no recent users found, push to super_admin for testing
+    let targetUsers = recentUsers.rows;
+    let fallbackUsed = false;
+    if (targetUsers.length === 0) {
+      const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+      targetUsers = [{ line_user_id: SUPER_ADMIN_ID }];
+      fallbackUsed = true;
+      console.log(`[NOTIFY] No recent users found, fallback to super_admin: ${SUPER_ADMIN_ID}`);
+    }
+
     let pushedCount = 0;
     const remainMin = Math.ceil((parseInt(remaining) || 0) / 60);
 
     if (status === 'done' || parseInt(remaining) <= 0) {
       // Machine done: send completion Flex Message
-      for (const u of recentUsers.rows) {
-        sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+      for (const u of targetUsers) {
+        sendLineFlexMessage(u.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(storeName, machineNum, supportUrl), { pushType: 'auto_complete', storeId: resolvedStoreId, description: `洗衣完成 ${storeName} ${machineNum}${fallbackUsed ? ' (fallback)' : ''}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
       }
     } else if (remainMin > 0 && remainMin <= 5) {
       // Almost done: send reminder
-      for (const u of recentUsers.rows) {
-        sendLineFlexMessage(u.line_user_id, '即將完成提醒', buildAlmostDoneFlexMessage(storeName, machineNum, remainMin), { pushType: 'auto_reminder', storeId: resolvedStoreId, description: `即將完成提醒 ${storeName} ${machineNum} 剩${remainMin}分` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
+      for (const u of targetUsers) {
+        sendLineFlexMessage(u.line_user_id, '即將完成提醒', buildAlmostDoneFlexMessage(storeName, machineNum, remainMin, supportUrl), { pushType: 'auto_reminder', storeId: resolvedStoreId, description: `即將完成提醒 ${storeName} ${machineNum} 剩${remainMin}分${fallbackUsed ? ' (fallback)' : ''}` }).then(ok => { if (ok) pushedCount++; }).catch(() => {});
       }
     }
 
-    res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}`, pushedCount, usersFound: recentUsers.rows.length });
+    res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}`, pushedCount, usersFound: recentUsers.rows.length, fallbackUsed });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2909,6 +2974,8 @@ async function initDB() {
       await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
     }
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
+    await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS support_url VARCHAR(500) DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS support_phone VARCHAR(30) DEFAULT ''`).catch(() => {});
     // Announcements table
     await db.query(`
       CREATE TABLE IF NOT EXISTS announcements (
