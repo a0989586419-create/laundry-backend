@@ -257,11 +257,11 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl) {
         { type: 'separator', margin: 'lg' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888', flex: 2 },
+            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
             { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888', flex: 2 },
+            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
             { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
           ]},
         ]},
@@ -326,11 +326,11 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
         { type: 'text', text: '您的洗衣即將完成，可以準備前往取衣了！', size: 'md', wrap: true, margin: 'md' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888', flex: 2 },
+            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
             { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888', flex: 2 },
+            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
             { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
           ]},
         ]},
