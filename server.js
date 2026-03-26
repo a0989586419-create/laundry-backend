@@ -2737,6 +2737,7 @@ const PUSH_TYPE_LABELS = {
   auto_topup: '儲值通知',
   manual_text: '手動文字',
   manual_promo: '促銷推播',
+  store_manual: '店家手動推播',
   unknown: '其他',
 };
 
@@ -2943,6 +2944,318 @@ app.get('/api/admin/push-export', async (req, res) => {
     res.send(csv);
   } catch (e) {
     console.error('push-export error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Store Owner Push Notifications
+// ═══════════════════════════════════════
+
+// Preview: get recipient count, balance, estimated cost
+app.get('/api/admin/store-push/preview', async (req, res) => {
+  try {
+    const { userId, groupId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const targetGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    if (!targetGroupId) return res.status(400).json({ error: 'groupId required' });
+
+    // Recipient count
+    const recipientRes = await db.query(
+      'SELECT COUNT(DISTINCT line_user_id) as cnt FROM wallets WHERE group_id = $1',
+      [targetGroupId]
+    );
+    const recipientCount = parseInt(recipientRes.rows[0].cnt) || 0;
+
+    // Balance info
+    const balanceRes = await db.query(
+      'SELECT balance, per_push_rate, monthly_manual_limit FROM store_push_balance WHERE group_id = $1',
+      [targetGroupId]
+    );
+    const balanceRow = balanceRes.rows[0] || { balance: 0, per_push_rate: 0.16, monthly_manual_limit: 500 };
+    const balance = parseFloat(balanceRow.balance) || 0;
+    const perPushRate = parseFloat(balanceRow.per_push_rate) || 0.16;
+    const monthlyLimit = parseInt(balanceRow.monthly_manual_limit) || 500;
+
+    // Monthly manual push count
+    const monthlyRes = await db.query(
+      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND push_type LIKE '%manual%' AND created_at >= date_trunc('month', CURRENT_DATE)`,
+      [targetGroupId]
+    );
+    const monthlyUsed = parseInt(monthlyRes.rows[0].cnt) || 0;
+
+    const estimatedCost = Math.round(recipientCount * perPushRate * 100) / 100;
+
+    res.json({
+      recipientCount,
+      balance,
+      perPushRate,
+      estimatedCost,
+      monthlyUsed,
+      monthlyLimit,
+    });
+  } catch (e) {
+    console.error('store-push/preview error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Send store push notification
+app.post('/api/admin/store-push', async (req, res) => {
+  try {
+    const { userId, message, title, imageUrl, groupId } = req.body;
+    if (!userId || !message) return res.status(400).json({ error: 'userId and message required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const targetGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    if (!targetGroupId) return res.status(400).json({ error: 'groupId required' });
+
+    // store_admin can only push to their own group
+    if (roleInfo.role === 'store_admin' && targetGroupId !== roleInfo.groupId) {
+      return res.status(403).json({ error: 'store_admin can only push to their own group' });
+    }
+
+    // Fetch recipients
+    const recipientRes = await db.query(
+      'SELECT DISTINCT line_user_id FROM wallets WHERE group_id = $1',
+      [targetGroupId]
+    );
+    const targets = recipientRes.rows.map(r => r.line_user_id);
+    if (targets.length === 0) return res.status(400).json({ error: 'No recipients found in this group' });
+
+    // Fetch balance
+    const balanceRes = await db.query(
+      'SELECT balance, per_push_rate, monthly_manual_limit FROM store_push_balance WHERE group_id = $1',
+      [targetGroupId]
+    );
+    const balanceRow = balanceRes.rows[0] || { balance: 0, per_push_rate: 0.16, monthly_manual_limit: 500 };
+    const perPushRate = parseFloat(balanceRow.per_push_rate) || 0.16;
+    const monthlyLimit = parseInt(balanceRow.monthly_manual_limit) || 500;
+    const currentBalance = parseFloat(balanceRow.balance) || 0;
+    const totalCost = Math.round(targets.length * perPushRate * 100) / 100;
+
+    // Check monthly limit
+    const monthlyRes = await db.query(
+      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND push_type LIKE '%manual%' AND created_at >= date_trunc('month', CURRENT_DATE)`,
+      [targetGroupId]
+    );
+    const monthlyUsed = parseInt(monthlyRes.rows[0].cnt) || 0;
+    if (monthlyUsed + targets.length > monthlyLimit) {
+      return res.status(429).json({ error: '已超過本月推播上限', monthlyUsed, monthlyLimit });
+    }
+
+    // Check balance
+    if (currentBalance < totalCost) {
+      return res.status(402).json({ error: '推播餘額不足', balance: currentBalance, cost: totalCost });
+    }
+
+    // Deduct balance atomically
+    const deductRes = await db.query(
+      'UPDATE store_push_balance SET balance = balance - $1, updated_at = NOW() WHERE group_id = $2 AND balance >= $1 RETURNING balance',
+      [totalCost, targetGroupId]
+    );
+    if (deductRes.rows.length === 0) {
+      return res.status(402).json({ error: '推播餘額不足（扣款失敗）' });
+    }
+    const remainingBalance = parseFloat(deductRes.rows[0].balance);
+
+    // Send messages
+    let successCount = 0;
+    let failCount = 0;
+    const costPerRecipient = Math.round((totalCost / targets.length) * 100) / 100;
+
+    for (const uid of targets) {
+      let ok = false;
+      const pushOpts = {
+        pushType: 'store_manual',
+        groupId: targetGroupId,
+        triggeredBy: userId,
+        description: message.substring(0, 200),
+      };
+
+      if (title && imageUrl) {
+        ok = await sendLineFlexMessage(uid, title || message, buildPromoFlexMessage(message, { title, imageUrl }), pushOpts);
+      } else {
+        ok = await sendLineText(uid, message, pushOpts);
+      }
+
+      // Update push_logs cost for this push
+      try {
+        await db.query(
+          `UPDATE push_logs SET cost = $1 WHERE target_user_id = $2 AND push_type = 'store_manual' AND group_id = $3 ORDER BY created_at DESC LIMIT 1`,
+          [costPerRecipient, uid, targetGroupId]
+        );
+      } catch (costErr) {
+        console.error('[store-push] cost update error:', costErr.message);
+      }
+
+      if (ok) successCount++; else failCount++;
+    }
+
+    res.json({
+      success: true,
+      totalTargets: targets.length,
+      successCount,
+      failCount,
+      cost: totalCost,
+      remainingBalance,
+    });
+  } catch (e) {
+    console.error('store-push error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get store push balance & topup history
+app.get('/api/admin/store-push/balance', async (req, res) => {
+  try {
+    const { userId, groupId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const targetGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    if (!targetGroupId) return res.status(400).json({ error: 'groupId required' });
+
+    const balanceRes = await db.query(
+      'SELECT balance, per_push_rate, monthly_manual_limit, updated_at FROM store_push_balance WHERE group_id = $1',
+      [targetGroupId]
+    );
+    const balanceRow = balanceRes.rows[0] || { balance: 0, per_push_rate: 0.16, monthly_manual_limit: 500, updated_at: null };
+
+    const topupRes = await db.query(
+      'SELECT id, amount, method, note, created_by, created_at FROM store_push_topup WHERE group_id = $1 ORDER BY created_at DESC LIMIT 20',
+      [targetGroupId]
+    );
+
+    res.json({
+      groupId: targetGroupId,
+      balance: parseFloat(balanceRow.balance) || 0,
+      perPushRate: parseFloat(balanceRow.per_push_rate) || 0.16,
+      monthlyManualLimit: parseInt(balanceRow.monthly_manual_limit) || 500,
+      updatedAt: balanceRow.updated_at,
+      topupHistory: topupRes.rows.map(r => ({
+        id: r.id,
+        amount: parseFloat(r.amount),
+        method: r.method,
+        note: r.note,
+        createdBy: r.created_by,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (e) {
+    console.error('store-push/balance error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Topup store push balance (super_admin only)
+app.post('/api/admin/store-push/topup', async (req, res) => {
+  try {
+    const { userId, groupId, amount, note } = req.body;
+    if (!userId || !groupId || !amount) return res.status(400).json({ error: 'userId, groupId, and amount required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only super_admin can topup push balance' });
+    }
+
+    const numAmount = parseFloat(amount);
+    if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    // Record topup
+    await db.query(
+      'INSERT INTO store_push_topup (group_id, amount, method, note, created_by) VALUES ($1, $2, $3, $4, $5)',
+      [groupId, numAmount, 'manual', note || '', userId]
+    );
+
+    // Update balance (upsert)
+    const updateRes = await db.query(
+      `INSERT INTO store_push_balance (group_id, balance, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (group_id) DO UPDATE SET balance = store_push_balance.balance + $2, updated_at = NOW()
+       RETURNING balance`,
+      [groupId, numAmount]
+    );
+
+    res.json({
+      success: true,
+      groupId,
+      addedAmount: numAmount,
+      newBalance: parseFloat(updateRes.rows[0].balance),
+    });
+  } catch (e) {
+    console.error('store-push/topup error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update store push settings (super_admin only)
+app.put('/api/admin/store-push/settings', async (req, res) => {
+  try {
+    const { userId, groupId, perPushRate, monthlyManualLimit } = req.body;
+    if (!userId || !groupId) return res.status(400).json({ error: 'userId and groupId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only super_admin can update push settings' });
+    }
+
+    const updates = [];
+    const params = [];
+    let paramIdx = 1;
+
+    if (perPushRate !== undefined) {
+      const rate = parseFloat(perPushRate);
+      if (isNaN(rate) || rate < 0) return res.status(400).json({ error: 'Invalid perPushRate' });
+      updates.push(`per_push_rate = $${paramIdx++}`);
+      params.push(rate);
+    }
+    if (monthlyManualLimit !== undefined) {
+      const limit = parseInt(monthlyManualLimit);
+      if (isNaN(limit) || limit < 0) return res.status(400).json({ error: 'Invalid monthlyManualLimit' });
+      updates.push(`monthly_manual_limit = $${paramIdx++}`);
+      params.push(limit);
+    }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    updates.push(`updated_at = NOW()`);
+    params.push(groupId);
+
+    const result = await db.query(
+      `UPDATE store_push_balance SET ${updates.join(', ')} WHERE group_id = $${paramIdx} RETURNING *`,
+      params
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Group push balance record not found' });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      success: true,
+      groupId: row.group_id,
+      balance: parseFloat(row.balance),
+      perPushRate: parseFloat(row.per_push_rate),
+      monthlyManualLimit: parseInt(row.monthly_manual_limit),
+      updatedAt: row.updated_at,
+    });
+  } catch (e) {
+    console.error('store-push/settings error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3199,6 +3512,30 @@ async function initDB() {
     // Index for faster queries on push_logs
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_created_at ON push_logs (created_at)`).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_group_id ON push_logs (group_id)`).catch(() => {});
+
+    // Store push balance & topup tables
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS store_push_balance (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(20) NOT NULL UNIQUE,
+        balance NUMERIC(10,2) DEFAULT 0,
+        per_push_rate NUMERIC(6,4) DEFAULT 0.16,
+        monthly_manual_limit INT DEFAULT 500,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS store_push_topup (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(20) NOT NULL,
+        amount NUMERIC(10,2) NOT NULL,
+        method VARCHAR(30) DEFAULT 'manual',
+        note TEXT DEFAULT '',
+        created_by VARCHAR(100),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    await db.query(`ALTER TABLE push_logs ADD COLUMN IF NOT EXISTS cost NUMERIC(10,2) DEFAULT 0`).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
@@ -3210,6 +3547,17 @@ async function initDB() {
       ('sg4', '上好洗自助洗衣', 'independent', '0800-018-888')
     ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, type=EXCLUDED.type
   `);
+
+  // Seed store push balance for each group
+  await db.query(`
+    INSERT INTO store_push_balance (group_id, balance, per_push_rate, monthly_manual_limit) VALUES
+      ('sg1', 0, 0.16, 500),
+      ('sg2', 0, 0.16, 500),
+      ('sg3', 0, 0.16, 500),
+      ('sg4', 0, 0.16, 500),
+      ('sg5', 0, 0.16, 500)
+    ON CONFLICT (group_id) DO NOTHING
+  `).catch(() => {});
 
   // Seed stores with group mapping
   await db.query(`DELETE FROM machines WHERE store_id IN ('s1','s2','s3','s4','s5')`);
