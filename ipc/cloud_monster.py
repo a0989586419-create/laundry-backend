@@ -6,6 +6,8 @@ Production-ready control script for laundry machine IPC units.
 Connects to HiveMQ Cloud via MQTT (TLS), listens for start/stop commands
 from the backend, and controls machines via Modbus RTU over RS485.
 
+Uses raw serial (pyserial) for Modbus RTU to avoid pymodbus API compatibility issues.
+
 MQTT Topic Schema (matches backend server.js):
   Subscribe: laundry/{STORE_ID}/+/command
   Publish:   laundry/{STORE_ID}/{machine_id}/status
@@ -24,6 +26,7 @@ import ssl
 import signal
 import sys
 import os
+import struct
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
@@ -35,10 +38,9 @@ except ImportError:
     sys.exit("[FATAL] paho-mqtt not installed. Run: pip3 install paho-mqtt")
 
 try:
-    from pymodbus.client import ModbusSerialClient
-    from pymodbus.exceptions import ModbusException
+    import serial
 except ImportError:
-    sys.exit("[FATAL] pymodbus not installed. Run: pip3 install pymodbus")
+    sys.exit("[FATAL] pyserial not installed. Run: pip3 install pyserial")
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +171,7 @@ log = setup_logging()
 
 
 # ---------------------------------------------------------------------------
-# CRC16/Modbus helper (for logging / verification)
+# Raw Modbus RTU helpers (using pyserial directly)
 # ---------------------------------------------------------------------------
 
 def crc16_modbus(data: bytes) -> int:
@@ -185,6 +187,24 @@ def crc16_modbus(data: bytes) -> int:
     return crc
 
 
+def build_read_request(slave: int, address: int, count: int) -> bytes:
+    """Build Modbus RTU read holding registers (FC 0x03) request."""
+    pdu = struct.pack('>BBHH', slave, 0x03, address, count)
+    crc = crc16_modbus(pdu)
+    return pdu + struct.pack('<H', crc)
+
+
+def build_write_request(slave: int, address: int, value: int) -> bytes:
+    """Build Modbus RTU write single register (FC 0x06) request."""
+    pdu = struct.pack('>BBHH', slave, 0x06, address, value)
+    crc = crc16_modbus(pdu)
+    return pdu + struct.pack('<H', crc)
+
+
+def hex_str(data: bytes) -> str:
+    return ' '.join(f'{b:02X}' for b in data)
+
+
 # ---------------------------------------------------------------------------
 # CloudMonsterIPC
 # ---------------------------------------------------------------------------
@@ -195,7 +215,7 @@ class CloudMonsterIPC:
     def __init__(self):
         self.running = True
         self.mqtt_client: mqtt.Client | None = None
-        self.modbus_client: ModbusSerialClient | None = None
+        self.serial_port: serial.Serial | None = None
         self.modbus_lock = threading.Lock()
         self.machine_states: dict[str, dict] = {}
         self._reconnect_attempts = 0
@@ -241,7 +261,6 @@ class CloudMonsterIPC:
         if rc == 0:
             self._reconnect_attempts = 0
             log.info("MQTT connected (rc=%d)", rc)
-            # Subscribe to command topic for all machines in this store
             topic = f"laundry/{STORE_ID}/+/command"
             client.subscribe(topic, qos=1)
             log.info("Subscribed to %s", topic)
@@ -269,7 +288,6 @@ class CloudMonsterIPC:
 
         log.info("MQTT << %s : %s", topic, json.dumps(payload, ensure_ascii=False))
 
-        # Parse topic: laundry/{store_id}/{machine_id}/command
         parts = topic.split("/")
         if len(parts) < 4 or parts[3] != "command":
             log.warning("Ignoring unexpected topic: %s", topic)
@@ -305,7 +323,6 @@ class CloudMonsterIPC:
         coins = int(payload.get("coins", 4))
         order_id = payload.get("orderId", "unknown")
 
-        # Store pending coins and dry program for start_machine to use
         self._pending_coins[machine_id] = coins
         self._pending_dry[machine_id] = dry_mode
 
@@ -352,101 +369,157 @@ class CloudMonsterIPC:
         log.info("SKIP_STEP %s", machine_id)
         slave = MACHINE_MAP[machine_id]["slave"]
         with self.modbus_lock:
-            try:
-                self._modbus_write_register(slave, REG_WRITE_SKIP_STEP, 1)
-                log.info("Skip step sent to slave=%d (addr=%d)", slave, REG_WRITE_SKIP_STEP)
-            except Exception as exc:
-                log.error("skip_step Modbus error for %s: %s", machine_id, exc)
+            ok = self._modbus_write_register(slave, REG_WRITE_SKIP_STEP, 1)
+            if ok:
+                log.info("Skip step sent to slave=%d", slave)
+            else:
+                log.error("skip_step Modbus write failed for %s", machine_id)
 
     def _handle_clear_coins(self, machine_id: str):
         log.info("CLEAR_COINS %s", machine_id)
         slave = MACHINE_MAP[machine_id]["slave"]
-        # Write 0 to coins register to clear
         with self.modbus_lock:
-            try:
-                self._modbus_write_register(slave, REG_WRITE_COINS, 0)
-                log.info("Clear coins sent to slave=%d (addr=%d)", slave, REG_WRITE_COINS)
-            except Exception as exc:
-                log.error("clear_coins Modbus error for %s: %s", machine_id, exc)
+            ok = self._modbus_write_register(slave, REG_WRITE_COINS, 0)
+            if ok:
+                log.info("Clear coins sent to slave=%d", slave)
+            else:
+                log.error("clear_coins Modbus write failed for %s", machine_id)
 
     # ------------------------------------------------------------------
-    # Modbus RTU
+    # Raw Modbus RTU over pyserial
     # ------------------------------------------------------------------
 
     def setup_modbus(self):
-        """Initialize Modbus serial client."""
-        self.modbus_client = ModbusSerialClient(
-            port=SERIAL_PORT,
-            baudrate=SERIAL_BAUD,
-            bytesize=8,
-            parity="N",
-            stopbits=1,
-            timeout=SERIAL_TIMEOUT,
-        )
-        if self.modbus_client.connect():
+        """Initialize serial port for Modbus RTU."""
+        try:
+            self.serial_port = serial.Serial(
+                port=SERIAL_PORT,
+                baudrate=SERIAL_BAUD,
+                bytesize=8,
+                parity='N',
+                stopbits=1,
+                timeout=SERIAL_TIMEOUT,
+            )
             log.info("Modbus connected on %s @ %d baud", SERIAL_PORT, SERIAL_BAUD)
-        else:
-            log.error("Modbus connection failed on %s", SERIAL_PORT)
+        except (serial.SerialException, OSError) as exc:
+            log.error("Modbus connection failed on %s: %s", SERIAL_PORT, exc)
+            self.serial_port = None
 
-    def _ensure_modbus(self) -> bool:
-        """Reconnect Modbus if needed. Returns True if connected."""
-        if self.modbus_client is None:
+    def _ensure_serial(self) -> bool:
+        """Reconnect serial if needed. Returns True if connected."""
+        if self.serial_port is not None and self.serial_port.is_open:
+            return True
+
+        log.info("Serial reconnecting...")
+        try:
+            if self.serial_port:
+                self.serial_port.close()
+            self.serial_port = serial.Serial(
+                port=SERIAL_PORT,
+                baudrate=SERIAL_BAUD,
+                bytesize=8,
+                parity='N',
+                stopbits=1,
+                timeout=SERIAL_TIMEOUT,
+            )
+            log.info("Serial reconnected on %s", SERIAL_PORT)
+            return True
+        except (serial.SerialException, OSError) as exc:
+            log.error("Serial reconnect failed: %s", exc)
+            self.serial_port = None
             return False
-        if not self.modbus_client.connected:
-            log.info("Modbus reconnecting...")
-            try:
-                return self.modbus_client.connect()
-            except Exception as exc:
-                log.error("Modbus reconnect failed: %s", exc)
-                return False
-        return True
 
-    def _modbus_write_register(self, slave: int, address: int, value: int):
-        """Write single register (function code 0x06) with CRC verification."""
-        if not self._ensure_modbus():
-            raise ConnectionError("Modbus not connected")
+    def _serial_send_receive(self, request: bytes, timeout: float = 1.0) -> bytes:
+        """Send Modbus RTU request and read response."""
+        if not self.serial_port:
+            return b''
 
-        try:
-            result = self.modbus_client.write_register(address=address, value=value, slave=slave)
-        except TypeError:
-            try:
-                result = self.modbus_client.write_register(address, value, unit=slave)
-            except TypeError:
-                result = self.modbus_client.write_register(address, value)
-        if result.isError():
-            raise ModbusException(f"Write error slave={slave} addr=0x{address:04X} val={value}: {result}")
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(request)
+        time.sleep(0.05)  # inter-frame gap
 
-        log.debug(
-            "Modbus WRITE slave=%d addr=0x%04X val=%d (CRC in frame verified by pymodbus)",
-            slave, address, value,
-        )
+        end_time = time.time() + timeout
+        response = b''
+        while time.time() < end_time:
+            if self.serial_port.in_waiting > 0:
+                response += self.serial_port.read(self.serial_port.in_waiting)
+                time.sleep(0.05)
+            else:
+                if response:
+                    break  # got data, no more coming
+                time.sleep(0.02)
+        return response
 
-    def _modbus_read_registers(self, slave: int, address: int, count: int):
-        """Read holding registers (function code 0x03)."""
-        if not self._ensure_modbus():
+    def _modbus_write_register(self, slave: int, address: int, value: int) -> bool:
+        """Write single register (FC 0x06). Returns True on success."""
+        if not self._ensure_serial():
+            log.error("Modbus WRITE failed: serial not connected")
+            return False
+
+        req = build_write_request(slave, address, value)
+        resp = self._serial_send_receive(req)
+
+        log.debug("Modbus WRITE slave=%d addr=%d val=%d TX[%s] RX[%s]",
+                  slave, address, value, hex_str(req), hex_str(resp))
+
+        if resp and len(resp) >= 8 and resp[1] == 0x06:
+            # FC 0x06 echo response confirms write
+            log.info("Modbus WRITE OK slave=%d addr=%d val=%d", slave, address, value)
+            return True
+        elif resp and len(resp) >= 3 and resp[1] & 0x80:
+            log.error("Modbus WRITE exception slave=%d addr=%d code=%d", slave, address, resp[2])
+            return False
+        else:
+            log.error("Modbus WRITE no valid response slave=%d addr=%d RX[%s]",
+                      slave, address, hex_str(resp))
+            return False
+
+    def _modbus_read_registers(self, slave: int, address: int, count: int) -> list | None:
+        """Read holding registers (FC 0x03). Returns list of int values or None."""
+        if not self._ensure_serial():
+            log.warning("Modbus READ failed: serial not connected")
             return None
 
-        try:
-            result = self.modbus_client.read_holding_registers(address=address, count=count, slave=slave)
-        except TypeError:
-            try:
-                result = self.modbus_client.read_holding_registers(address, count=count, unit=slave)
-            except TypeError:
-                result = self.modbus_client.read_holding_registers(address, count=count)
-        if result.isError():
-            log.warning("Modbus READ error slave=%d addr=0x%04X count=%d: %s", slave, address, count, result)
+        req = build_read_request(slave, address, count)
+        expected_bytes = 3 + count * 2 + 2  # slave + fc + bytecount + data + crc
+        resp = self._serial_send_receive(req, timeout=1.5)
+
+        log.debug("Modbus READ slave=%d addr=%d count=%d TX[%s] RX[%s]",
+                  slave, address, count, hex_str(req), hex_str(resp))
+
+        if not resp:
+            log.warning("Modbus READ no response slave=%d addr=%d", slave, address)
             return None
 
-        return result.registers
+        if len(resp) < 5:
+            log.warning("Modbus READ response too short slave=%d len=%d", slave, len(resp))
+            return None
+
+        if resp[1] & 0x80:
+            log.warning("Modbus READ exception slave=%d addr=%d code=%d", slave, address, resp[2])
+            return None
+
+        if resp[1] != 0x03:
+            log.warning("Modbus READ unexpected FC=0x%02X slave=%d", resp[1], slave)
+            return None
+
+        byte_count = resp[2]
+        if len(resp) < 3 + byte_count:
+            log.warning("Modbus READ incomplete slave=%d expected=%d got=%d",
+                        slave, 3 + byte_count, len(resp))
+            return None
+
+        # Parse register values
+        regs = []
+        for i in range(count):
+            offset = 3 + i * 2
+            if offset + 2 <= len(resp):
+                val = struct.unpack('>H', resp[offset:offset + 2])[0]
+                regs.append(val)
+        return regs
 
     def start_machine(self, machine_id: str, mode: int, duration_min: int) -> bool:
-        """Send SX176005A Modbus start sequence to a machine.
-
-        Args:
-            machine_id: Machine identifier (e.g. "s1_washer_1")
-            mode: Wash program number (0=none, 1-29) from backend wash_mode
-            duration_min: Unused in SX176005A protocol (machine controls timing)
-        """
+        """Send SX176005A Modbus start sequence to a machine."""
         info = MACHINE_MAP.get(machine_id)
         if not info:
             log.error("start_machine: unknown machine %s", machine_id)
@@ -458,33 +531,34 @@ class CloudMonsterIPC:
         coins = self._pending_coins.get(machine_id, 4)
 
         with self.modbus_lock:
-            try:
-                # Step 1: Write wash program (address 5)
-                self._modbus_write_register(slave, REG_WRITE_WASH_PROG, wash_prog)
-                time.sleep(0.1)
-
-                # Step 2: Write dry program (address 6)
-                self._modbus_write_register(slave, REG_WRITE_DRY_PROG, dry_prog)
-                time.sleep(0.1)
-
-                # Step 3: Write coins/amount (address 4)
-                self._modbus_write_register(slave, REG_WRITE_COINS, coins)
-                time.sleep(0.1)
-
-                # Step 4: Start machine (address 1, value 1)
-                self._modbus_write_register(slave, REG_WRITE_START, 1)
-
-                log.info(
-                    "Machine %s (slave=%d) started: wash_prog=%d dry_prog=%d coins=%d",
-                    machine_id, slave, wash_prog, dry_prog, coins,
-                )
-                return True
-            except (ModbusException, ConnectionError) as exc:
-                log.error("start_machine Modbus error %s: %s", machine_id, exc)
+            # Step 1: Write wash program (address 5)
+            if not self._modbus_write_register(slave, REG_WRITE_WASH_PROG, wash_prog):
+                log.error("start_machine: failed to write wash_prog for %s", machine_id)
                 return False
-            except Exception as exc:
-                log.exception("start_machine unexpected error %s: %s", machine_id, exc)
+            time.sleep(0.1)
+
+            # Step 2: Write dry program (address 6)
+            if not self._modbus_write_register(slave, REG_WRITE_DRY_PROG, dry_prog):
+                log.error("start_machine: failed to write dry_prog for %s", machine_id)
                 return False
+            time.sleep(0.1)
+
+            # Step 3: Write coins/amount (address 4)
+            if not self._modbus_write_register(slave, REG_WRITE_COINS, coins):
+                log.error("start_machine: failed to write coins for %s", machine_id)
+                return False
+            time.sleep(0.1)
+
+            # Step 4: Start machine (address 1, value 1)
+            if not self._modbus_write_register(slave, REG_WRITE_START, 1):
+                log.error("start_machine: failed to write start for %s", machine_id)
+                return False
+
+            log.info(
+                "Machine %s (slave=%d) started: wash_prog=%d dry_prog=%d coins=%d",
+                machine_id, slave, wash_prog, dry_prog, coins,
+            )
+            return True
 
     def stop_machine(self, machine_id: str) -> bool:
         """Send force-stop command via SX176005A protocol."""
@@ -495,20 +569,15 @@ class CloudMonsterIPC:
 
         slave = info["slave"]
         with self.modbus_lock:
-            try:
-                # Force stop: write 1 to address 3
-                self._modbus_write_register(slave, REG_WRITE_FORCE_STOP, 1)
+            if self._modbus_write_register(slave, REG_WRITE_FORCE_STOP, 1):
                 log.info("Machine %s (slave=%d) force-stopped", machine_id, slave)
                 return True
-            except (ModbusException, ConnectionError) as exc:
-                log.error("stop_machine Modbus error %s: %s", machine_id, exc)
+            else:
+                log.error("stop_machine Modbus write failed for %s", machine_id)
                 return False
 
     def read_machine_status(self, machine_id: str) -> dict | None:
-        """Read current status from a single machine via SX176005A protocol.
-
-        Reads 24 registers starting at address 20 (addresses 20-43).
-        """
+        """Read current status from a single machine via SX176005A protocol."""
         info = MACHINE_MAP.get(machine_id)
         if not info:
             return None
@@ -539,7 +608,6 @@ class CloudMonsterIPC:
 
         state = STATE_MAP.get(machine_state_raw, "unknown")
         door = DOOR_MAP.get(door_state_raw, "unknown")
-
         total_remain_seconds = total_remain_hr * 3600 + total_remain_min * 60 + total_remain_sec
 
         return {
@@ -607,8 +675,8 @@ class CloudMonsterIPC:
             "store_id": STORE_ID,
             "status": "online",
             "machines": len(MACHINE_MAP),
-            "modbus_connected": (
-                self.modbus_client is not None and self.modbus_client.connected
+            "serial_connected": (
+                self.serial_port is not None and self.serial_port.is_open
             ),
             "uptime_sec": int(time.time() - self._start_time),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -630,7 +698,6 @@ class CloudMonsterIPC:
                 try:
                     hw_status = self.read_machine_status(machine_id)
                     if hw_status:
-                        # Merge hardware status into cached state, preserving order_id
                         cached = self.machine_states.get(machine_id, {})
                         order_id = cached.get("order_id")
                         cached.update(hw_status)
@@ -638,6 +705,8 @@ class CloudMonsterIPC:
                             cached["order_id"] = order_id
                         self.machine_states[machine_id] = cached
                         self._publish_status(machine_id)
+                    else:
+                        log.debug("No status response from %s", machine_id)
                 except Exception as exc:
                     log.error("Status read error for %s: %s", machine_id, exc)
 
@@ -690,7 +759,6 @@ class CloudMonsterIPC:
 
         log.info("Cloud Monster IPC running. Press Ctrl+C to stop.")
 
-        # Main thread just waits
         try:
             while self.running:
                 time.sleep(1)
@@ -715,16 +783,16 @@ class CloudMonsterIPC:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             self.mqtt_client.publish(topic, payload, qos=1, retain=True)
-            time.sleep(0.5)  # allow publish to flush
+            time.sleep(0.5)
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             log.info("MQTT disconnected")
 
-        # Close Modbus
-        if self.modbus_client:
+        # Close serial
+        if self.serial_port and self.serial_port.is_open:
             try:
-                self.modbus_client.close()
-                log.info("Modbus closed")
+                self.serial_port.close()
+                log.info("Serial closed")
             except Exception:
                 pass
 
