@@ -221,6 +221,9 @@ class CloudMonsterIPC:
         self._reconnect_attempts = 0
         self._pending_coins: dict[str, int] = {}
         self._pending_dry: dict[str, int] = {}
+        self._active_slaves: set[int] = set()       # slaves that responded
+        self._failed_slaves: dict[int, int] = {}     # slave -> consecutive fail count
+        self._SKIP_THRESHOLD = 3  # skip slave after N consecutive fails
 
     # ------------------------------------------------------------------
     # MQTT
@@ -583,10 +586,27 @@ class CloudMonsterIPC:
             return None
 
         slave = info["slave"]
+
+        # Skip slaves that consistently don't respond (check every 30 cycles)
+        fail_count = self._failed_slaves.get(slave, 0)
+        if fail_count >= self._SKIP_THRESHOLD and slave not in self._active_slaves:
+            # Re-check every 30th cycle (about 5 minutes at 10s interval)
+            if fail_count % 30 != 0:
+                self._failed_slaves[slave] = fail_count + 1
+                return None
+
         with self.modbus_lock:
             regs = self._modbus_read_registers(slave, REG_READ_START, REG_READ_COUNT)
 
         if regs is None or len(regs) < REG_READ_COUNT:
+            self._failed_slaves[slave] = self._failed_slaves.get(slave, 0) + 1
+            if self._failed_slaves[slave] == self._SKIP_THRESHOLD:
+                log.info("Slave %d not responding, will reduce polling (recheck every ~5min)", slave)
+            return None
+
+        # Mark as active
+        self._active_slaves.add(slave)
+        self._failed_slaves[slave] = 0
             return None
 
         # Parse registers (index = address - 20)
@@ -609,6 +629,10 @@ class CloudMonsterIPC:
         state = STATE_MAP.get(machine_state_raw, "unknown")
         door = DOOR_MAP.get(door_state_raw, "unknown")
         total_remain_seconds = total_remain_hr * 3600 + total_remain_min * 60 + total_remain_sec
+
+        log.info("STATUS %s: state=%s door=%s temp=%dC coins=%d/%d wash=%d dry=%d remain=%ds",
+                 machine_id, state, door, current_temp, current_coins, required_coins,
+                 wash_prog, dry_prog, total_remain_seconds)
 
         return {
             "machine_id": machine_id,
