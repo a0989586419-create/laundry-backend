@@ -3516,6 +3516,236 @@ app.get('/api/referral/status', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  Store Owner Admin Endpoints
+// ═══════════════════════════════════════
+
+// Check if user is a store owner
+app.get('/api/owner/check', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Missing userId' });
+  try {
+    const r = await db.query('SELECT * FROM store_owners WHERE user_id = $1 AND status = $2', [userId, 'active']);
+    if (r.rows.length > 0) {
+      const owner = r.rows[0];
+      res.json({ isOwner: true, storeId: owner.store_id, ownerName: owner.owner_name, role: owner.role });
+    } else {
+      res.json({ isOwner: false });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Owner dashboard data (only their store)
+app.get('/api/owner/dashboard', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Missing userId' });
+  try {
+    const ownerR = await db.query('SELECT store_id FROM store_owners WHERE user_id = $1 AND status = $2', [userId, 'active']);
+    if (ownerR.rows.length === 0) return res.status(403).json({ error: 'Not authorized' });
+    const storeId = ownerR.rows[0].store_id;
+
+    // Today's revenue
+    const todayR = await db.query(
+      `SELECT COALESCE(SUM(total_amount),0) as total, COUNT(*) as count FROM orders WHERE store_id = $1 AND created_at >= CURRENT_DATE AND status != 'cancelled'`,
+      [storeId]
+    );
+
+    // This month's revenue
+    const monthR = await db.query(
+      `SELECT COALESCE(SUM(total_amount),0) as total, COUNT(*) as count FROM orders WHERE store_id = $1 AND created_at >= DATE_TRUNC('month', CURRENT_DATE) AND status != 'cancelled'`,
+      [storeId]
+    );
+
+    // Machine states
+    const machinesR = await db.query(
+      `SELECT * FROM machine_current_state WHERE machine_id LIKE $1 ORDER BY machine_id`,
+      [storeId + '%']
+    );
+
+    // Recent orders (last 20)
+    const ordersR = await db.query(
+      `SELECT * FROM orders WHERE store_id = $1 ORDER BY created_at DESC LIMIT 20`,
+      [storeId]
+    );
+
+    // Unique customers this month
+    const customersR = await db.query(
+      `SELECT COUNT(DISTINCT member_id) as count FROM orders WHERE store_id = $1 AND created_at >= DATE_TRUNC('month', CURRENT_DATE)`,
+      [storeId]
+    );
+
+    res.json({
+      storeId,
+      today: { revenue: parseInt(todayR.rows[0].total), orders: parseInt(todayR.rows[0].count) },
+      month: { revenue: parseInt(monthR.rows[0].total), orders: parseInt(monthR.rows[0].count) },
+      customers: parseInt(customersR.rows[0].count),
+      machines: machinesR.rows,
+      recentOrders: ordersR.rows
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Owner's machines only
+app.get('/api/owner/machines', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Missing userId' });
+  try {
+    const ownerR = await db.query('SELECT store_id FROM store_owners WHERE user_id = $1 AND status = $2', [userId, 'active']);
+    if (ownerR.rows.length === 0) return res.status(403).json({ error: 'Not authorized' });
+    const storeId = ownerR.rows[0].store_id;
+    const r = await db.query(
+      `SELECT * FROM machine_current_state WHERE machine_id LIKE $1 ORDER BY machine_id`,
+      [storeId + '%']
+    );
+    res.json({ machines: r.rows, storeId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Owner revenue report
+app.get('/api/owner/revenue', async (req, res) => {
+  const { userId, period = 'daily', days = 30 } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Missing userId' });
+  try {
+    // Check owner or admin
+    let storeId = null;
+    const ownerR = await db.query('SELECT store_id FROM store_owners WHERE user_id = $1 AND status = $2', [userId, 'active']);
+    if (ownerR.rows.length > 0) {
+      storeId = ownerR.rows[0].store_id;
+    }
+    // If not owner, check if super_admin (storeId stays null = all stores)
+
+    const safeDays = parseInt(days) || 30;
+    let dateGroup;
+    if (period === 'weekly') {
+      dateGroup = `DATE_TRUNC('week', created_at)`;
+    } else if (period === 'monthly') {
+      dateGroup = `DATE_TRUNC('month', created_at)`;
+    } else {
+      dateGroup = `DATE(created_at)`;
+    }
+
+    let query = `SELECT ${dateGroup} as date, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
+      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
+    const params = [];
+    if (storeId) {
+      query += ` AND store_id = $1`;
+      params.push(storeId);
+    }
+    query += ` GROUP BY ${dateGroup} ORDER BY date ASC`;
+
+    const r = await db.query(query, params);
+
+    // Top modes
+    let modeQuery = `SELECT mode, COUNT(*) as count, COALESCE(SUM(total_amount),0) as revenue FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
+    const modeParams = [];
+    if (storeId) {
+      modeQuery += ` AND store_id = $1`;
+      modeParams.push(storeId);
+    }
+    modeQuery += ` GROUP BY mode ORDER BY count DESC LIMIT 5`;
+    const modeR = await db.query(modeQuery, modeParams);
+
+    // Peak hours
+    let peakQuery = `SELECT EXTRACT(HOUR FROM created_at) as hour, COUNT(*) as count FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
+    const peakParams = [];
+    if (storeId) {
+      peakQuery += ` AND store_id = $1`;
+      peakParams.push(storeId);
+    }
+    peakQuery += ` GROUP BY hour ORDER BY hour`;
+    const peakR = await db.query(peakQuery, peakParams);
+
+    res.json({
+      period,
+      data: r.rows.map(row => ({ date: row.date, revenue: parseInt(row.revenue), orders: parseInt(row.orders) })),
+      topModes: modeR.rows,
+      peakHours: peakR.rows.map(row => ({ hour: parseInt(row.hour), count: parseInt(row.count) })),
+      storeId
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Super admin: add a store owner
+app.post('/api/admin/store-owners', async (req, res) => {
+  const { userId, storeId, ownerName, phone } = req.body;
+  if (!userId || !storeId) return res.status(400).json({ error: 'Missing userId or storeId' });
+  try {
+    await db.query(
+      `INSERT INTO store_owners (user_id, store_id, owner_name, phone)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id) DO UPDATE SET store_id=$2, owner_name=$3, phone=$4`,
+      [userId, storeId, ownerName || null, phone || null]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Super admin: list all store owners
+app.get('/api/admin/store-owners', async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM store_owners ORDER BY created_at DESC');
+    res.json({ owners: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Super admin: revenue report (with optional storeId filter)
+app.get('/api/admin/revenue', async (req, res) => {
+  const { period = 'daily', days = 30, storeId } = req.query;
+  try {
+    const safeDays = parseInt(days) || 30;
+    let dateGroup;
+    if (period === 'weekly') {
+      dateGroup = `DATE_TRUNC('week', created_at)`;
+    } else if (period === 'monthly') {
+      dateGroup = `DATE_TRUNC('month', created_at)`;
+    } else {
+      dateGroup = `DATE(created_at)`;
+    }
+
+    let query = `SELECT ${dateGroup} as date, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
+      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
+    const params = [];
+    if (storeId) {
+      query += ` AND store_id = $1`;
+      params.push(storeId);
+    }
+    query += ` GROUP BY ${dateGroup} ORDER BY date ASC`;
+    const r = await db.query(query, params);
+
+    // Per-store breakdown
+    let storeQuery = `SELECT store_id, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
+      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
+    const storeParams = [];
+    if (storeId) {
+      storeQuery += ` AND store_id = $1`;
+      storeParams.push(storeId);
+    }
+    storeQuery += ` GROUP BY store_id ORDER BY revenue DESC`;
+    const storeR = await db.query(storeQuery, storeParams);
+
+    res.json({
+      period,
+      data: r.rows.map(row => ({ date: row.date, revenue: parseInt(row.revenue), orders: parseInt(row.orders) })),
+      storeBreakdown: storeR.rows.map(row => ({ storeId: row.store_id, revenue: parseInt(row.revenue), orders: parseInt(row.orders) })),
+      storeId: storeId || 'all'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  MQTT WebSocket Config Endpoint
+// ═══════════════════════════════════════
+
+app.get('/api/mqtt/config', (req, res) => {
+  res.json({
+    host: process.env.MQTT_HOST || 'f29e89cd32414b9c826381e76ef8baaf.s1.eu.hivemq.cloud',
+    port: 8884,
+    protocol: 'wss',
+    username: process.env.MQTT_USER || 'ypure-iot',
+    password: process.env.MQTT_PASS || 'Ypure2025!'
+  });
+});
+
+// ═══════════════════════════════════════
 //  Database Initialization
 // ═══════════════════════════════════════
 async function initDB() {
@@ -3784,6 +4014,20 @@ async function initDB() {
         reward_amount INT DEFAULT 30,
         status VARCHAR(20) DEFAULT 'completed',
         created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Store owners table for owner admin portal
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS store_owners (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(100) UNIQUE NOT NULL,
+        store_id VARCHAR(20) NOT NULL,
+        owner_name VARCHAR(100),
+        phone VARCHAR(20),
+        role VARCHAR(20) DEFAULT 'owner',
+        status VARCHAR(20) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW()
       )
     `).catch(() => {});
   } catch (e) { /* column might already exist */ }
