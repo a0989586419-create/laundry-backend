@@ -97,6 +97,7 @@ while True:
     print("  6 - 完整啟動流程 (程式→投幣→啟動)")
     print("  7 - 強制停止")
     print("  8 - 故障重置")
+    print("  9 - 🔥 遠端啟動（自動模式切換，任何畫面都能啟動）")
     print("  0 - 離開")
     print("=" * 50)
 
@@ -187,6 +188,64 @@ while True:
         write_reg(ser, SLAVE, 0, 1, "fault_reset")
         time.sleep(1)
         read_status(ser, SLAVE)
+
+    elif choice == "9":
+        try:
+            wash = int(input("洗衣程式 (1-29): ").strip() or "1")
+            dry = int(input("烘乾程式 (0-4, 0=不烘): ").strip() or "0")
+        except (ValueError, EOFError):
+            wash, dry = 1, 0
+
+        print(f"\n🔥 遠端啟動（模式切換）: 洗衣={wash} 烘乾={dry}")
+        print()
+
+        # Step 1: 故障重置（清除錢盒門異常等）
+        print("Step 1/7: 故障重置")
+        write_reg(ser, SLAVE, 0, 1, "fault_reset")
+        time.sleep(0.3)
+
+        # Step 2: 切換為常規模式 (param 1009 → addr 709 = 1)
+        print("Step 2/7: 切換為常規模式")
+        write_reg(ser, SLAVE, 709, 1, "machine_type=regular")
+        time.sleep(0.3)
+
+        # Step 3: 儲存參數
+        print("Step 3/7: 儲存參數")
+        write_reg(ser, SLAVE, 7, 1, "save_params")
+        time.sleep(1.5)  # 等待觸控屏重新載入
+
+        # Step 4: 設定洗衣程式
+        print("Step 4/7: 設定洗衣程式")
+        write_reg(ser, SLAVE, 5, wash, "wash_prog")
+        time.sleep(0.2)
+
+        # Step 5: 設定烘乾程式
+        print("Step 5/7: 設定烘乾程式")
+        write_reg(ser, SLAVE, 6, dry, "dry_prog")
+        time.sleep(0.2)
+
+        # Step 6: 啟動機器
+        print("Step 6/7: 啟動機器")
+        write_reg(ser, SLAVE, 1, 1, "start")
+        time.sleep(2)
+
+        # 確認狀態
+        print("\n📖 啟動後狀態:")
+        regs = read_status(ser, SLAVE)
+        running = regs and regs[0] == 3
+
+        if running:
+            print("\n✅ 機器已運轉！")
+        else:
+            print("\n⚠️  機器未運轉，狀態未變更")
+
+        # Step 7: 切回自助模式
+        print("\nStep 7/7: 切回自助模式")
+        write_reg(ser, SLAVE, 709, 0, "machine_type=self_service")
+        time.sleep(0.3)
+        write_reg(ser, SLAVE, 7, 1, "save_params")
+        time.sleep(1)
+        print("✅ 已切回自助模式")
 
     print()
 
