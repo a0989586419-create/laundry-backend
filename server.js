@@ -3096,6 +3096,37 @@ async function initDB() {
       )
     `).catch(() => {});
     await db.query(`ALTER TABLE announcements ADD COLUMN IF NOT EXISTS tag VARCHAR(20) DEFAULT ''`).catch(() => {});
+
+    // Seed default announcements if table is empty
+    await db.query(`
+      INSERT INTO announcements (title, content, tag, published, sort_order, created_at)
+      SELECT '我們一直都在',
+             E'在生活節奏越來越快的都市中，自助洗衣已成為許多人生活中不可或缺的一環。雲管家深知，對顧客來說「乾淨」從來不只是衣服的狀態，更是整體洗衣體驗的基礎。\n\n為了提供最安心、舒適的自助洗衣空間，我們雲管家洗衣團隊每週都會到店巡檢，默默守護大家的洗衣時光。我們定期補充洗衣用品、清潔環境、維護設備、檢查濾網、確認洗衣機運作狀況，只為了讓每位來洗衣的你都能感受到一種被照顧的安心。\n\n我們相信，洗衣不是把衣服丟進機器就好，而是日常中一種「讓生活更有秩序」的儀式感。我們會繼續努力，成為你生活裡最可靠的洗衣夥伴。',
+             '原創', true, 1, '2026-03-20'
+      WHERE NOT EXISTS (SELECT 1 FROM announcements LIMIT 1)
+    `).catch(() => {});
+    await db.query(`
+      INSERT INTO announcements (title, content, tag, published, sort_order, created_at)
+      SELECT '升級會員洗衣更輕鬆',
+             E'雲管家全面升級會員系統，打造更智慧、便利的洗衣體驗！新系統支援點數儲值、優惠券管理、機器狀態即時查詢等功能，讓你的洗衣生活更加輕鬆便利。\n\n透過LINE官方帳號即可快速註冊，享受專屬會員福利。',
+             '系統', true, 2, '2026-03-18'
+      WHERE NOT EXISTS (SELECT 1 FROM announcements LIMIT 1)
+    `).catch(() => {});
+    await db.query(`
+      INSERT INTO announcements (title, content, tag, published, sort_order, created_at)
+      SELECT '專屬你的洗衣錢包',
+             E'雲管家全新線上會員功能來囉！會員可透過LINE官方帳號管理點數、查看交易紀錄、領取優惠券。\n\n首次加入會員即贈50元洗衣折扣券，立即加入享受專屬優惠！',
+             '功能', true, 3, '2026-03-15'
+      WHERE NOT EXISTS (SELECT 1 FROM announcements LIMIT 1)
+    `).catch(() => {});
+    await db.query(`
+      INSERT INTO announcements (title, content, tag, published, sort_order, created_at)
+      SELECT '夜猫洗衣全年最划算',
+             E'你也是「夜猫洗衣族」嗎？深夜洗衣機台不用排隊，空間獨享更自在！\n\n夜猫計畫提供01:00-07:00時段專屬優惠，年卡方案每次洗衣只要65點，是一般價格的31折！立即購買夜猫計畫，享受最划算的深夜洗衣體驗。',
+             '優惠', true, 4, '2026-03-10'
+      WHERE NOT EXISTS (SELECT 1 FROM announcements LIMIT 1)
+    `).catch(() => {});
+
     // Coin records table for tracking coin box clears
     await db.query(`
       CREATE TABLE IF NOT EXISTS coin_records (
