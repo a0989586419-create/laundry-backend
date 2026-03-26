@@ -580,6 +580,55 @@ app.get('/api/user/profile', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: User Order History
+// ═══════════════════════════════════════
+app.get('/api/user/orders', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
+    // Get total count
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM orders o
+       JOIN members mb ON o.member_id = mb.id
+       WHERE mb.line_user_id = $1 AND COALESCE(o.type, 'online') != 'topup'`,
+      [userId]
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Get paginated orders with store and machine names
+    const ordersResult = await db.query(
+      `SELECT o.id, o.store_id, o.machine_id, o.mode, o.addons, o.extend_min, o.temp,
+              o.total_amount as amount, o.status, o.created_at, o.paid_at, o.completed_at,
+              COALESCE(o.payment_method, 'wallet') as payment_method,
+              COALESCE(o.type, 'online') as order_type,
+              s.name as store_name,
+              m.name as machine_name
+       FROM orders o
+       JOIN members mb ON o.member_id = mb.id
+       LEFT JOIN stores s ON o.store_id = s.id
+       LEFT JOIN machines m ON o.machine_id = m.id
+       WHERE mb.line_user_id = $1 AND COALESCE(o.type, 'online') != 'topup'
+       ORDER BY o.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+
+    res.json({
+      orders: ordersResult.rows,
+      total,
+      hasMore: offset + limit < total,
+    });
+  } catch (e) {
+    console.error('user orders error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
 //  API: Stores & Store Groups
 // ═══════════════════════════════════════
 app.get('/api/store-groups', async (req, res) => {
