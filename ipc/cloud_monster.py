@@ -64,12 +64,50 @@ HEARTBEAT_INTERVAL = 30  # seconds between heartbeat publishes
 RECONNECT_BASE = 5     # base seconds for exponential backoff
 RECONNECT_MAX = 300    # max backoff cap
 
-# Modbus register addresses
-REG_POWER     = 0x0001  # Write: 1=ON, 0=OFF
-REG_MODE      = 0x0002  # Write: 1=standard, 2=light, 3=wash_only, 4=dry_only
-REG_DURATION  = 0x0003  # Write: duration in minutes
-REG_STATE     = 0x0010  # Read: 0=idle, 1=running, 2=done, 3=error
-REG_REMAINING = 0x0011  # Read: remaining time in minutes
+# ---------------------------------------------------------------------------
+# SX176005A Touchscreen Modbus Protocol — Register Map
+# ---------------------------------------------------------------------------
+# Write Registers (function code 0x06 single register):
+#   Address 0: Fault reset / mute command
+#   Address 1: Start machine (write 1)
+#   Address 2: Skip step (write 1)
+#   Address 3: Force stop (write 1)
+#   Address 4: Paid coins / amount (0-65535)
+#   Address 5: Select wash program (0=none, 1-29)
+#   Address 6: Select dry program (0=none, 1=high, 2=mid, 3=low, 4=soft)
+#
+# Read Registers (function code 0x03, start address 20, count 24):
+#   Address 20: Machine state (0=power_on, 1=standby, 3=auto_running, 4=manual)
+#   Address 21: Door state (0=idle, 1=open, 2=closed, 3=locked, 4=error, 5=locking, 6=unlocking)
+#   Address 22: Fault state (bit0=fault, bit1=warning)
+#   Address 23: Step remaining time (minutes)
+#   Address 24: Step remaining time (seconds)
+#   Address 25: Auto program total remaining (hours)
+#   Address 26: Auto program total remaining (minutes)
+#   Address 27: Auto program total remaining (seconds)
+#   Address 28: Current water level (cm)
+#   Address 29: Set water level
+#   Address 30: Current temperature (deg C)
+#   Address 31: Set temperature
+#   Address 32: Current RPM
+#   Address 33: Set RPM
+#   Address 38: Current wash program number
+#   Address 39: Current dry program number
+#   Address 40: Current step number
+#   Address 41: Required coins
+#   Address 42: Current coin count
+# ---------------------------------------------------------------------------
+
+REG_WRITE_FAULT_RESET  = 0   # Write: fault reset / mute
+REG_WRITE_START        = 1   # Write: 1 = start machine
+REG_WRITE_SKIP_STEP    = 2   # Write: 1 = skip step
+REG_WRITE_FORCE_STOP   = 3   # Write: 1 = force stop
+REG_WRITE_COINS        = 4   # Write: paid coins / amount
+REG_WRITE_WASH_PROG    = 5   # Write: wash program (0=none, 1-29)
+REG_WRITE_DRY_PROG     = 6   # Write: dry program (0=none, 1-4)
+
+REG_READ_START         = 20  # Read start address
+REG_READ_COUNT         = 24  # Number of registers to read (20..43)
 
 # Machine mapping -- machine_id -> Modbus slave + metadata
 MACHINE_MAP = {
@@ -81,17 +119,11 @@ MACHINE_MAP = {
     "s1_dryer_3":  {"slave": 6, "type": "dryer",  "name": "Dryer 3"},
 }
 
-# Backend wash_mode codes -> Modbus register value
-WASH_MODE_TO_REG = {
-    0: 4,  # dryonly  -> 4 (dry_only)
-    1: 1,  # standard -> 1
-    2: 2,  # small    -> 2 (light)
-    3: 3,  # washonly -> 3
-    4: 1,  # soft     -> 1
-    5: 1,  # strong   -> 1
-}
+# Machine state mapping (address 20)
+STATE_MAP = {0: "power_on", 1: "idle", 3: "running", 4: "manual"}
 
-STATE_NAMES = {0: "idle", 1: "running", 2: "done", 3: "error"}
+# Door state mapping (address 21)
+DOOR_MAP = {0: "idle", 1: "open", 2: "closed", 3: "locked", 4: "error", 5: "locking", 6: "unlocking"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -167,6 +199,8 @@ class CloudMonsterIPC:
         self.modbus_lock = threading.Lock()
         self.machine_states: dict[str, dict] = {}
         self._reconnect_attempts = 0
+        self._pending_coins: dict[str, int] = {}
+        self._pending_dry: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # MQTT
@@ -266,46 +300,39 @@ class CloudMonsterIPC:
     # ------------------------------------------------------------------
 
     def _handle_start(self, machine_id: str, payload: dict):
-        wash_mode = payload.get("wash_mode", 1)
-        coins = payload.get("coins", 0)
+        wash_mode = int(payload.get("wash_mode", 1))
+        dry_mode = int(payload.get("dry_mode", 0))
+        coins = int(payload.get("coins", 4))
         order_id = payload.get("orderId", "unknown")
 
-        # Derive duration from coins (10 NTD per coin, ~10 min per coin for washers)
-        # If durationMin is provided directly, use that; otherwise estimate
-        duration_min = payload.get("durationMin")
-        if duration_min is None:
-            # Default durations by machine type
-            mtype = MACHINE_MAP[machine_id]["type"]
-            if mtype == "washer":
-                duration_min = max(coins * 10, 30)  # minimum 30 min
-            else:
-                duration_min = max(coins * 10, 15)  # dryer minimum 15 min
-
-        modbus_mode = WASH_MODE_TO_REG.get(wash_mode, 1)
+        # Store pending coins and dry program for start_machine to use
+        self._pending_coins[machine_id] = coins
+        self._pending_dry[machine_id] = dry_mode
 
         log.info(
-            "START %s order=%s mode=%d duration=%dmin coins=%d",
-            machine_id, order_id, modbus_mode, duration_min, coins,
+            "START %s order=%s wash_prog=%d dry_prog=%d coins=%d",
+            machine_id, order_id, wash_mode, dry_mode, coins,
         )
 
-        success = self.start_machine(machine_id, modbus_mode, duration_min)
+        success = self.start_machine(machine_id, wash_mode, 0)
 
         if success:
             self.machine_states[machine_id] = {
                 "state": "running",
-                "remain_sec": duration_min * 60,
-                "mode": modbus_mode,
+                "remain_sec": 0,
+                "wash_program": wash_mode,
+                "dry_program": dry_mode,
                 "order_id": order_id,
                 "started_at": time.time(),
             }
             self._publish_status(machine_id)
         else:
             log.error("Failed to start %s via Modbus", machine_id)
-            # Publish error state
             self.machine_states[machine_id] = {
                 "state": "error",
                 "remain_sec": 0,
-                "mode": modbus_mode,
+                "wash_program": wash_mode,
+                "dry_program": dry_mode,
                 "order_id": order_id,
                 "started_at": time.time(),
             }
@@ -318,29 +345,27 @@ class CloudMonsterIPC:
             self.machine_states[machine_id] = {
                 "state": "idle",
                 "remain_sec": 0,
-                "mode": 0,
             }
             self._publish_status(machine_id)
 
     def _handle_skip_step(self, machine_id: str):
         log.info("SKIP_STEP %s", machine_id)
         slave = MACHINE_MAP[machine_id]["slave"]
-        # Write skip register (0x0004 = skip command flag)
         with self.modbus_lock:
             try:
-                self._modbus_write_register(slave, 0x0004, 1)
-                log.info("Skip step sent to slave=%d", slave)
+                self._modbus_write_register(slave, REG_WRITE_SKIP_STEP, 1)
+                log.info("Skip step sent to slave=%d (addr=%d)", slave, REG_WRITE_SKIP_STEP)
             except Exception as exc:
                 log.error("skip_step Modbus error for %s: %s", machine_id, exc)
 
     def _handle_clear_coins(self, machine_id: str):
         log.info("CLEAR_COINS %s", machine_id)
         slave = MACHINE_MAP[machine_id]["slave"]
-        # Write clear-coins register (0x0005 = clear coins flag)
+        # Write 0 to coins register to clear
         with self.modbus_lock:
             try:
-                self._modbus_write_register(slave, 0x0005, 1)
-                log.info("Clear coins sent to slave=%d", slave)
+                self._modbus_write_register(slave, REG_WRITE_COINS, 0)
+                log.info("Clear coins sent to slave=%d (addr=%d)", slave, REG_WRITE_COINS)
             except Exception as exc:
                 log.error("clear_coins Modbus error for %s: %s", machine_id, exc)
 
@@ -415,24 +440,44 @@ class CloudMonsterIPC:
         return result.registers
 
     def start_machine(self, machine_id: str, mode: int, duration_min: int) -> bool:
-        """Send Modbus start sequence to a machine."""
+        """Send SX176005A Modbus start sequence to a machine.
+
+        Args:
+            machine_id: Machine identifier (e.g. "s1_washer_1")
+            mode: Wash program number (0=none, 1-29) from backend wash_mode
+            duration_min: Unused in SX176005A protocol (machine controls timing)
+        """
         info = MACHINE_MAP.get(machine_id)
         if not info:
             log.error("start_machine: unknown machine %s", machine_id)
             return False
 
         slave = info["slave"]
+        wash_prog = mode
+        dry_prog = self._pending_dry.get(machine_id, 0)
+        coins = self._pending_coins.get(machine_id, 4)
+
         with self.modbus_lock:
             try:
-                # Set mode first
-                self._modbus_write_register(slave, REG_MODE, mode)
-                time.sleep(0.05)  # small gap between commands
-                # Set duration
-                self._modbus_write_register(slave, REG_DURATION, duration_min)
-                time.sleep(0.05)
-                # Power ON (must be last)
-                self._modbus_write_register(slave, REG_POWER, 1)
-                log.info("Machine %s (slave=%d) started: mode=%d dur=%dmin", machine_id, slave, mode, duration_min)
+                # Step 1: Write wash program (address 5)
+                self._modbus_write_register(slave, REG_WRITE_WASH_PROG, wash_prog)
+                time.sleep(0.1)
+
+                # Step 2: Write dry program (address 6)
+                self._modbus_write_register(slave, REG_WRITE_DRY_PROG, dry_prog)
+                time.sleep(0.1)
+
+                # Step 3: Write coins/amount (address 4)
+                self._modbus_write_register(slave, REG_WRITE_COINS, coins)
+                time.sleep(0.1)
+
+                # Step 4: Start machine (address 1, value 1)
+                self._modbus_write_register(slave, REG_WRITE_START, 1)
+
+                log.info(
+                    "Machine %s (slave=%d) started: wash_prog=%d dry_prog=%d coins=%d",
+                    machine_id, slave, wash_prog, dry_prog, coins,
+                )
                 return True
             except (ModbusException, ConnectionError) as exc:
                 log.error("start_machine Modbus error %s: %s", machine_id, exc)
@@ -442,7 +487,7 @@ class CloudMonsterIPC:
                 return False
 
     def stop_machine(self, machine_id: str) -> bool:
-        """Send Modbus stop command to a machine."""
+        """Send force-stop command via SX176005A protocol."""
         info = MACHINE_MAP.get(machine_id)
         if not info:
             log.error("stop_machine: unknown machine %s", machine_id)
@@ -451,34 +496,69 @@ class CloudMonsterIPC:
         slave = info["slave"]
         with self.modbus_lock:
             try:
-                self._modbus_write_register(slave, REG_POWER, 0)
-                log.info("Machine %s (slave=%d) stopped", machine_id, slave)
+                # Force stop: write 1 to address 3
+                self._modbus_write_register(slave, REG_WRITE_FORCE_STOP, 1)
+                log.info("Machine %s (slave=%d) force-stopped", machine_id, slave)
                 return True
             except (ModbusException, ConnectionError) as exc:
                 log.error("stop_machine Modbus error %s: %s", machine_id, exc)
                 return False
 
     def read_machine_status(self, machine_id: str) -> dict | None:
-        """Read current status from a single machine via Modbus."""
+        """Read current status from a single machine via SX176005A protocol.
+
+        Reads 24 registers starting at address 20 (addresses 20-43).
+        """
         info = MACHINE_MAP.get(machine_id)
         if not info:
             return None
 
         slave = info["slave"]
         with self.modbus_lock:
-            regs = self._modbus_read_registers(slave, REG_STATE, 2)
+            regs = self._modbus_read_registers(slave, REG_READ_START, REG_READ_COUNT)
 
-        if regs is None or len(regs) < 2:
+        if regs is None or len(regs) < REG_READ_COUNT:
             return None
 
-        raw_state = regs[0]
-        remain_min = regs[1]
+        # Parse registers (index = address - 20)
+        machine_state_raw = regs[0]   # Address 20
+        door_state_raw    = regs[1]   # Address 21
+        fault_state       = regs[2]   # Address 22
+        step_remain_min   = regs[3]   # Address 23
+        step_remain_sec   = regs[4]   # Address 24
+        total_remain_hr   = regs[5]   # Address 25
+        total_remain_min  = regs[6]   # Address 26
+        total_remain_sec  = regs[7]   # Address 27
+        current_temp      = regs[10]  # Address 30
+        current_rpm       = regs[12]  # Address 32
+        wash_prog         = regs[18]  # Address 38
+        dry_prog          = regs[19]  # Address 39
+        current_step      = regs[20]  # Address 40
+        required_coins    = regs[21]  # Address 41
+        current_coins     = regs[22]  # Address 42
 
-        state_name = STATE_NAMES.get(raw_state, "unknown")
+        state = STATE_MAP.get(machine_state_raw, "unknown")
+        door = DOOR_MAP.get(door_state_raw, "unknown")
+
+        total_remain_seconds = total_remain_hr * 3600 + total_remain_min * 60 + total_remain_sec
+
         return {
-            "state": state_name,
-            "remain_sec": remain_min * 60,
-            "raw_state": raw_state,
+            "machine_id": machine_id,
+            "state": state,
+            "door": door,
+            "remain_sec": total_remain_seconds,
+            "step_remain": step_remain_min * 60 + step_remain_sec,
+            "temperature": current_temp,
+            "rpm": current_rpm,
+            "wash_program": wash_prog,
+            "dry_program": dry_prog,
+            "current_step": current_step,
+            "required_coins": required_coins,
+            "current_coins": current_coins,
+            "fault": bool(fault_state & 0x01),
+            "warning": bool(fault_state & 0x02),
+            "store_id": STORE_ID,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
     # ------------------------------------------------------------------
@@ -495,20 +575,22 @@ class CloudMonsterIPC:
         state = cached.get("state", "idle")
         remain_sec = cached.get("remain_sec", 0)
 
-        # Adjust remain_sec if running, based on elapsed time
-        if state == "running" and "started_at" in cached:
-            elapsed = time.time() - cached["started_at"]
-            remain_sec = max(0, remain_sec - int(elapsed))
-            if remain_sec == 0:
-                state = "done"
-                cached["state"] = "done"
-
         topic = f"laundry/{STORE_ID}/{machine_id}/status"
         payload = {
             "machine_id": machine_id,
             "state": state,
             "remain_sec": remain_sec,
-            "mode": cached.get("mode", 0),
+            "door": cached.get("door", "unknown"),
+            "step_remain": cached.get("step_remain", 0),
+            "temperature": cached.get("temperature", 0),
+            "rpm": cached.get("rpm", 0),
+            "wash_program": cached.get("wash_program", 0),
+            "dry_program": cached.get("dry_program", 0),
+            "current_step": cached.get("current_step", 0),
+            "required_coins": cached.get("required_coins", 0),
+            "current_coins": cached.get("current_coins", 0),
+            "fault": cached.get("fault", False),
+            "warning": cached.get("warning", False),
             "store_id": STORE_ID,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -548,13 +630,12 @@ class CloudMonsterIPC:
                 try:
                     hw_status = self.read_machine_status(machine_id)
                     if hw_status:
-                        # Merge hardware status into cached state
+                        # Merge hardware status into cached state, preserving order_id
                         cached = self.machine_states.get(machine_id, {})
-                        cached["state"] = hw_status["state"]
-                        cached["remain_sec"] = hw_status["remain_sec"]
-                        # Reset started_at based on hardware remaining time
-                        if hw_status["state"] == "running" and hw_status["remain_sec"] > 0:
-                            cached["started_at"] = time.time()
+                        order_id = cached.get("order_id")
+                        cached.update(hw_status)
+                        if order_id:
+                            cached["order_id"] = order_id
                         self.machine_states[machine_id] = cached
                         self._publish_status(machine_id)
                 except Exception as exc:
