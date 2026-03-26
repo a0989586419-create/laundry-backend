@@ -3327,6 +3327,195 @@ app.post('/api/admin/cleanup', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: Member Level (spending-based)
+// ═══════════════════════════════════════
+
+const MEMBER_LEVELS = [
+  { name: '鑽石', threshold: 8000, discount: 8 },
+  { name: '金卡', threshold: 3000, discount: 5 },
+  { name: '銀卡', threshold: 1000, discount: 2 },
+  { name: '銅卡', threshold: 0, discount: 0 },
+];
+
+function calculateMemberLevel(totalSpent) {
+  for (const lvl of MEMBER_LEVELS) {
+    if (totalSpent >= lvl.threshold) {
+      const currentIndex = MEMBER_LEVELS.indexOf(lvl);
+      const nextLevel = currentIndex > 0 ? MEMBER_LEVELS[currentIndex - 1] : null;
+      return {
+        level: lvl.name,
+        discount: lvl.discount,
+        totalSpent,
+        nextLevel: nextLevel ? nextLevel.name : null,
+        nextThreshold: nextLevel ? nextLevel.threshold : null,
+        progress: nextLevel
+          ? Math.min(100, Math.round(((totalSpent - lvl.threshold) / (nextLevel.threshold - lvl.threshold)) * 100))
+          : 100,
+      };
+    }
+  }
+  // Fallback (should not reach here)
+  return { level: '銅卡', discount: 0, totalSpent, nextLevel: '銀卡', nextThreshold: 1000, progress: 0 };
+}
+
+app.get('/api/user/member-level', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const result = await db.query(
+      `SELECT COALESCE(SUM(o.total_amount), 0) as total_spent
+       FROM orders o
+       JOIN members m ON o.member_id = m.id
+       WHERE m.line_user_id = $1 AND o.status = 'completed'`,
+      [userId]
+    );
+
+    const totalSpent = parseInt(result.rows[0].total_spent) || 0;
+    const levelInfo = calculateMemberLevel(totalSpent);
+
+    res.json(levelInfo);
+  } catch (e) {
+    console.error('member-level error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Referral System (LINE ID based)
+// ═══════════════════════════════════════
+
+app.post('/api/referral/apply', async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { userId, referralCode } = req.body;
+    if (!userId || !referralCode) return res.status(400).json({ error: 'userId and referralCode required' });
+
+    const code = referralCode.toUpperCase().trim();
+
+    // Find referrer by last 6 chars of LINE user ID
+    const referrerResult = await db.query(
+      `SELECT line_user_id FROM members WHERE UPPER(RIGHT(line_user_id, 6)) = $1`,
+      [code]
+    );
+    if (referrerResult.rows.length === 0) {
+      return res.status(400).json({ error: '推薦碼無效' });
+    }
+
+    const referrerUserId = referrerResult.rows[0].line_user_id;
+
+    // Cannot refer yourself
+    if (referrerUserId === userId) {
+      return res.status(400).json({ error: '不能使用自己的推薦碼' });
+    }
+
+    // Check if user has already been referred
+    const existing = await db.query(
+      'SELECT 1 FROM referrals WHERE referred_user_id = $1',
+      [userId]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: '您已使用過推薦碼' });
+    }
+
+    const rewardAmount = 30;
+
+    await client.query('BEGIN');
+
+    // Insert referral record
+    await client.query(
+      'INSERT INTO referrals (referrer_user_id, referred_user_id, reward_amount) VALUES ($1, $2, $3)',
+      [referrerUserId, userId, rewardAmount]
+    );
+
+    // Reward referrer: add to all their group wallets
+    const referrerWallets = await client.query(
+      'SELECT group_id FROM wallets WHERE line_user_id = $1',
+      [referrerUserId]
+    );
+    for (const w of referrerWallets.rows) {
+      await client.query(
+        `INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+         ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3`,
+        [referrerUserId, w.group_id, rewardAmount]
+      );
+      await client.query(
+        `INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+         VALUES ($1, $2, 'referral_reward', $3, $4, NOW())`,
+        [referrerUserId, w.group_id, rewardAmount, `推薦獎勵 (推薦碼 ${code})`]
+      );
+    }
+
+    // Reward referred user: add to all their group wallets
+    const referredWallets = await client.query(
+      'SELECT group_id FROM wallets WHERE line_user_id = $1',
+      [userId]
+    );
+    for (const w of referredWallets.rows) {
+      await client.query(
+        `INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+         ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3`,
+        [userId, w.group_id, rewardAmount]
+      );
+      await client.query(
+        `INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+         VALUES ($1, $2, 'referral_bonus', $3, $4, NOW())`,
+        [userId, w.group_id, rewardAmount, `新用戶推薦獎勵 (NT$${rewardAmount})`]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      message: `推薦碼使用成功！您和推薦人各獲得 NT$${rewardAmount} 獎勵`,
+      reward: rewardAmount,
+    });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('referral apply error:', e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/referral/status', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // My referral code = last 6 chars of LINE user ID (uppercase)
+    const myCode = userId.slice(-6).toUpperCase();
+
+    // Has this user been referred?
+    const referred = await db.query(
+      'SELECT 1 FROM referrals WHERE referred_user_id = $1',
+      [userId]
+    );
+    const hasBeenReferred = referred.rows.length > 0;
+
+    // How many people has this user referred?
+    const countResult = await db.query(
+      'SELECT COUNT(*) as cnt, COALESCE(SUM(reward_amount), 0) as total_rewards FROM referrals WHERE referrer_user_id = $1',
+      [userId]
+    );
+    const referralCount = parseInt(countResult.rows[0].cnt) || 0;
+    const totalRewards = parseInt(countResult.rows[0].total_rewards) || 0;
+
+    res.json({
+      myCode,
+      hasBeenReferred,
+      referralCount,
+      totalRewards,
+    });
+  } catch (e) {
+    console.error('referral status error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
 //  Database Initialization
 // ═══════════════════════════════════════
 async function initDB() {
@@ -3585,6 +3774,18 @@ async function initDB() {
       )
     `).catch(() => {});
     await db.query(`ALTER TABLE push_logs ADD COLUMN IF NOT EXISTS cost NUMERIC(10,2) DEFAULT 0`).catch(() => {});
+
+    // Referrals table (simple referral tracking by LINE user ID)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS referrals (
+        id SERIAL PRIMARY KEY,
+        referrer_user_id VARCHAR(100) NOT NULL,
+        referred_user_id VARCHAR(100) NOT NULL UNIQUE,
+        reward_amount INT DEFAULT 30,
+        status VARCHAR(20) DEFAULT 'completed',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
