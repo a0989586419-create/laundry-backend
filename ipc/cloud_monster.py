@@ -381,9 +381,7 @@ class CloudMonsterIPC:
         if not self._ensure_modbus():
             raise ConnectionError("Modbus not connected")
 
-        result = self.modbus_client.write_register(
-            address=address, value=value, unit=slave
-        )
+        result = self.modbus_client.write_register(address, value, slave)
         if result.isError():
             raise ModbusException(f"Write error slave={slave} addr=0x{address:04X} val={value}: {result}")
 
@@ -397,9 +395,7 @@ class CloudMonsterIPC:
         if not self._ensure_modbus():
             return None
 
-        result = self.modbus_client.read_holding_registers(
-            address=address, count=count, unit=slave
-        )
+        result = self.modbus_client.read_holding_registers(address, count, slave)
         if result.isError():
             log.warning("Modbus READ error slave=%d addr=0x%04X count=%d: %s", slave, address, count, result)
             return None
