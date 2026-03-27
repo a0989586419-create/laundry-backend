@@ -1574,9 +1574,11 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
 
       // Find active order for this machine and send LINE notification
       const orderRes = await db.query(`
-        SELECT o.id, o.line_user_id, o.store_id, o.machine_id, o.mode
+        SELECT o.id, mb.line_user_id, o.store_id, o.machine_id, o.mode, s.name as store_name
         FROM orders o
-        WHERE o.machine_id=$1 AND o.status='paid'
+        JOIN members mb ON o.member_id = mb.id
+        LEFT JOIN stores s ON o.store_id = s.id
+        WHERE o.machine_id=$1 AND o.status IN ('paid','running')
         ORDER BY o.created_at DESC LIMIT 1
       `, [device]);
 
@@ -1587,8 +1589,7 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
 
         // Send LINE push notification if user has line_user_id
         if (order.line_user_id && process.env.LINE_CHANNEL_ACCESS_TOKEN) {
-          const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [order.store_id || store_id]);
-          const storeName = storeRes.rows[0]?.name || store_id;
+          const storeName = order.store_name || store_id;
           const machineLabel = device.replace(/-/g, ' ').toUpperCase();
 
           try {
