@@ -121,6 +121,19 @@ MACHINE_MAP = {
     "s1_dryer_3":  {"slave": 6, "type": "dryer",  "name": "Dryer 3"},
 }
 
+# Program map: frontend mode_id → Modbus register values
+# (same as Edge Gateway config.json program_map, kept in sync)
+PROGRAM_MAP = {
+    "standard": {"wash_program": 1, "dry_program": 1, "coins": 4},
+    "small":    {"wash_program": 2, "dry_program": 1, "coins": 3},
+    "washonly": {"wash_program": 3, "dry_program": 0, "coins": 2},
+    "soft":     {"wash_program": 4, "dry_program": 2, "coins": 4},
+    "strong":   {"wash_program": 5, "dry_program": 1, "coins": 5},
+    "dryonly":  {"wash_program": 0, "dry_program": 1, "coins": 2},
+}
+
+DRY_TEMP_MAP = {"high": 1, "mid": 2, "low": 3, "soft": 4}
+
 # Machine state mapping (address 20)
 STATE_MAP = {0: "power_on", 1: "idle", 3: "running", 4: "manual"}
 
@@ -321,10 +334,30 @@ class CloudMonsterIPC:
     # ------------------------------------------------------------------
 
     def _handle_start(self, machine_id: str, payload: dict):
-        wash_mode = int(payload.get("wash_mode", 1))
-        dry_mode = int(payload.get("dry_mode", 0))
-        coins = int(payload.get("coins", 4))
         order_id = payload.get("orderId", "unknown")
+
+        # Support mode_id lookup from PROGRAM_MAP
+        mode_id = payload.get("mode_id")
+        if mode_id and mode_id in PROGRAM_MAP:
+            mapping = PROGRAM_MAP[mode_id]
+            wash_mode = mapping["wash_program"]
+            dry_mode = mapping["dry_program"]
+            coins = mapping["coins"]
+            log.info("mode_id '%s' → wash=%d dry=%d coins=%d", mode_id, wash_mode, dry_mode, coins)
+        else:
+            wash_mode = int(payload.get("wash_mode", 1))
+            dry_mode = int(payload.get("dry_mode", 0))
+            coins = int(payload.get("coins", 4))
+
+        # Override dry program with temp selection if provided
+        temp = payload.get("temp")
+        if temp and temp in DRY_TEMP_MAP:
+            dry_mode = DRY_TEMP_MAP[temp]
+            log.info("temp '%s' → dry_program=%d", temp, dry_mode)
+
+        # Override coins if explicitly provided
+        if "coins" in payload and not mode_id:
+            coins = int(payload["coins"])
 
         self._pending_coins[machine_id] = coins
         self._pending_dry[machine_id] = dry_mode
@@ -607,7 +640,6 @@ class CloudMonsterIPC:
         # Mark as active
         self._active_slaves.add(slave)
         self._failed_slaves[slave] = 0
-            return None
 
         # Parse registers (index = address - 20)
         machine_state_raw = regs[0]   # Address 20

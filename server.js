@@ -410,14 +410,16 @@ async function publishStartCommand(order) {
   const washMode = washModeMap[mode] ?? 1;
   const dryMode = mode === 'washonly' ? 0 : (dryModeMap[temp] ?? 1);
   const coins = Math.ceil(total_amount / 10);
-  const mqttPayload = { cmd: 'start', orderId, wash_mode: washMode, dry_mode: dryMode, coins, amount: total_amount };
+  const mqttPayload = { cmd: 'start', orderId, mode_id: mode, wash_mode: washMode, dry_mode: dryMode, coins, amount: total_amount, temp: temp || 'high' };
 
   try {
-    // Primary: Send via ThingsBoard RPC
+    // Primary: Send via ThingsBoard RPC (with mode_id for program_map lookup)
     await sendThingsBoardRPC(machine_id, 'startMachine', {
       orderId,
-      mode: washMode,
-      dry_mode: dryMode,
+      mode_id: mode,
+      wash_program: washMode,
+      dry_program: dryMode,
+      temp: temp || 'high',
       coins,
       amount: total_amount,
     });
@@ -1546,6 +1548,79 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
     `, [machineId, status || 'unknown', remaining || 0]).catch(() => {});
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════
+//  API: ThingsBoard Webhook (machine_done notification)
+// ═══════════════════════════════════════
+const TB_WEBHOOK_TOKEN = process.env.TB_WEBHOOK_TOKEN || 'e002afa25100c2fa5033db4d839e777d400d701c932d138598a372cf5d492819';
+
+app.post('/api/thingsboard/webhook', async (req, res) => {
+  const token = req.headers['x-tb-webhook-token'];
+  if (token !== TB_WEBHOOK_TOKEN) {
+    return res.status(401).json({ error: 'Invalid webhook token' });
+  }
+
+  const { event, device, store_id } = req.body;
+  console.log(`[TB Webhook] event=${event} device=${device} store_id=${store_id}`);
+
+  if (event === 'machine_done') {
+    try {
+      // Update machine state to idle
+      await db.query(`
+        UPDATE machine_current_state SET status='idle', remaining=0, updated_at=NOW()
+        WHERE machine_id=$1
+      `, [device]).catch(() => {});
+
+      // Find active order for this machine and send LINE notification
+      const orderRes = await db.query(`
+        SELECT o.id, o.line_user_id, o.store_id, o.machine_id, o.mode
+        FROM orders o
+        WHERE o.machine_id=$1 AND o.status='paid'
+        ORDER BY o.created_at DESC LIMIT 1
+      `, [device]);
+
+      if (orderRes.rows.length > 0) {
+        const order = orderRes.rows[0];
+        // Mark order completed
+        await db.query(`UPDATE orders SET status='completed', completed_at=NOW() WHERE id=$1`, [order.id]);
+
+        // Send LINE push notification if user has line_user_id
+        if (order.line_user_id && process.env.LINE_CHANNEL_ACCESS_TOKEN) {
+          const storeRes = await db.query('SELECT name FROM stores WHERE id=$1', [order.store_id || store_id]);
+          const storeName = storeRes.rows[0]?.name || store_id;
+          const machineLabel = device.replace(/-/g, ' ').toUpperCase();
+
+          try {
+            await fetch('https://api.line.me/v2/bot/message/push', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+              },
+              body: JSON.stringify({
+                to: order.line_user_id,
+                messages: [{
+                  type: 'text',
+                  text: `✅ 您的洗衣已完成！\n📍 ${storeName}\n🔧 ${machineLabel}\n請盡快取回衣物 🧺`,
+                }],
+              }),
+            });
+            console.log(`[TB Webhook] LINE notification sent to ${order.line_user_id}`);
+          } catch (lineErr) {
+            console.error('[TB Webhook] LINE push error:', lineErr.message);
+          }
+        }
+      }
+
+      res.json({ success: true, event, device });
+    } catch (e) {
+      console.error('[TB Webhook] Error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  } else {
+    res.json({ success: true, event, message: 'event received' });
+  }
 });
 
 // ═══════════════════════════════════════
