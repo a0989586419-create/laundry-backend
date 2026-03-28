@@ -66,6 +66,12 @@ HEARTBEAT_INTERVAL = 30  # seconds between heartbeat publishes
 RECONNECT_BASE = 5     # base seconds for exponential backoff
 RECONNECT_MAX = 300    # max backoff cap
 
+# ThingsBoard Gateway (Path B) — parallel to HiveMQ
+TB_ENABLED = os.environ.get("TB_ENABLED", "true").lower() in ("true", "1", "yes")
+TB_HOST    = os.environ.get("TB_HOST", "vps3.monsterstore.tw")
+TB_PORT    = int(os.environ.get("TB_PORT", "1883"))
+TB_TOKEN   = os.environ.get("TB_TOKEN", "QzCdDUV9I9xjw6HNrjyr")  # s1-gateway token
+
 # ---------------------------------------------------------------------------
 # SX176005A Touchscreen Modbus Protocol — Register Map
 # ---------------------------------------------------------------------------
@@ -113,13 +119,16 @@ REG_READ_COUNT         = 24  # Number of registers to read (20..43)
 
 # Machine mapping -- machine_id -> Modbus slave + metadata
 MACHINE_MAP = {
-    "s1_washer_1": {"slave": 1, "type": "washer", "name": "Wash-Dry 1 (Large)"},
-    "s1_washer_2": {"slave": 2, "type": "washer", "name": "Wash-Dry 2 (Medium)"},
-    "s1_washer_3": {"slave": 3, "type": "washer", "name": "Wash-Dry 3 (Medium)"},
-    "s1_dryer_1":  {"slave": 4, "type": "dryer",  "name": "Dryer 1"},
-    "s1_dryer_2":  {"slave": 5, "type": "dryer",  "name": "Dryer 2"},
-    "s1_dryer_3":  {"slave": 6, "type": "dryer",  "name": "Dryer 3"},
+    "s1_washer_1": {"slave": 1, "type": "washer", "name": "Wash-Dry 1 (Large)",  "tb_device": "s1-m1"},
+    "s1_washer_2": {"slave": 2, "type": "washer", "name": "Wash-Dry 2 (Medium)", "tb_device": "s1-m2"},
+    "s1_washer_3": {"slave": 3, "type": "washer", "name": "Wash-Dry 3 (Medium)", "tb_device": "s1-m3"},
+    "s1_dryer_1":  {"slave": 4, "type": "dryer",  "name": "Dryer 1",            "tb_device": "s1-m4"},
+    "s1_dryer_2":  {"slave": 5, "type": "dryer",  "name": "Dryer 2",            "tb_device": "s1-m5"},
+    "s1_dryer_3":  {"slave": 6, "type": "dryer",  "name": "Dryer 3",            "tb_device": "s1-m6"},
 }
+
+# Reverse lookup: TB device name → MACHINE_MAP key
+TB_DEVICE_TO_MACHINE = {v["tb_device"]: k for k, v in MACHINE_MAP.items()}
 
 # Program map: frontend mode_id → Modbus register values
 # (same as Edge Gateway config.json program_map, kept in sync)
@@ -237,6 +246,9 @@ class CloudMonsterIPC:
         self._active_slaves: set[int] = set()       # slaves that responded
         self._failed_slaves: dict[int, int] = {}     # slave -> consecutive fail count
         self._SKIP_THRESHOLD = 3  # skip slave after N consecutive fails
+        # ThingsBoard Gateway (Path B)
+        self.tb_client: mqtt.Client | None = None
+        self._tb_connected = False
 
     # ------------------------------------------------------------------
     # MQTT
@@ -272,6 +284,163 @@ class CloudMonsterIPC:
         log.info("Connecting MQTT -> %s:%d as %s", MQTT_HOST, MQTT_PORT, client_id)
         self.mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.mqtt_client.loop_start()
+
+    # ------------------------------------------------------------------
+    # ThingsBoard Gateway MQTT (Path B)
+    # ------------------------------------------------------------------
+
+    def setup_tb_mqtt(self):
+        """Initialize ThingsBoard Gateway MQTT client (Path B)."""
+        if not TB_ENABLED:
+            log.info("ThingsBoard Gateway disabled (TB_ENABLED=false)")
+            return
+        if not TB_HOST or not TB_TOKEN:
+            log.warning("TB_ENABLED=true but TB_HOST or TB_TOKEN missing, skipping")
+            return
+
+        client_id = f"tb-gw-{STORE_ID}-{int(time.time())}"
+        self.tb_client = mqtt.Client(
+            client_id=client_id,
+            protocol=mqtt.MQTTv311,
+            transport="tcp",
+        )
+        self.tb_client.username_pw_set(TB_TOKEN)  # token only, no password
+        # NO TLS for ThingsBoard (port 1883)
+
+        self.tb_client.on_connect = self._tb_on_connect
+        self.tb_client.on_disconnect = self._tb_on_disconnect
+        self.tb_client.on_message = self._tb_on_message
+
+        log.info("Connecting TB Gateway MQTT -> %s:%d as %s", TB_HOST, TB_PORT, client_id)
+        try:
+            self.tb_client.connect_async(TB_HOST, TB_PORT, keepalive=60)
+            self.tb_client.loop_start()
+        except Exception as exc:
+            log.error("TB MQTT connect_async failed: %s", exc)
+            self.tb_client = None
+
+    def _tb_on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._tb_connected = True
+            log.info("TB Gateway MQTT connected (rc=%d)", rc)
+            # Register all child devices via Gateway API
+            for machine_id, info in MACHINE_MAP.items():
+                device_name = info["tb_device"]
+                client.publish("v1/gateway/connect", json.dumps({"device": device_name}), qos=1)
+                log.info("TB registered device: %s", device_name)
+            # Subscribe to server-side RPC
+            client.subscribe("v1/gateway/rpc", qos=1)
+            log.info("TB subscribed to v1/gateway/rpc")
+        else:
+            self._tb_connected = False
+            log.error("TB Gateway MQTT connect failed rc=%d", rc)
+
+    def _tb_on_disconnect(self, client, userdata, rc):
+        self._tb_connected = False
+        if rc != 0:
+            log.warning("TB Gateway MQTT unexpected disconnect (rc=%d). Will auto-reconnect.", rc)
+
+    def _tb_on_message(self, client, userdata, msg):
+        """Handle ThingsBoard Gateway RPC messages."""
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            log.error("TB bad payload: %s", exc)
+            return
+
+        log.info("TB RPC << %s", json.dumps(payload, ensure_ascii=False))
+
+        device_name = payload.get("device", "")
+        data = payload.get("data", {})
+        rpc_id = data.get("id")
+        method = data.get("method", "")
+        params = data.get("params", {})
+
+        machine_id = TB_DEVICE_TO_MACHINE.get(device_name)
+        if not machine_id:
+            log.warning("TB RPC for unknown device: %s", device_name)
+            self._tb_rpc_respond(device_name, rpc_id, {"success": False, "error": "unknown device"})
+            return
+
+        try:
+            if method == "start":
+                self._handle_start(machine_id, params)
+                self._tb_rpc_respond(device_name, rpc_id, {"success": True})
+            elif method == "stop":
+                self._handle_stop(machine_id)
+                self._tb_rpc_respond(device_name, rpc_id, {"success": True})
+            elif method == "skip_step":
+                self._handle_skip_step(machine_id)
+                self._tb_rpc_respond(device_name, rpc_id, {"success": True})
+            elif method == "clear_coins":
+                self._handle_clear_coins(machine_id)
+                self._tb_rpc_respond(device_name, rpc_id, {"success": True})
+            else:
+                log.warning("TB RPC unknown method=%s for %s", method, device_name)
+                self._tb_rpc_respond(device_name, rpc_id, {"success": False, "error": f"unknown method: {method}"})
+        except Exception as exc:
+            log.exception("TB RPC error method=%s device=%s: %s", method, device_name, exc)
+            self._tb_rpc_respond(device_name, rpc_id, {"success": False, "error": str(exc)})
+
+    def _tb_rpc_respond(self, device_name: str, rpc_id, data: dict):
+        """Send RPC response back to ThingsBoard."""
+        if not self.tb_client or not self._tb_connected or rpc_id is None:
+            return
+        payload = json.dumps({"device": device_name, "id": rpc_id, "data": data})
+        self.tb_client.publish("v1/gateway/rpc", payload, qos=1)
+        log.debug("TB RPC response >> device=%s id=%s", device_name, rpc_id)
+
+    def _tb_publish_telemetry(self, machine_id: str):
+        """Publish machine status as TB Gateway telemetry."""
+        if not self.tb_client or not self._tb_connected:
+            return
+        info = MACHINE_MAP.get(machine_id)
+        if not info:
+            return
+
+        device_name = info["tb_device"]
+        cached = self.machine_states.get(machine_id, {})
+        ts = int(time.time() * 1000)
+
+        values = {
+            "state": cached.get("state", "idle"),
+            "door": cached.get("door", "unknown"),
+            "remain_sec": cached.get("remain_sec", 0),
+            "temperature": cached.get("temperature", 0),
+            "rpm": cached.get("rpm", 0),
+            "wash_program": cached.get("wash_program", 0),
+            "dry_program": cached.get("dry_program", 0),
+            "current_step": cached.get("current_step", 0),
+            "required_coins": cached.get("required_coins", 0),
+            "current_coins": cached.get("current_coins", 0),
+            "fault": cached.get("fault", False),
+            "warning": cached.get("warning", False),
+        }
+
+        payload = json.dumps({device_name: [{"ts": ts, "values": values}]})
+        self.tb_client.publish("v1/gateway/telemetry", payload, qos=1)
+        log.debug("TB telemetry >> %s", device_name)
+
+    def _tb_publish_heartbeat(self):
+        """Publish IPC heartbeat as TB Gateway shared attributes."""
+        if not self.tb_client or not self._tb_connected:
+            return
+
+        attrs = {
+            "ipc_status": "online",
+            "serial_connected": self.serial_port is not None and self.serial_port.is_open,
+            "uptime_sec": int(time.time() - self._start_time),
+            "store_id": STORE_ID,
+        }
+        for machine_id, info in MACHINE_MAP.items():
+            device_name = info["tb_device"]
+            self.tb_client.publish("v1/gateway/attributes",
+                                   json.dumps({device_name: attrs}), qos=1)
+        log.debug("TB heartbeat attributes published")
+
+    # ------------------------------------------------------------------
+    # HiveMQ MQTT (Path A)
+    # ------------------------------------------------------------------
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -721,6 +890,12 @@ class CloudMonsterIPC:
         self.mqtt_client.publish(topic, json.dumps(payload), qos=1)
         log.debug("MQTT >> %s : state=%s remain=%ds", topic, state, remain_sec)
 
+        # Path B: also publish to ThingsBoard
+        try:
+            self._tb_publish_telemetry(machine_id)
+        except Exception as exc:
+            log.error("TB telemetry publish error for %s: %s", machine_id, exc)
+
     def _publish_heartbeat(self):
         """Publish IPC heartbeat."""
         if not self.mqtt_client or not self.mqtt_client.is_connected():
@@ -739,6 +914,12 @@ class CloudMonsterIPC:
         }
         self.mqtt_client.publish(topic, json.dumps(payload), qos=1, retain=True)
         log.debug("Heartbeat published")
+
+        # Path B: also publish heartbeat to ThingsBoard
+        try:
+            self._tb_publish_heartbeat()
+        except Exception as exc:
+            log.error("TB heartbeat publish error: %s", exc)
 
     # ------------------------------------------------------------------
     # Background loops
@@ -796,11 +977,14 @@ class CloudMonsterIPC:
         log.info("=" * 60)
         log.info("Cloud Monster IPC starting  store=%s", STORE_ID)
         log.info("MQTT=%s:%d  Serial=%s@%d", MQTT_HOST, MQTT_PORT, SERIAL_PORT, SERIAL_BAUD)
+        if TB_ENABLED:
+            log.info("TB Gateway=%s:%d  Token=%s...  Enabled", TB_HOST, TB_PORT, TB_TOKEN[:8])
         log.info("Machines: %s", ", ".join(MACHINE_MAP.keys()))
         log.info("=" * 60)
 
         # Setup connections
-        self.setup_mqtt()
+        self.setup_mqtt()        # Path A: HiveMQ Cloud
+        self.setup_tb_mqtt()     # Path B: ThingsBoard Gateway
         self.setup_modbus()
 
         # Initialize machine states
@@ -843,6 +1027,22 @@ class CloudMonsterIPC:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             log.info("MQTT disconnected")
+
+        # Disconnect ThingsBoard Gateway (Path B)
+        if self.tb_client and self._tb_connected:
+            try:
+                for machine_id, info in MACHINE_MAP.items():
+                    device_name = info["tb_device"]
+                    self.tb_client.publish("v1/gateway/attributes",
+                                           json.dumps({device_name: {"ipc_status": "offline"}}), qos=1)
+                    self.tb_client.publish("v1/gateway/disconnect",
+                                           json.dumps({"device": device_name}), qos=1)
+                time.sleep(0.5)
+                self.tb_client.loop_stop()
+                self.tb_client.disconnect()
+                log.info("TB Gateway MQTT disconnected")
+            except Exception as exc:
+                log.error("TB shutdown error: %s", exc)
 
         # Close serial
         if self.serial_port and self.serial_port.is_open:
@@ -892,6 +1092,10 @@ RestartSec=10
 WatchdogSec=120
 Environment=STORE_ID={store_id}
 Environment=SERIAL_PORT={serial_port}
+Environment=TB_ENABLED=true
+Environment=TB_HOST=vps3.monsterstore.tw
+Environment=TB_PORT=1883
+Environment=TB_TOKEN={tb_token}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cloud-monster
@@ -908,7 +1112,7 @@ WantedBy=multi-user.target
 
 
 def generate_systemd_service(output_path: str = "/tmp/cloud-monster.service"):
-    content = SYSTEMD_UNIT.format(store_id=STORE_ID, serial_port=SERIAL_PORT)
+    content = SYSTEMD_UNIT.format(store_id=STORE_ID, serial_port=SERIAL_PORT, tb_token=TB_TOKEN)
     with open(output_path, "w") as f:
         f.write(content)
     print(f"Systemd service file written to {output_path}")

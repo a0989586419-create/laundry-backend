@@ -1625,6 +1625,241 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  API: ThingsBoard Telemetry Query (Path B)
+// ═══════════════════════════════════════
+
+// GET /api/tb/telemetry/:deviceName — 查詢單台機器最新遙測
+app.get('/api/tb/telemetry/:deviceName', async (req, res) => {
+  try {
+    const { deviceName } = req.params;
+    const keys = req.query.keys || 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,required_coins,current_coins,fault,warning';
+    const token = await getTBToken();
+    const deviceId = await getTBDeviceId(deviceName);
+    if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
+
+    const tbRes = await fetch(
+      `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`,
+      { headers: { 'X-Authorization': `Bearer ${token}` } }
+    );
+    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB telemetry query failed' });
+    const data = await tbRes.json();
+
+    // Flatten: { "state": [{"ts":..,"value":"idle"}] } → { "state": "idle", ... }
+    const flat = {};
+    for (const [k, arr] of Object.entries(data)) {
+      if (arr && arr.length > 0) {
+        let v = arr[0].value;
+        if (v === 'true') v = true;
+        else if (v === 'false') v = false;
+        else if (!isNaN(v) && v !== '') v = Number(v);
+        flat[k] = v;
+        flat[k + '_ts'] = arr[0].ts;
+      }
+    }
+    flat.device = deviceName;
+    flat.source = 'thingsboard';
+    res.json(flat);
+  } catch (e) {
+    console.error('[TB Telemetry]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/tb/telemetry/store/:storeId — 查詢整店所有機器最新遙測
+app.get('/api/tb/telemetry/store/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const token = await getTBToken();
+    const keys = 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,fault,warning';
+
+    // Get all machines for this store from DB
+    const machinesRes = await db.query(
+      'SELECT id, name, size FROM machines WHERE store_id=$1 AND active=true ORDER BY sort_order, name',
+      [storeId]
+    );
+
+    const results = [];
+    for (const machine of machinesRes.rows) {
+      const deviceName = machine.id;  // e.g. "s1-m1"
+      try {
+        const deviceId = await getTBDeviceId(deviceName);
+        if (!deviceId) {
+          results.push({ device: deviceName, name: machine.name, source: 'thingsboard', error: 'not_found' });
+          continue;
+        }
+        const tbRes = await fetch(
+          `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`,
+          { headers: { 'X-Authorization': `Bearer ${token}` } }
+        );
+        if (!tbRes.ok) {
+          results.push({ device: deviceName, name: machine.name, source: 'thingsboard', error: `tb_${tbRes.status}` });
+          continue;
+        }
+        const data = await tbRes.json();
+        const flat = { device: deviceName, name: machine.name, size: machine.size, source: 'thingsboard' };
+        for (const [k, arr] of Object.entries(data)) {
+          if (arr && arr.length > 0) {
+            let v = arr[0].value;
+            if (v === 'true') v = true;
+            else if (v === 'false') v = false;
+            else if (!isNaN(v) && v !== '') v = Number(v);
+            flat[k] = v;
+            flat[k + '_ts'] = arr[0].ts;
+          }
+        }
+        results.push(flat);
+      } catch (innerErr) {
+        results.push({ device: deviceName, name: machine.name, source: 'thingsboard', error: innerErr.message });
+      }
+    }
+
+    res.json({ store_id: storeId, machines: results, source: 'thingsboard', timestamp: new Date().toISOString() });
+  } catch (e) {
+    console.error('[TB Store Telemetry]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/tb/history/:deviceName — 查詢歷史遙測（時間序列）
+app.get('/api/tb/history/:deviceName', async (req, res) => {
+  try {
+    const { deviceName } = req.params;
+    const keys = req.query.keys || 'state,temperature,rpm';
+    const startTs = req.query.startTs || (Date.now() - 24 * 3600 * 1000); // default: last 24h
+    const endTs = req.query.endTs || Date.now();
+    const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+    const interval = req.query.interval || 0; // 0 = no aggregation
+    const agg = req.query.agg || 'NONE'; // NONE, AVG, MIN, MAX, COUNT, SUM
+
+    const token = await getTBToken();
+    const deviceId = await getTBDeviceId(deviceName);
+    if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
+
+    let url = `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}&startTs=${startTs}&endTs=${endTs}&limit=${limit}`;
+    if (interval > 0 && agg !== 'NONE') {
+      url += `&interval=${interval}&agg=${agg}`;
+    }
+
+    const tbRes = await fetch(url, { headers: { 'X-Authorization': `Bearer ${token}` } });
+    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB history query failed' });
+    const data = await tbRes.json();
+
+    res.json({ device: deviceName, source: 'thingsboard', startTs: Number(startTs), endTs: Number(endTs), data });
+  } catch (e) {
+    console.error('[TB History]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/tb/attributes/:deviceName — 查詢設備屬性（shared + client）
+app.get('/api/tb/attributes/:deviceName', async (req, res) => {
+  try {
+    const { deviceName } = req.params;
+    const token = await getTBToken();
+    const deviceId = await getTBDeviceId(deviceName);
+    if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
+
+    // Fetch both shared and client attributes
+    const [sharedRes, clientRes] = await Promise.all([
+      fetch(`http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`, {
+        headers: { 'X-Authorization': `Bearer ${token}` },
+      }),
+      fetch(`http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/CLIENT_SCOPE`, {
+        headers: { 'X-Authorization': `Bearer ${token}` },
+      }),
+    ]);
+
+    const shared = sharedRes.ok ? await sharedRes.json() : [];
+    const client = clientRes.ok ? await clientRes.json() : [];
+
+    // Convert array format to object: [{key, value}] → {key: value}
+    const sharedObj = {};
+    for (const item of shared) sharedObj[item.key] = item.value;
+    const clientObj = {};
+    for (const item of client) clientObj[item.key] = item.value;
+
+    res.json({ device: deviceName, source: 'thingsboard', shared: sharedObj, client: clientObj });
+  } catch (e) {
+    console.error('[TB Attributes]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/machines/:storeId/live — 混合查詢：DB + ThingsBoard（最佳數據源）
+app.get('/api/machines/:storeId/live', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+
+    // 1. Get DB state (always available)
+    const dbRes = await db.query(`
+      SELECT m.id, m.name, m.size,
+      CASE
+        WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
+        ELSE COALESCE(cs.state,'unknown')
+      END as state,
+      CASE
+        WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
+        ELSE 0
+      END as remain_sec,
+      cs.temperature, cs.rpm, cs.mode,
+      cs.updated_at as last_seen
+      FROM machines m LEFT JOIN machine_current_state cs ON m.id=cs.machine_id
+      WHERE m.store_id=$1 AND m.active=true ORDER BY m.sort_order, m.name
+    `, [storeId]);
+
+    const machines = dbRes.rows;
+
+    // 2. Try to enrich with ThingsBoard telemetry (best-effort)
+    try {
+      const token = await getTBToken();
+      const tbKeys = 'state,door,remain_sec,temperature,rpm,fault,warning';
+
+      await Promise.all(machines.map(async (machine) => {
+        try {
+          const deviceId = await getTBDeviceId(machine.id);
+          if (!deviceId) return;
+          const tbRes = await fetch(
+            `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${tbKeys}`,
+            { headers: { 'X-Authorization': `Bearer ${token}` } }
+          );
+          if (!tbRes.ok) return;
+          const data = await tbRes.json();
+
+          // Only use TB data if it's fresher than DB data
+          const tbTs = data.state?.[0]?.ts || 0;
+          const dbTs = machine.last_seen ? new Date(machine.last_seen).getTime() : 0;
+
+          if (tbTs > dbTs) {
+            machine.state = data.state?.[0]?.value || machine.state;
+            machine.remain_sec = Number(data.remain_sec?.[0]?.value) || machine.remain_sec;
+            machine.temperature = Number(data.temperature?.[0]?.value) || machine.temperature;
+            machine.rpm = Number(data.rpm?.[0]?.value) || machine.rpm;
+            machine.door = data.door?.[0]?.value || 'unknown';
+            machine.fault = data.fault?.[0]?.value === 'true';
+            machine.warning = data.warning?.[0]?.value === 'true';
+            machine.source = 'thingsboard';
+            machine.tb_ts = tbTs;
+          } else {
+            machine.source = 'database';
+          }
+        } catch (innerErr) {
+          machine.source = 'database';
+        }
+      }));
+    } catch (tbErr) {
+      // TB unavailable, all machines use DB data
+      console.warn('[Live] TB unavailable, using DB only:', tbErr.message);
+      machines.forEach(m => { m.source = 'database'; });
+    }
+
+    res.json(machines);
+  } catch (e) {
+    console.error('[Live Machines]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
 //  API: Machine Notify (queue notification)
 // ═══════════════════════════════════════
 app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
