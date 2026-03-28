@@ -102,7 +102,7 @@ function requireIotApiKey(req, res, next) {
 let tbToken = null;
 let tbTokenExpiry = 0;
 
-const TB_BASE = process.env.TB_BASE_URL || 'http://vps3.monsterstore.tw:8090/tb-api';
+const TB_BASE = process.env.TB_BASE_URL || 'http://vps3.monsterstore.tw:8090';
 
 async function getTBToken() {
   if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
