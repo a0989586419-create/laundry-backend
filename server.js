@@ -9,6 +9,7 @@ const https = require('https');
 
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const axios = require('axios');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -101,25 +102,25 @@ function requireIotApiKey(req, res, next) {
 let tbToken = null;
 let tbTokenExpiry = 0;
 
+const TB_BASE = process.env.TB_BASE_URL || '${TB_BASE}';
+
 async function getTBToken() {
   if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
-  const res = await fetch('http://vps3.monsterstore.tw:8080/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: process.env.TB_USERNAME || 'sl6963693171@gmail.com', password: process.env.TB_PASSWORD || 's85010805' }),
-  });
-  const data = await res.json();
+  const { data } = await axios.post(`${TB_BASE}/api/auth/login`, {
+    username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
+    password: process.env.TB_PASSWORD || 's85010805',
+  }, { timeout: 10000 });
   tbToken = data.token;
-  tbTokenExpiry = Date.now() + 3600000; // 1 hour
+  tbTokenExpiry = Date.now() + 3600000;
   return tbToken;
 }
 
 async function getTBDeviceId(deviceName) {
   const token = await getTBToken();
-  const res = await fetch(`http://vps3.monsterstore.tw:8080/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
+  const { data } = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
     headers: { 'X-Authorization': `Bearer ${token}` },
+    timeout: 10000,
   });
-  const data = await res.json();
   return data.data?.[0]?.id?.id || null;
 }
 
@@ -127,13 +128,21 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
   const token = await getTBToken();
   const deviceId = await getTBDeviceId(deviceName);
   if (!deviceId) throw new Error(`Device ${deviceName} not found in ThingsBoard`);
-  const res = await fetch(`http://vps3.monsterstore.tw:8080/api/rpc/oneway/${deviceId}`, {
-    method: 'POST',
+  await axios.post(`${TB_BASE}/api/rpc/oneway/${deviceId}`, { method, params }, {
     headers: { 'Content-Type': 'application/json', 'X-Authorization': `Bearer ${token}` },
-    body: JSON.stringify({ method, params }),
+    timeout: 10000,
   });
-  if (!res.ok) throw new Error(`TB RPC failed: ${res.status}`);
   return true;
+}
+
+// Generic TB GET helper (used by telemetry/attribute endpoints)
+async function tbGet(path) {
+  const token = await getTBToken();
+  const { data } = await axios.get(`${TB_BASE}${path}`, {
+    headers: { 'X-Authorization': `Bearer ${token}` },
+    timeout: 10000,
+  });
+  return data;
 }
 
 // ===== LINE Messaging API Push Notifications =====
@@ -1633,16 +1642,10 @@ app.get('/api/tb/telemetry/:deviceName', async (req, res) => {
   try {
     const { deviceName } = req.params;
     const keys = req.query.keys || 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,required_coins,current_coins,fault,warning';
-    const token = await getTBToken();
     const deviceId = await getTBDeviceId(deviceName);
     if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
 
-    const tbRes = await fetch(
-      `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`,
-      { headers: { 'X-Authorization': `Bearer ${token}` } }
-    );
-    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB telemetry query failed' });
-    const data = await tbRes.json();
+    const data = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`);
 
     // Flatten: { "state": [{"ts":..,"value":"idle"}] } → { "state": "idle", ... }
     const flat = {};
@@ -1669,7 +1672,6 @@ app.get('/api/tb/telemetry/:deviceName', async (req, res) => {
 app.get('/api/tb/telemetry/store/:storeId', async (req, res) => {
   try {
     const { storeId } = req.params;
-    const token = await getTBToken();
     const keys = 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,fault,warning';
 
     // Get all machines for this store from DB
@@ -1687,15 +1689,7 @@ app.get('/api/tb/telemetry/store/:storeId', async (req, res) => {
           results.push({ device: deviceName, name: machine.name, source: 'thingsboard', error: 'not_found' });
           continue;
         }
-        const tbRes = await fetch(
-          `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`,
-          { headers: { 'X-Authorization': `Bearer ${token}` } }
-        );
-        if (!tbRes.ok) {
-          results.push({ device: deviceName, name: machine.name, source: 'thingsboard', error: `tb_${tbRes.status}` });
-          continue;
-        }
-        const data = await tbRes.json();
+        const data = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`);
         const flat = { device: deviceName, name: machine.name, size: machine.size, source: 'thingsboard' };
         for (const [k, arr] of Object.entries(data)) {
           if (arr && arr.length > 0) {
@@ -1731,18 +1725,15 @@ app.get('/api/tb/history/:deviceName', async (req, res) => {
     const interval = req.query.interval || 0; // 0 = no aggregation
     const agg = req.query.agg || 'NONE'; // NONE, AVG, MIN, MAX, COUNT, SUM
 
-    const token = await getTBToken();
     const deviceId = await getTBDeviceId(deviceName);
     if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
 
-    let url = `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}&startTs=${startTs}&endTs=${endTs}&limit=${limit}`;
+    let path = `/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}&startTs=${startTs}&endTs=${endTs}&limit=${limit}`;
     if (interval > 0 && agg !== 'NONE') {
-      url += `&interval=${interval}&agg=${agg}`;
+      path += `&interval=${interval}&agg=${agg}`;
     }
 
-    const tbRes = await fetch(url, { headers: { 'X-Authorization': `Bearer ${token}` } });
-    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB history query failed' });
-    const data = await tbRes.json();
+    const data = await tbGet(path);
 
     res.json({ device: deviceName, source: 'thingsboard', startTs: Number(startTs), endTs: Number(endTs), data });
   } catch (e) {
@@ -1755,22 +1746,14 @@ app.get('/api/tb/history/:deviceName', async (req, res) => {
 app.get('/api/tb/attributes/:deviceName', async (req, res) => {
   try {
     const { deviceName } = req.params;
-    const token = await getTBToken();
     const deviceId = await getTBDeviceId(deviceName);
     if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
 
-    // Fetch both shared and client attributes
-    const [sharedRes, clientRes] = await Promise.all([
-      fetch(`http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`, {
-        headers: { 'X-Authorization': `Bearer ${token}` },
-      }),
-      fetch(`http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/CLIENT_SCOPE`, {
-        headers: { 'X-Authorization': `Bearer ${token}` },
-      }),
+    // Fetch both shared and client attributes in parallel
+    const [shared, client] = await Promise.all([
+      tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`).catch(() => []),
+      tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/CLIENT_SCOPE`).catch(() => []),
     ]);
-
-    const shared = sharedRes.ok ? await sharedRes.json() : [];
-    const client = clientRes.ok ? await clientRes.json() : [];
 
     // Convert array format to object: [{key, value}] → {key: value}
     const sharedObj = {};
@@ -1790,19 +1773,12 @@ app.get('/api/tb/attributes/:deviceName', async (req, res) => {
 app.get('/api/tb/config/:storeId', async (req, res) => {
   try {
     const { storeId } = req.params;
-    const token = await getTBToken();
-
     // Read config from first machine of this store (all machines share same config)
     const deviceName = `${storeId}-m1`;
     const deviceId = await getTBDeviceId(deviceName);
     if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
 
-    const tbRes = await fetch(
-      `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`,
-      { headers: { 'X-Authorization': `Bearer ${token}` } }
-    );
-    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB config query failed' });
-    const attrs = await tbRes.json();
+    const attrs = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`);
 
     // Convert array [{key, value}] to object
     const config = {};
@@ -1864,19 +1840,13 @@ app.get('/api/machines/:storeId/live', async (req, res) => {
 
     // 2. Try to enrich with ThingsBoard telemetry (best-effort)
     try {
-      const token = await getTBToken();
       const tbKeys = 'state,door,remain_sec,temperature,rpm,fault,warning';
 
       await Promise.all(machines.map(async (machine) => {
         try {
           const deviceId = await getTBDeviceId(machine.id);
           if (!deviceId) return;
-          const tbRes = await fetch(
-            `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${tbKeys}`,
-            { headers: { 'X-Authorization': `Bearer ${token}` } }
-          );
-          if (!tbRes.ok) return;
-          const data = await tbRes.json();
+          const data = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${tbKeys}`);
 
           // Only use TB data if it's fresher than DB data
           const tbTs = data.state?.[0]?.ts || 0;

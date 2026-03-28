@@ -247,7 +247,8 @@ class CloudMonsterIPC:
         self._failed_slaves: dict[int, int] = {}     # slave -> consecutive fail count
         self._SKIP_THRESHOLD = 3  # skip slave after N consecutive fails
         self._price_read_counter = 0
-        self._PRICE_READ_INTERVAL = 30  # 每 30 個 status 周期讀一次價格 (30 * 10s = 5min)
+        self._PRICE_READ_INTERVAL = 8640  # 每 8640 個 status 周期讀一次 (8640 * 10s = 24hr)
+        self._config_read_on_startup = True  # 啟動時讀一次
         # ThingsBoard Gateway (Path B)
         self.tb_client: mqtt.Client | None = None
         self._tb_connected = False
@@ -1048,14 +1049,21 @@ class CloudMonsterIPC:
                 except Exception as exc:
                     log.error("Status read error for %s: %s", machine_id, exc)
 
-            # Periodically read prices from touchscreen
-            self._price_read_counter += 1
-            if self._price_read_counter >= self._PRICE_READ_INTERVAL:
-                self._price_read_counter = 0
+            # Read touchscreen config: on startup + every 24 hours
+            if self._config_read_on_startup:
+                self._config_read_on_startup = False
                 try:
                     self.read_and_publish_config()
                 except Exception as exc:
-                    log.error("Price read error: %s", exc)
+                    log.error("Startup config read error: %s", exc)
+            else:
+                self._price_read_counter += 1
+                if self._price_read_counter >= self._PRICE_READ_INTERVAL:
+                    self._price_read_counter = 0
+                    try:
+                        self.read_and_publish_config()
+                    except Exception as exc:
+                        log.error("Config read error: %s", exc)
 
             # Sleep in small increments so we can exit quickly
             for _ in range(STATUS_INTERVAL * 10):
