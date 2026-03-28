@@ -106,13 +106,19 @@ const TB_BASE = process.env.TB_BASE_URL || 'http://vps3.monsterstore.tw:8090';
 
 async function getTBToken() {
   if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
-  const { data } = await axios.post(`${TB_BASE}/api/auth/login`, {
-    username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
-    password: process.env.TB_PASSWORD || 's85010805',
-  }, { timeout: 10000 });
-  tbToken = data.token;
-  tbTokenExpiry = Date.now() + 3600000;
-  return tbToken;
+  try {
+    const { data } = await axios.post(`${TB_BASE}/api/auth/login`, {
+      username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
+      password: process.env.TB_PASSWORD || 's85010805',
+    }, { timeout: 10000 });
+    tbToken = data.token;
+    tbTokenExpiry = Date.now() + 3600000;
+    console.log('[TB] Login OK, token acquired');
+    return tbToken;
+  } catch (e) {
+    console.error('[TB Login FAIL]', e.response?.status, e.response?.data || e.message);
+    throw e;
+  }
 }
 
 function tbHeaders(token) {
@@ -121,10 +127,18 @@ function tbHeaders(token) {
 
 async function getTBDeviceId(deviceName) {
   const token = await getTBToken();
-  const { data } = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
-    headers: tbHeaders(token), timeout: 10000,
-  });
-  return data.data?.[0]?.id?.id || null;
+  try {
+    const { data } = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
+      headers: tbHeaders(token), timeout: 10000,
+    });
+    const id = data.data?.[0]?.id?.id || null;
+    if (id) console.log(`[TB] Device ${deviceName} → ${id}`);
+    else console.warn(`[TB] Device ${deviceName} NOT FOUND`);
+    return id;
+  } catch (e) {
+    console.error(`[TB DeviceId FAIL] ${deviceName}:`, e.response?.status, e.response?.data || e.message);
+    throw e;
+  }
 }
 
 async function sendThingsBoardRPC(deviceName, method, params = {}) {
@@ -140,10 +154,15 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
 // Generic TB GET helper (used by telemetry/attribute endpoints)
 async function tbGet(path) {
   const token = await getTBToken();
-  const { data } = await axios.get(`${TB_BASE}${path}`, {
-    headers: tbHeaders(token), timeout: 15000,
-  });
-  return data;
+  try {
+    const { data } = await axios.get(`${TB_BASE}${path}`, {
+      headers: tbHeaders(token), timeout: 15000,
+    });
+    return data;
+  } catch (e) {
+    console.error(`[TB GET FAIL] ${path}:`, e.response?.status, JSON.stringify(e.response?.data || e.message).slice(0, 300));
+    throw e;
+  }
 }
 
 // ===== LINE Messaging API Push Notifications =====
@@ -1631,6 +1650,46 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
     }
   } else {
     res.json({ success: true, event, message: 'event received' });
+  }
+});
+
+// GET /api/tb/diag — ThingsBoard connectivity diagnostic
+app.get('/api/tb/diag', async (req, res) => {
+  const steps = { tb_base: TB_BASE };
+  try {
+    // Step 1: Login
+    const loginRes = await axios.post(`${TB_BASE}/api/auth/login`, {
+      username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
+      password: process.env.TB_PASSWORD || 's85010805',
+    }, { timeout: 10000 });
+    steps.login = { status: loginRes.status, hasToken: !!loginRes.data?.token };
+    const token = loginRes.data.token;
+
+    // Step 2: Device lookup
+    const devRes = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=s1-m1`, {
+      headers: tbHeaders(token), timeout: 10000,
+    });
+    const deviceId = devRes.data?.data?.[0]?.id?.id;
+    steps.device_lookup = { status: devRes.status, deviceId, found: !!deviceId };
+
+    // Step 3: Telemetry query
+    if (deviceId) {
+      const telRes = await axios.get(`${TB_BASE}/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=state`, {
+        headers: tbHeaders(token), timeout: 10000,
+      });
+      steps.telemetry = { status: telRes.status, data: telRes.data };
+    }
+
+    steps.overall = 'OK';
+    res.json(steps);
+  } catch (e) {
+    steps.error = {
+      step: steps.login ? (steps.device_lookup ? 'telemetry' : 'device_lookup') : 'login',
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message,
+    };
+    res.status(500).json(steps);
   }
 });
 
