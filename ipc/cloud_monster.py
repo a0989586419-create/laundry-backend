@@ -246,6 +246,8 @@ class CloudMonsterIPC:
         self._active_slaves: set[int] = set()       # slaves that responded
         self._failed_slaves: dict[int, int] = {}     # slave -> consecutive fail count
         self._SKIP_THRESHOLD = 3  # skip slave after N consecutive fails
+        self._price_read_counter = 0
+        self._PRICE_READ_INTERVAL = 30  # 每 30 個 status 周期讀一次價格 (30 * 10s = 5min)
         # ThingsBoard Gateway (Path B)
         self.tb_client: mqtt.Client | None = None
         self._tb_connected = False
@@ -922,6 +924,105 @@ class CloudMonsterIPC:
             log.error("TB heartbeat publish error: %s", exc)
 
     # ------------------------------------------------------------------
+    # Price reading from touchscreen
+    # ------------------------------------------------------------------
+
+    def read_and_publish_config(self):
+        """Read touchscreen config (prices, programs, settings) and publish to TB."""
+        if not self._ensure_serial():
+            return
+
+        slave = next(iter(self._active_slaves), 1)
+        config = {"config_updated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+        # ── 1. Read P1-P4 prices (READ addr 440-443, param 1340-1343) ──
+        with self.modbus_lock:
+            price_regs = self._modbus_read_registers(slave, 440, 4)
+        if price_regs and len(price_regs) >= 4:
+            for i in range(4):
+                config[f"P{i+1}_coins"] = price_regs[i]
+                config[f"P{i+1}_price_nt"] = price_regs[i] * 10
+            log.info("PRICES P1=%d P2=%d P3=%d P4=%d (coins)",
+                     price_regs[0], price_regs[1], price_regs[2], price_regs[3])
+        else:
+            log.warning("Price read failed from slave=%d", slave)
+
+        time.sleep(0.15)
+
+        # ── 2. Read general config (READ addr 412-426) ──
+        # param 1312=payment_mode, 1320=coin_value, 1322=auto_start,
+        # 1325=currency, 1326=num_programs
+        with self.modbus_lock:
+            cfg_regs = self._modbus_read_registers(slave, 412, 15)  # addr 412-426
+        if cfg_regs and len(cfg_regs) >= 15:
+            config["payment_mode"] = cfg_regs[0]       # addr 412 (param 1312)
+            config["coin_value_nt"] = cfg_regs[8]       # addr 420 (param 1320)
+            config["auto_start"] = cfg_regs[10]          # addr 422 (param 1322)
+            config["currency"] = cfg_regs[13]            # addr 425 (param 1325)
+            config["num_programs"] = cfg_regs[14]        # addr 426 (param 1326)
+            log.info("CONFIG programs=%d coin_val=%d currency=%d",
+                     cfg_regs[14], cfg_regs[8], cfg_regs[13])
+
+        time.sleep(0.15)
+
+        # ── 3. Scan program details (select each program, read back timing) ──
+        # Only scan when machine is idle (state=1)
+        with self.modbus_lock:
+            status_regs = self._modbus_read_registers(slave, REG_READ_START, REG_READ_COUNT)
+        if status_regs and status_regs[0] in (0, 1):  # power_on or standby
+            programs = []
+            for prog in range(1, 5):  # P1-P4
+                with self.modbus_lock:
+                    # Write wash program number to addr 5
+                    ok = self._modbus_write_register(slave, REG_WRITE_WASH_PROG, prog)
+                if not ok:
+                    programs.append({"program": prog, "error": "write_failed"})
+                    continue
+                time.sleep(0.25)
+
+                with self.modbus_lock:
+                    st = self._modbus_read_registers(slave, REG_READ_START, REG_READ_COUNT)
+                if st and len(st) >= REG_READ_COUNT:
+                    total_sec = st[5] * 3600 + st[6] * 60 + st[7]  # addr 25-27
+                    prog_info = {
+                        "program": prog,
+                        "wash_program_readback": st[18],   # addr 38
+                        "dry_program_readback": st[19],    # addr 39
+                        "required_coins": st[21],          # addr 41
+                        "total_time_sec": total_sec,
+                        "total_time_min": round(total_sec / 60, 1),
+                        "step": st[20],                    # addr 40
+                    }
+                    programs.append(prog_info)
+                    config[f"prog{prog}_coins"] = st[21]
+                    config[f"prog{prog}_price_nt"] = st[21] * config.get("coin_value_nt", 10)
+                    config[f"prog{prog}_total_min"] = round(total_sec / 60, 1)
+                    config[f"prog{prog}_wash"] = st[18]
+                    config[f"prog{prog}_dry"] = st[19]
+                    log.info("PROG%d: coins=%d time=%.1fmin wash=%d dry=%d",
+                             prog, st[21], total_sec / 60, st[18], st[19])
+                else:
+                    programs.append({"program": prog, "error": "read_failed"})
+                time.sleep(0.15)
+
+            # Reset wash program selection
+            with self.modbus_lock:
+                self._modbus_write_register(slave, REG_WRITE_WASH_PROG, 0)
+
+            config["programs_scanned"] = len([p for p in programs if "error" not in p])
+        else:
+            log.info("Machine not idle (state=%s), skipping program scan",
+                     status_regs[0] if status_regs else "?")
+
+        # ── 4. Publish to ThingsBoard as shared attributes ──
+        if self.tb_client and self._tb_connected and config:
+            for machine_id, info in MACHINE_MAP.items():
+                device_name = info["tb_device"]
+                self.tb_client.publish("v1/gateway/attributes",
+                                       json.dumps({device_name: config}), qos=1)
+            log.info("Config published to TB (%d keys)", len(config))
+
+    # ------------------------------------------------------------------
     # Background loops
     # ------------------------------------------------------------------
 
@@ -946,6 +1047,15 @@ class CloudMonsterIPC:
                         log.debug("No status response from %s", machine_id)
                 except Exception as exc:
                     log.error("Status read error for %s: %s", machine_id, exc)
+
+            # Periodically read prices from touchscreen
+            self._price_read_counter += 1
+            if self._price_read_counter >= self._PRICE_READ_INTERVAL:
+                self._price_read_counter = 0
+                try:
+                    self.read_and_publish_config()
+                except Exception as exc:
+                    log.error("Price read error: %s", exc)
 
             # Sleep in small increments so we can exit quickly
             for _ in range(STATUS_INTERVAL * 10):

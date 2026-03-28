@@ -1785,6 +1785,59 @@ app.get('/api/tb/attributes/:deviceName', async (req, res) => {
   }
 });
 
+// GET /api/tb/config/:storeId — 查詢觸控屏程式配置（價格、洗程、時間）
+// 從 TB shared attributes 讀取，工控機每 5 分鐘自動更新
+app.get('/api/tb/config/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const token = await getTBToken();
+
+    // Read config from first machine of this store (all machines share same config)
+    const deviceName = `${storeId}-m1`;
+    const deviceId = await getTBDeviceId(deviceName);
+    if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
+
+    const tbRes = await fetch(
+      `http://vps3.monsterstore.tw:8080/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`,
+      { headers: { 'X-Authorization': `Bearer ${token}` } }
+    );
+    if (!tbRes.ok) return res.status(tbRes.status).json({ error: 'TB config query failed' });
+    const attrs = await tbRes.json();
+
+    // Convert array [{key, value}] to object
+    const config = {};
+    for (const item of attrs) config[item.key] = item.value;
+
+    // Build structured program list for frontend
+    const programs = [];
+    for (let i = 1; i <= (config.num_programs || 4); i++) {
+      programs.push({
+        program: i,
+        coins: config[`prog${i}_coins`] || config[`P${i}_coins`] || 0,
+        price_nt: config[`prog${i}_price_nt`] || config[`P${i}_price_nt`] || 0,
+        total_min: config[`prog${i}_total_min`] || 0,
+        wash_program: config[`prog${i}_wash`] || i,
+        dry_program: config[`prog${i}_dry`] || 0,
+      });
+    }
+
+    res.json({
+      store_id: storeId,
+      source: 'thingsboard',
+      config_updated_at: config.config_updated_at || null,
+      num_programs: config.num_programs || 4,
+      coin_value_nt: config.coin_value_nt || 10,
+      currency: config.currency || 3,
+      payment_mode: config.payment_mode || 1,
+      programs,
+      raw: config,
+    });
+  } catch (e) {
+    console.error('[TB Config]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/machines/:storeId/live — 混合查詢：DB + ThingsBoard（最佳數據源）
 app.get('/api/machines/:storeId/live', async (req, res) => {
   try {
