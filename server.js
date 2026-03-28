@@ -125,15 +125,24 @@ function tbHeaders(token) {
   return { 'X-Authorization': `Bearer ${token}`, 'Authorization': `Bearer ${token}` };
 }
 
+// Cache device IDs to avoid repeated lookups
+const tbDeviceIdCache = {};
+
 async function getTBDeviceId(deviceName) {
+  if (tbDeviceIdCache[deviceName]) return tbDeviceIdCache[deviceName];
   const token = await getTBToken();
   try {
-    const { data } = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
-      headers: tbHeaders(token), timeout: 10000,
-    });
+    const { data } = await axios.get(
+      `${TB_BASE}/api/tenant/devices?pageSize=1&page=0&textSearch=${encodeURIComponent(deviceName)}&sortProperty=name&sortOrder=ASC`,
+      { headers: tbHeaders(token), timeout: 10000 }
+    );
     const id = data.data?.[0]?.id?.id || null;
-    if (id) console.log(`[TB] Device ${deviceName} → ${id}`);
-    else console.warn(`[TB] Device ${deviceName} NOT FOUND`);
+    if (id) {
+      tbDeviceIdCache[deviceName] = id;
+      console.log(`[TB] Device ${deviceName} → ${id}`);
+    } else {
+      console.warn(`[TB] Device ${deviceName} NOT FOUND`);
+    }
     return id;
   } catch (e) {
     console.error(`[TB DeviceId FAIL] ${deviceName}:`, e.response?.status, e.response?.data || e.message);
@@ -1666,7 +1675,7 @@ app.get('/api/tb/diag', async (req, res) => {
     const token = loginRes.data.token;
 
     // Step 2: Device lookup
-    const devRes = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=s1-m1`, {
+    const devRes = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&page=0&textSearch=s1-m1&sortProperty=name&sortOrder=ASC`, {
       headers: tbHeaders(token), timeout: 10000,
     });
     const deviceId = devRes.data?.data?.[0]?.id?.id;
