@@ -115,11 +115,14 @@ async function getTBToken() {
   return tbToken;
 }
 
+function tbHeaders(token) {
+  return { 'X-Authorization': `Bearer ${token}`, 'Authorization': `Bearer ${token}` };
+}
+
 async function getTBDeviceId(deviceName) {
   const token = await getTBToken();
   const { data } = await axios.get(`${TB_BASE}/api/tenant/devices?pageSize=1&textSearch=${deviceName}`, {
-    headers: { 'X-Authorization': `Bearer ${token}` },
-    timeout: 10000,
+    headers: tbHeaders(token), timeout: 10000,
   });
   return data.data?.[0]?.id?.id || null;
 }
@@ -129,8 +132,7 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
   const deviceId = await getTBDeviceId(deviceName);
   if (!deviceId) throw new Error(`Device ${deviceName} not found in ThingsBoard`);
   await axios.post(`${TB_BASE}/api/rpc/oneway/${deviceId}`, { method, params }, {
-    headers: { 'Content-Type': 'application/json', 'X-Authorization': `Bearer ${token}` },
-    timeout: 10000,
+    headers: { ...tbHeaders(token), 'Content-Type': 'application/json' }, timeout: 10000,
   });
   return true;
 }
@@ -139,8 +141,7 @@ async function sendThingsBoardRPC(deviceName, method, params = {}) {
 async function tbGet(path) {
   const token = await getTBToken();
   const { data } = await axios.get(`${TB_BASE}${path}`, {
-    headers: { 'X-Authorization': `Bearer ${token}` },
-    timeout: 10000,
+    headers: tbHeaders(token), timeout: 15000,
   });
   return data;
 }
