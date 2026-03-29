@@ -2201,6 +2201,144 @@ app.get('/api/machines/:storeId/live', async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  Machine Management CRUD
+// ═══════════════════════════════════════
+
+// Machine type definitions
+const MACHINE_TYPES = [
+  { id: 'combo', name: '洗脫烘一體機', description: '單機洗+脫+烘', protocol: 'sx176005a' },
+  { id: 'dual_dryer', name: '雙烘機', description: '兩個烘乾單元', protocol: 'sx176005a' },
+  { id: 'stack', name: '上烘下洗機', description: '上層烘乾、下層洗衣', protocol: 'sx176005a' },
+  { id: 'washer', name: '單洗機', description: '純洗衣', protocol: 'sx176005a' },
+  { id: 'dryer', name: '單烘機', description: '純烘乾', protocol: 'sx176005a' },
+];
+
+// GET /api/admin/machine-types
+app.get('/api/admin/machine-types', (req, res) => {
+  res.json(MACHINE_TYPES);
+});
+
+// POST /api/admin/machines
+app.post('/api/admin/machines', async (req, res) => {
+  try {
+    const { userId, storeId, name, size, machineType, protocol, modbusSlave, tbDevice, description } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+    if (!storeId || !name) return res.status(400).json({ error: 'storeId and name required' });
+
+    // Auto-generate machine ID
+    const existing = await db.query('SELECT id FROM machines WHERE store_id=$1 ORDER BY id', [storeId]);
+    const nextNum = existing.rows.length + 1;
+    let machineId = `${storeId}-m${nextNum}`;
+
+    // Find next available ID if collision
+    let n = nextNum;
+    while (true) {
+      const check = await db.query('SELECT id FROM machines WHERE id=$1', [machineId]);
+      if (check.rows.length === 0) break;
+      n++;
+      machineId = `${storeId}-m${n}`;
+    }
+
+    res.json(await createMachine(machineId, storeId, name, size, machineType, protocol, modbusSlave, tbDevice, description, n));
+  } catch (e) {
+    console.error('[Machine Create]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function createMachine(machineId, storeId, name, size, machineType, protocol, modbusSlave, tbDevice, description, sortOrder) {
+  const result = await db.query(
+    `INSERT INTO machines (id, store_id, name, size, machine_type, protocol, modbus_slave, tb_device, description, sort_order, active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
+     RETURNING *`,
+    [machineId, storeId, name, size || '中型', machineType || 'combo', protocol || 'sx176005a', modbusSlave || 0, tbDevice || machineId, description || '', sortOrder]
+  );
+  return result.rows[0];
+}
+
+// PUT /api/admin/machines/:machineId
+app.put('/api/admin/machines/:machineId', async (req, res) => {
+  try {
+    const { userId, name, size, machineType, protocol, modbusSlave, tbDevice, description, active, sortOrder } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+
+    const { machineId } = req.params;
+    const result = await db.query(
+      `UPDATE machines SET
+        name = COALESCE($1, name),
+        size = COALESCE($2, size),
+        machine_type = COALESCE($3, machine_type),
+        protocol = COALESCE($4, protocol),
+        modbus_slave = COALESCE($5, modbus_slave),
+        tb_device = COALESCE($6, tb_device),
+        description = COALESCE($7, description),
+        active = COALESCE($8, active),
+        sort_order = COALESCE($9, sort_order)
+      WHERE id = $10 RETURNING *`,
+      [name, size, machineType, protocol, modbusSlave, tbDevice, description, active, sortOrder, machineId]
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Machine not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('[Machine Update]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/machines/:machineId (soft delete)
+app.delete('/api/admin/machines/:machineId', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+
+    const { machineId } = req.params;
+    const result = await db.query(
+      'UPDATE machines SET active = false WHERE id = $1 RETURNING id, name',
+      [machineId]
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Machine not found' });
+    res.json({ success: true, message: `已停用 ${result.rows[0].name}`, machine: result.rows[0] });
+  } catch (e) {
+    console.error('[Machine Delete]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/machines/all
+app.get('/api/admin/machines/all', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+
+    const storeId = req.query.storeId;
+    let query = `SELECT m.*, s.name as store_name FROM machines m
+                 LEFT JOIN stores s ON m.store_id = s.id`;
+    const params = [];
+    if (storeId) {
+      query += ' WHERE m.store_id = $1';
+      params.push(storeId);
+    }
+    query += ' ORDER BY m.store_id, m.sort_order, m.id';
+
+    const result = await db.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[Machine List]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
 //  API: Machine Notify (queue notification)
 // ═══════════════════════════════════════
 app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
@@ -4525,6 +4663,15 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS machine_current_state (machine_id VARCHAR(30) PRIMARY KEY, state VARCHAR(20) DEFAULT 'unknown', remain_sec INT DEFAULT 0, progress INT DEFAULT 0, wifi_rssi INT DEFAULT 0, updated_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS members (id VARCHAR(40) PRIMARY KEY, line_user_id VARCHAR(60) UNIQUE, wallet INT DEFAULT 0, is_admin BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS orders (id VARCHAR(30) PRIMARY KEY, member_id VARCHAR(40), store_id VARCHAR(20), machine_id VARCHAR(30), mode VARCHAR(20), addons JSONB DEFAULT '[]', extend_min INT DEFAULT 0, temp VARCHAR(10), total_amount INT, pulses INT, duration_sec INT, status VARCHAR(20) DEFAULT 'pending', paid_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW());
+  `);
+
+  // Add machine management columns
+  await db.query(`
+    ALTER TABLE machines ADD COLUMN IF NOT EXISTS machine_type VARCHAR(30) DEFAULT 'combo';
+    ALTER TABLE machines ADD COLUMN IF NOT EXISTS protocol VARCHAR(30) DEFAULT 'sx176005a';
+    ALTER TABLE machines ADD COLUMN IF NOT EXISTS modbus_slave INT DEFAULT 0;
+    ALTER TABLE machines ADD COLUMN IF NOT EXISTS tb_device VARCHAR(30) DEFAULT '';
+    ALTER TABLE machines ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
   `);
 
   // New multi-tenant tables
