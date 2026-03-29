@@ -3961,6 +3961,123 @@ app.put('/api/admin/store-push/settings', async (req, res) => {
   }
 });
 
+// ═══ Push Plans Management ═══
+
+// GET /api/admin/push-plans — 取得所有推播方案
+app.get('/api/admin/push-plans', async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM push_plans WHERE is_active=true ORDER BY sort_order');
+    res.json(result.rows);
+  } catch (e) {
+    console.error('[Push Plans]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/push-plans/:planKey — 更新方案
+app.put('/api/admin/push-plans/:planKey', async (req, res) => {
+  try {
+    const userId = req.body.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+
+    const { planKey } = req.params;
+    const { label, monthlyFee, includedMessages, extraRate, canExceed } = req.body;
+
+    const result = await db.query(
+      `UPDATE push_plans SET
+        label = COALESCE($1, label),
+        monthly_fee = COALESCE($2, monthly_fee),
+        included_messages = COALESCE($3, included_messages),
+        extra_rate = COALESCE($4, extra_rate),
+        can_exceed = COALESCE($5, can_exceed),
+        updated_at = NOW()
+      WHERE plan_key = $6 RETURNING *`,
+      [label, monthlyFee, includedMessages, extraRate, canExceed, planKey]
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Plan not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('[Push Plans Update]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/push-plans — 新增方案
+app.post('/api/admin/push-plans', async (req, res) => {
+  try {
+    const userId = req.body.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const { role } = await getUserRole(userId);
+    if (role !== 'super_admin') return res.status(403).json({ error: '權限不足' });
+
+    const { planKey, label, monthlyFee, includedMessages, extraRate, canExceed } = req.body;
+    if (!planKey || !label) return res.status(400).json({ error: 'planKey and label required' });
+
+    const maxSort = await db.query('SELECT COALESCE(MAX(sort_order), 0) + 1 as next FROM push_plans');
+    const result = await db.query(
+      `INSERT INTO push_plans (plan_key, label, monthly_fee, included_messages, extra_rate, can_exceed, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [planKey, label, monthlyFee || 0, includedMessages || 0, extraRate || 0, canExceed !== false, maxSort.rows[0].next]
+    );
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('[Push Plans Create]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/push-plans/select — 業主選擇方案
+app.post('/api/admin/push-plans/select', async (req, res) => {
+  try {
+    const { userId, groupId, planKey } = req.body;
+    if (!userId || !groupId || !planKey) return res.status(400).json({ error: 'userId, groupId, planKey required' });
+
+    // Verify plan exists
+    const planRes = await db.query('SELECT * FROM push_plans WHERE plan_key=$1 AND is_active=true', [planKey]);
+    if (planRes.rows.length === 0) return res.status(404).json({ error: 'Plan not found' });
+
+    // Update store's selected plan and per_push_rate
+    const plan = planRes.rows[0];
+    await db.query(
+      `INSERT INTO store_push_balance (group_id, selected_plan, per_push_rate, monthly_manual_limit)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (group_id) DO UPDATE SET selected_plan=$2, per_push_rate=$3, monthly_manual_limit=$4, updated_at=NOW()`,
+      [groupId, planKey, plan.extra_rate, plan.included_messages]
+    );
+
+    res.json({ success: true, plan: plan, groupId });
+  } catch (e) {
+    console.error('[Push Plan Select]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/push-plans/store/:groupId — 取得店家已選方案
+app.get('/api/admin/push-plans/store/:groupId', async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const result = await db.query(
+      `SELECT spb.selected_plan, pp.*
+       FROM store_push_balance spb
+       LEFT JOIN push_plans pp ON spb.selected_plan = pp.plan_key
+       WHERE spb.group_id = $1`,
+      [groupId]
+    );
+    if (result.rows.length === 0) {
+      // Default to light plan
+      const defaultPlan = await db.query('SELECT * FROM push_plans WHERE plan_key = $1', ['light']);
+      return res.json({ selected_plan: 'light', plan: defaultPlan.rows[0] || null });
+    }
+    res.json({ selected_plan: result.rows[0].selected_plan, plan: result.rows[0] });
+  } catch (e) {
+    console.error('[Push Plan Store]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
 // Admin: cleanup duplicate roles
@@ -4657,6 +4774,26 @@ async function initDB() {
     `).catch(() => {});
     await db.query(`ALTER TABLE push_logs ADD COLUMN IF NOT EXISTS cost NUMERIC(10,2) DEFAULT 0`).catch(() => {});
 
+    // Push plans table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS push_plans (
+        id SERIAL PRIMARY KEY,
+        plan_key VARCHAR(30) UNIQUE NOT NULL,
+        label VARCHAR(50) NOT NULL,
+        monthly_fee NUMERIC(10,0) DEFAULT 0,
+        included_messages INT DEFAULT 0,
+        extra_rate NUMERIC(6,2) DEFAULT 0,
+        can_exceed BOOLEAN DEFAULT true,
+        is_active BOOLEAN DEFAULT true,
+        sort_order INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Add selected_plan column to store_push_balance
+    await db.query(`ALTER TABLE store_push_balance ADD COLUMN IF NOT EXISTS selected_plan VARCHAR(30) DEFAULT 'light'`).catch(() => {});
+
     // Referrals table (simple referral tracking by LINE user ID)
     await db.query(`
       CREATE TABLE IF NOT EXISTS referrals (
@@ -4703,6 +4840,17 @@ async function initDB() {
       ('sg4', 0, 0.16, 500),
       ('sg5', 0, 0.16, 500)
     ON CONFLICT (group_id) DO NOTHING
+  `).catch(() => {});
+
+  // Seed default push plans
+  await db.query(`
+    INSERT INTO push_plans (plan_key, label, monthly_fee, included_messages, extra_rate, can_exceed, sort_order)
+    VALUES
+      ('free', '免費', 0, 200, 0, false, 1),
+      ('light', '輕用量', 800, 4000, 0.2, true, 2),
+      ('standard', '中用量', 4000, 25000, 0.16, true, 3),
+      ('pro', '高用量', 10000, 100000, 0.1, true, 4)
+    ON CONFLICT (plan_key) DO NOTHING
   `).catch(() => {});
 
   // Seed stores with group mapping
