@@ -2815,10 +2815,10 @@ app.get('/api/coupons', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Purchase a coupon (deducts points, creates user_coupon)
+// Purchase a coupon (deducts points OR LINE Pay, creates user_coupon)
 app.post('/api/coupons/purchase', async (req, res) => {
   try {
-    const { userId, couponId, groupId } = req.body;
+    const { userId, couponId, groupId, paymentMethod } = req.body;
     if (!userId || !couponId) return res.status(400).json({ error: 'userId and couponId required' });
     // Verify coupon exists and is active
     const couponRes = await db.query('SELECT * FROM admin_coupons WHERE id=$1 AND active=true AND expiry >= CURRENT_DATE', [couponId]);
@@ -2826,6 +2826,47 @@ app.post('/api/coupons/purchase', async (req, res) => {
     const coupon = couponRes.rows[0];
     const price = coupon.price || 0;
     const effectiveGroupId = groupId || coupon.group_id;
+
+    // === LINE Pay flow ===
+    if (paymentMethod === 'linepay') {
+      if (price <= 0) return res.status(400).json({ error: 'Free coupons do not need LINE Pay' });
+      // Create a coupon_purchase order
+      const orderId = 'CPORD' + Date.now();
+      const member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [userId])).rows[0];
+      const memberId = member ? member.id : null;
+      await db.query(
+        `INSERT INTO orders (id, member_id, store_id, machine_id, mode, addons, extend_min, temp, total_amount, pulses, duration_sec, status, created_at)
+         VALUES ($1, $2, 'coupon_purchase', $3, 'coupon_purchase', '[]', 0, '', $4, 0, 0, 'pending', NOW())`,
+        [orderId, memberId, couponId, price]
+      );
+      // Call LINE Pay Request API
+      const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+      const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+      const orderName = `購買優惠券: ${coupon.name}`;
+      const payBody = {
+        amount: price, currency: 'TWD', orderId,
+        packages: [{ id: orderId, amount: price, name: orderName, products: [{ name: orderName, quantity: 1, price }] }],
+        redirectUrls: {
+          confirmUrl: `${SERVER_URL}/api/coupons/purchase/confirm`,
+          cancelUrl: `${FRONTEND_URL}/?status=cancel&orderId=${orderId}`,
+        },
+      };
+      const result = await linePayRequest('POST', '/v3/payments/request', payBody);
+      if (result.returnCode === '0000') {
+        await db.query(`UPDATE orders SET status='waiting_payment' WHERE id=$1`, [orderId]);
+        return res.json({
+          success: true,
+          paymentMethod: 'linepay',
+          paymentUrl: result.info.paymentUrl.web,
+          transactionId: result.info.transactionId,
+          orderId,
+        });
+      } else {
+        return res.status(400).json({ success: false, error: result.returnMessage });
+      }
+    }
+
+    // === Wallet (points) flow (default, unchanged) ===
     // Check wallet balance
     if (price > 0 && effectiveGroupId) {
       const walletRes = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
@@ -2849,13 +2890,81 @@ app.post('/api/coupons/purchase', async (req, res) => {
       INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
       VALUES ($1, $2, $3, $4, $5, 'active') RETURNING id
     `, [userId, couponId, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
-    res.json({ success: true, userCouponId: ucRes.rows[0].id, newBalance: price > 0 ? undefined : undefined });
-    // Return new balance if deducted
+    // Fetch new balance
+    let newBalance;
     if (price > 0 && effectiveGroupId) {
       const newBal = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
-      // Note: response already sent, but frontend can re-fetch
+      newBalance = newBal.rows[0]?.balance || 0;
     }
+    res.json({ success: true, paymentMethod: 'wallet', userCouponId: ucRes.rows[0].id, newBalance });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// LINE Pay confirm for coupon purchase
+app.get('/api/coupons/purchase/confirm', async (req, res) => {
+  try {
+    const { transactionId, orderId } = req.query;
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    if (!transactionId || !orderId) return res.redirect(`${FRONTEND_URL}/?status=error&msg=missing_params`);
+
+    // Fetch the coupon_purchase order
+    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
+    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=error&msg=order_not_found`);
+    const order = orderResult.rows[0];
+
+    // Confirm with LINE Pay
+    const body = { amount: order.total_amount, currency: 'TWD' };
+    const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
+    if (result.returnCode !== '0000') {
+      return res.redirect(`${FRONTEND_URL}/?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
+    }
+
+    // Mark order as paid
+    await db.query(`UPDATE orders SET status='paid', paid_at=NOW(), payment_method='linepay' WHERE id=$1`, [orderId]);
+
+    // The couponId is stored in machine_id field of the coupon_purchase order
+    const couponId = order.machine_id;
+    const couponRes = await db.query('SELECT * FROM admin_coupons WHERE id=$1', [couponId]);
+    if (couponRes.rows.length === 0) {
+      return res.redirect(`${FRONTEND_URL}/?status=error&msg=coupon_not_found`);
+    }
+    const coupon = couponRes.rows[0];
+    const effectiveGroupId = coupon.group_id;
+
+    // Get userId from member
+    const memberRow = order.member_id ? (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0] : null;
+    const userId = memberRow?.line_user_id;
+
+    if (!userId) {
+      return res.redirect(`${FRONTEND_URL}/?status=error&msg=user_not_found`);
+    }
+
+    // Calculate expiry date from validity
+    let expiryDate = coupon.expiry;
+    const validityMatch = (coupon.validity || '').match(/(\d+)日/);
+    if (validityMatch) {
+      const days = parseInt(validityMatch[1]);
+      expiryDate = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
+    }
+
+    // Insert user_coupon
+    await db.query(`
+      INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
+      VALUES ($1, $2, $3, $4, $5, 'active')
+    `, [userId, couponId, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
+
+    // Record transaction
+    if (effectiveGroupId) {
+      await db.query('INSERT INTO transactions (line_user_id, group_id, type, amount, description) VALUES ($1,$2,$3,$4,$5)',
+        [userId, effectiveGroupId, 'payment', -order.total_amount, `LINE Pay 購買優惠券: ${coupon.name}`]);
+    }
+
+    console.log(`[Coupon] LINE Pay purchase confirmed: userId=${userId}, coupon=${coupon.name}, amount=${order.total_amount}`);
+    res.redirect(`${FRONTEND_URL}/?status=success&type=coupon_purchase&orderId=${orderId}`);
+  } catch (e) {
+    console.error('[Coupon] LINE Pay confirm error:', e.message);
+    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=error&msg=${encodeURIComponent(e.message)}`);
+  }
 });
 
 // Get user's owned coupons
