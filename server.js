@@ -14,7 +14,10 @@ const axios = require('axios');
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json());
+// Save raw body for LINE webhook signature verification
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 app.use(cors());
 
 // Rate limiting
@@ -174,8 +177,9 @@ async function tbGet(path) {
   }
 }
 
-// ===== LINE Messaging API Push Notifications =====
+// ===== LINE Messaging API =====
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || '';
 
 async function sendLinePush(userId, messages, options = {}) {
   // options: { groupId, storeId, pushType, triggeredBy, description }
@@ -5215,6 +5219,20 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `).catch(() => {});
+    // User tags table (LINE OA auto-tagging & manual tagging)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS user_tags (
+        id SERIAL PRIMARY KEY,
+        line_user_id VARCHAR(100) NOT NULL,
+        tag VARCHAR(50) NOT NULL,
+        source VARCHAR(30) DEFAULT 'auto',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(line_user_id, tag)
+      )
+    `).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_tags_user ON user_tags (line_user_id)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags (tag)`).catch(() => {});
+
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
@@ -5314,6 +5332,450 @@ async function initDB() {
 
   console.log('DB initialized with multi-tenant tables');
 }
+
+// ===== LINE Webhook & Auto-Reply System =====
+
+// Reply to LINE message (uses reply token, free of charge)
+async function lineReply(replyToken, messages) {
+  if (!LINE_CHANNEL_ACCESS_TOKEN || !replyToken) return false;
+  try {
+    const res = await fetch('https://api.line.me/v2/bot/message/reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+      body: JSON.stringify({ replyToken, messages }),
+    });
+    if (!res.ok) console.error('[LINE Reply] Error:', await res.json().catch(() => ({})));
+    return res.ok;
+  } catch (e) { console.error('[LINE Reply] Failed:', e.message); return false; }
+}
+
+// Helper: add tag to user
+async function addUserTag(lineUserId, tag, source = 'auto') {
+  try {
+    await db.query(
+      `INSERT INTO user_tags (line_user_id, tag, source) VALUES ($1, $2, $3) ON CONFLICT (line_user_id, tag) DO NOTHING`,
+      [lineUserId, tag, source]
+    );
+    return true;
+  } catch (e) { console.error('[Tag] Error:', e.message); return false; }
+}
+
+// Helper: remove tag from user
+async function removeUserTag(lineUserId, tag) {
+  try {
+    await db.query(`DELETE FROM user_tags WHERE line_user_id = $1 AND tag = $2`, [lineUserId, tag]);
+    return true;
+  } catch (e) { return false; }
+}
+
+// ---- Flex Message Builders for Webhook ----
+
+function buildWelcomeFlexMessage() {
+  return {
+    type: 'flex', altText: '歡迎加入雲管家！請選擇你的需求',
+    contents: {
+      type: 'bubble', size: 'mega',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '歡迎加入雲管家！', color: '#FFFFFF', weight: 'bold', size: 'xl' },
+          { type: 'text', text: '很高興認識你～', color: BRAND_GOLD, size: 'sm', margin: 'sm' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'lg', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '在開始之前，讓我先了解一下：', size: 'md', wrap: true },
+          { type: 'text', text: '你今天來，是想洗衣服？\n還是想靠洗衣服賺錢？😄', size: 'md', wrap: true, weight: 'bold', margin: 'lg' },
+          { type: 'text', text: '請點選下方按鈕，我幫你準備最適合的內容 👇', size: 'sm', wrap: true, color: '#888888', margin: 'md' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          {
+            type: 'button', style: 'primary', color: BRAND_PRIMARY, height: 'md',
+            action: { type: 'postback', label: '🧺 我要洗衣服', data: 'action=welcome_customer', displayText: '我要洗衣服！' }
+          },
+          {
+            type: 'button', style: 'primary', color: BRAND_GOLD, height: 'md',
+            action: { type: 'postback', label: '💼 我想了解加盟', data: 'action=welcome_franchise', displayText: '我想了解加盟' }
+          }
+        ]
+      }
+    }
+  };
+}
+
+function buildCustomerWelcomeReply() {
+  return {
+    type: 'flex', altText: '歡迎使用悠洗自助洗衣！',
+    contents: {
+      type: 'bubble', size: 'mega',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '🧺 歡迎來洗衣！', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '這裡有幾個實用功能：', size: 'md', wrap: true, weight: 'bold' },
+          { type: 'text', text: '🔍 查空機 — 出門前就知道有沒有位子', size: 'sm', wrap: true, margin: 'md' },
+          { type: 'text', text: '💰 手機付款 — LINE Pay 一掃即付，免帶零錢', size: 'sm', wrap: true },
+          { type: 'text', text: '🎁 新客禮 — 首次儲值送 NT$20 洗衣金', size: 'sm', wrap: true },
+          { type: 'text', text: '🔔 洗好通知 — 洗完 LINE 提醒你，不用乾等', size: 'sm', wrap: true },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '💡 儲值滿 NT$200 再送 NT$30，比投幣更划算！', size: 'sm', wrap: true, color: BRAND_GOLD, margin: 'md', weight: 'bold' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'uri', label: '立即開始使用', uri: LIFF_URL } },
+          { type: 'button', style: 'link', action: { type: 'uri', label: 'LINE 聯繫客服', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+}
+
+function buildFranchiseWelcomeReply() {
+  return {
+    type: 'flex', altText: '感謝你對雲管家加盟的興趣！',
+    contents: {
+      type: 'bubble', size: 'mega',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '💼 歡迎了解加盟！', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '眼光很好！自助洗衣是目前少數「低人力、穩現金流」的實體投資。', size: 'sm', wrap: true },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '🎁 加入禮', size: 'md', wrap: true, weight: 'bold', margin: 'lg' },
+          { type: 'text', text: '我們整理了一份《自助洗衣創業避坑指南》，包含選址公式、設備配置、損益試算。', size: 'sm', wrap: true, margin: 'sm' },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '📩 回覆關鍵字即可領取：', size: 'sm', wrap: true, weight: 'bold', margin: 'lg' },
+          { type: 'text', text: '「我要創業」→ 領取創業避坑指南\n「獲利分析」→ 領取投報率試算表\n「區域評估」→ 免費評估你的開店地點', size: 'sm', wrap: true, margin: 'sm', color: '#555555' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📘 立即領取創業指南', data: 'action=keyword_startup', displayText: '我要創業' } },
+          { type: 'button', style: 'link', action: { type: 'uri', label: 'LINE 聯繫客服', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+}
+
+// ---- Keyword Auto-Reply Responses ----
+
+const KEYWORD_REPLIES = {
+  // Franchise keywords
+  '我要創業': {
+    tags: ['加盟_興趣'],
+    message: {
+      type: 'flex', altText: '《自助洗衣創業避坑指南》',
+      contents: {
+        type: 'bubble', size: 'mega',
+        header: { type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px', contents: [
+          { type: 'text', text: '📘 創業避坑指南', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        ]},
+        body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+          { type: 'text', text: '5 個開店前必看的關鍵指標：', size: 'md', weight: 'bold', wrap: true },
+          { type: 'text', text: '1️⃣ 選址密度比 — 半徑500m住戶÷競業數≥800', size: 'sm', wrap: true, margin: 'md' },
+          { type: 'text', text: '2️⃣ 設備投報率 — 單機日均使用≥4次才健康', size: 'sm', wrap: true },
+          { type: 'text', text: '3️⃣ 金流結構 — 行動支付客單價比投幣高18%', size: 'sm', wrap: true },
+          { type: 'text', text: '4️⃣ 遠端管理 — 每天只需15分鐘管整間店', size: 'sm', wrap: true },
+          { type: 'text', text: '5️⃣ 會員經營 — 有會員系統的店終身價值高2.3倍', size: 'sm', wrap: true },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '想進一步了解？回覆「獲利分析」領取投報率試算表', size: 'xs', wrap: true, color: '#888888', margin: 'md' }
+        ]},
+        footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📊 領取獲利分析表', data: 'action=keyword_profit', displayText: '獲利分析' } }
+        ]}
+      }
+    }
+  },
+  '獲利分析': {
+    tags: ['加盟_評估中'],
+    message: {
+      type: 'flex', altText: '加盟獲利分析',
+      contents: {
+        type: 'bubble', size: 'mega',
+        header: { type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px', contents: [
+          { type: 'text', text: '📊 獲利分析概覽', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        ]},
+        body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+          { type: 'text', text: '以 6 台機器標準店為例：', size: 'md', weight: 'bold', wrap: true },
+          { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+            { type: 'text', text: '月均營收', size: 'sm', color: '#888888', flex: 4 },
+            { type: 'text', text: 'NT$ 8-15 萬', size: 'sm', weight: 'bold', flex: 6, align: 'end' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '月淨利', size: 'sm', color: '#888888', flex: 4 },
+            { type: 'text', text: 'NT$ 4-8 萬', size: 'sm', weight: 'bold', flex: 6, align: 'end' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '預估回收期', size: 'sm', color: '#888888', flex: 4 },
+            { type: 'text', text: '14-20 個月', size: 'sm', weight: 'bold', flex: 6, align: 'end' }
+          ]},
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '雲管家加盟優勢：\n📊 數據分析精準投放\n🎯 會員系統拉高回購\n🔧 遠端管理省人力', size: 'sm', wrap: true, margin: 'md' },
+          { type: 'text', text: '想要客製化評估？回覆「區域評估」', size: 'xs', wrap: true, color: '#888888', margin: 'md' }
+        ]},
+        footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'uri', label: '預約免費 Demo', uri: LINE_OA_CHAT_URL } }
+        ]}
+      }
+    }
+  },
+  '區域評估': {
+    tags: ['加盟_熱leads'],
+    message: { type: 'text', text: '📍 感謝你的興趣！\n\n請提供以下資訊，我們將在 24 小時內免費為你評估：\n\n1️⃣ 你預計開店的地址或區域\n2️⃣ 預計的店面坪數\n3️⃣ 你的預算範圍\n4️⃣ 是否已有店面或還在找？\n\n直接回覆以上資訊即可，真人顧問會盡快聯繫你！😊' }
+  },
+  // Customer Q&A keywords
+  '系統不穩怎麼辦': {
+    tags: [],
+    message: { type: 'text', text: '您好！若遇到系統異常，請先確認網路連線是否正常。\n\n若問題持續，請直接點選下方「LINE 聯繫客服」，我們工程師將在 30 分鐘內回覆您。\n\n雲管家支援遠端診斷，多數問題免到場即可排除！🔧' }
+  },
+  '行動支付': {
+    tags: [],
+    message: { type: 'text', text: '💳 雲管家支援 LINE Pay 行動支付！\n\n使用方式超簡單：\n1️⃣ 掃機台 QR Code\n2️⃣ 選擇洗衣模式\n3️⃣ LINE Pay 付款\n\n也可以先儲值到錢包，儲值滿 NT$200 送 NT$30 更划算！\n\n👉 不用帶零錢，不用找兌幣機 🎉' }
+  },
+  '空機': {
+    tags: [],
+    message: { type: 'text', text: '🔍 想查看空機狀態？\n\n點選下方按鈕，即可查看各店即時空機情況：\n👉 ' + LIFF_URL + '?tab=wash\n\n出門前先看，不用白跑一趟！' }
+  }
+};
+
+// ---- Franchise secondary segmentation ----
+function buildFranchiseSegmentReply() {
+  return {
+    type: 'flex', altText: '請問你目前的狀態是？',
+    contents: {
+      type: 'bubble', size: 'mega',
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '想更了解你的需求，請問目前的狀態是？', size: 'md', wrap: true, weight: 'bold' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#AAAAAA', height: 'sm', action: { type: 'postback', label: '🅰️ 還在觀望，想多了解', data: 'action=franchise_observe', displayText: '還在觀望，想多了解' } },
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'postback', label: '🅱️ 已有看好地點，認真評估', data: 'action=franchise_hot', displayText: '已有看好地點，認真評估中' } },
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY, height: 'sm', action: { type: 'postback', label: '🅾️ 已有洗衣店，想升級系統', data: 'action=franchise_upgrade', displayText: '已有洗衣店，想升級系統' } }
+        ]
+      }
+    }
+  };
+}
+
+// ---- Webhook Signature Verification ----
+function verifyLineSignature(rawBody, signature) {
+  if (!LINE_CHANNEL_SECRET) return false;
+  const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET).update(rawBody).digest('base64');
+  return hash === signature;
+}
+
+// ---- LINE Webhook Endpoint ----
+app.post('/api/line/webhook', async (req, res) => {
+  // Verify signature
+  const signature = req.headers['x-line-signature'];
+  if (!signature || !verifyLineSignature(req.rawBody, signature)) {
+    console.warn('[Webhook] Invalid signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  res.status(200).json({ ok: true }); // Reply immediately to LINE
+
+  const events = req.body?.events || [];
+  for (const event of events) {
+    try {
+      const userId = event.source?.userId;
+      if (!userId) continue;
+
+      switch (event.type) {
+        case 'follow': await handleFollow(event, userId); break;
+        case 'unfollow': await handleUnfollow(userId); break;
+        case 'postback': await handlePostback(event, userId); break;
+        case 'message': {
+          if (event.message?.type === 'text') await handleTextMessage(event, userId, event.message.text.trim());
+          break;
+        }
+      }
+    } catch (e) {
+      console.error('[Webhook] Event error:', e.message);
+    }
+  }
+});
+
+// ---- Event Handlers ----
+
+async function handleFollow(event, userId) {
+  console.log(`[Webhook] Follow: ${userId}`);
+  await addUserTag(userId, '新好友');
+  await lineReply(event.replyToken, [buildWelcomeFlexMessage()]);
+}
+
+async function handleUnfollow(userId) {
+  console.log(`[Webhook] Unfollow: ${userId}`);
+  await addUserTag(userId, '已封鎖', 'system');
+}
+
+async function handlePostback(event, userId) {
+  const data = new URLSearchParams(event.postback?.data || '');
+  const action = data.get('action');
+  console.log(`[Webhook] Postback: ${userId} → ${action}`);
+
+  switch (action) {
+    case 'welcome_customer': {
+      await addUserTag(userId, '顧客');
+      await addUserTag(userId, '新會員');
+      await removeUserTag(userId, '新好友');
+      await lineReply(event.replyToken, [buildCustomerWelcomeReply()]);
+      break;
+    }
+    case 'welcome_franchise': {
+      await addUserTag(userId, '加盟_興趣');
+      await removeUserTag(userId, '新好友');
+      await lineReply(event.replyToken, [buildFranchiseWelcomeReply()]);
+      break;
+    }
+    case 'keyword_startup': {
+      // Same as keyword "我要創業"
+      const entry = KEYWORD_REPLIES['我要創業'];
+      for (const tag of entry.tags) await addUserTag(userId, tag);
+      await lineReply(event.replyToken, [entry.message]);
+      break;
+    }
+    case 'keyword_profit': {
+      const entry = KEYWORD_REPLIES['獲利分析'];
+      for (const tag of entry.tags) await addUserTag(userId, tag);
+      await lineReply(event.replyToken, [entry.message]);
+      break;
+    }
+    case 'franchise_observe': {
+      await addUserTag(userId, '加盟_觀望');
+      await lineReply(event.replyToken, [{ type: 'text', text: '沒問題！我們會持續分享成功案例和經營知識給你。\n\n有任何問題隨時問我 😊' }]);
+      break;
+    }
+    case 'franchise_hot': {
+      await addUserTag(userId, '加盟_熱leads');
+      await lineReply(event.replyToken, [{ type: 'text', text: '太好了！🔥\n\n我們的業務顧問會在 24 小時內聯繫你，幫你做完整的選址分析報告。\n\n請先提供：\n1️⃣ 你的姓名\n2️⃣ 看好的地點地址\n3️⃣ 方便聯繫的電話\n\n直接回覆即可！' }]);
+      break;
+    }
+    case 'franchise_upgrade': {
+      await addUserTag(userId, '加盟_升級');
+      await lineReply(event.replyToken, [{ type: 'text', text: '很高興你已經在洗衣業了！💼\n\n雲管家可以幫你現有的店升級智慧系統，不需要換機器。\n\n我們會安排專人為你做免費的系統 Demo 和報價。\n\n請提供：\n1️⃣ 你的店名和地址\n2️⃣ 目前機器數量和品牌\n3️⃣ 方便聯繫的時間\n\n直接回覆即可！' }]);
+      break;
+    }
+    default:
+      console.log(`[Webhook] Unknown postback action: ${action}`);
+  }
+}
+
+async function handleTextMessage(event, userId, text) {
+  console.log(`[Webhook] Message: ${userId} → "${text}"`);
+
+  // Check exact keyword match first
+  const entry = KEYWORD_REPLIES[text];
+  if (entry) {
+    for (const tag of (entry.tags || [])) await addUserTag(userId, tag);
+    await lineReply(event.replyToken, [entry.message]);
+    return;
+  }
+
+  // Fuzzy keyword matching
+  const fuzzyMap = [
+    { keywords: ['創業', '開店', '加盟'], reply: '我要創業' },
+    { keywords: ['獲利', '賺錢', '投報率', 'ROI', '回收'], reply: '獲利分析' },
+    { keywords: ['區域', '地點', '選址', '評估'], reply: '區域評估' },
+    { keywords: ['不穩', '故障', '壞了', '當機'], reply: '系統不穩怎麼辦' },
+    { keywords: ['支付', '付款', 'LINE Pay', 'linepay'], reply: '行動支付' },
+    { keywords: ['空機', '有沒有位', '還有機器'], reply: '空機' },
+  ];
+
+  for (const { keywords, reply } of fuzzyMap) {
+    if (keywords.some(k => text.includes(k))) {
+      const matched = KEYWORD_REPLIES[reply];
+      if (matched) {
+        for (const tag of (matched.tags || [])) await addUserTag(userId, tag);
+        await lineReply(event.replyToken, [matched.message]);
+        return;
+      }
+    }
+  }
+
+  // No keyword matched — don't reply (let human customer service handle it)
+}
+
+// ---- User Tag Management API ----
+
+// Get user tags
+app.get('/api/user/tags', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try {
+    const result = await db.query('SELECT tag, source, created_at FROM user_tags WHERE line_user_id = $1 ORDER BY created_at', [userId]);
+    res.json({ success: true, tags: result.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add tag manually (admin)
+app.post('/api/user/tags', async (req, res) => {
+  const { userId, tag, adminUserId } = req.body;
+  if (!userId || !tag) return res.status(400).json({ error: 'userId and tag required' });
+  // Verify admin
+  const role = await db.query('SELECT role FROM user_roles WHERE line_user_id = $1 AND role IN ($2, $3)', [adminUserId, 'super_admin', 'store_admin']);
+  if (role.rows.length === 0) return res.status(403).json({ error: 'Admin only' });
+  const ok = await addUserTag(userId, tag, 'manual');
+  res.json({ success: ok });
+});
+
+// Remove tag (admin)
+app.delete('/api/user/tags', async (req, res) => {
+  const { userId, tag, adminUserId } = req.body;
+  if (!userId || !tag) return res.status(400).json({ error: 'userId and tag required' });
+  const role = await db.query('SELECT role FROM user_roles WHERE line_user_id = $1 AND role IN ($2, $3)', [adminUserId, 'super_admin', 'store_admin']);
+  if (role.rows.length === 0) return res.status(403).json({ error: 'Admin only' });
+  const ok = await removeUserTag(userId, tag);
+  res.json({ success: ok });
+});
+
+// List all tags with user count (admin analytics)
+app.get('/api/admin/tags', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT tag, COUNT(DISTINCT line_user_id) as user_count, MAX(created_at) as last_used
+      FROM user_tags GROUP BY tag ORDER BY user_count DESC
+    `);
+    res.json({ success: true, tags: result.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List users by tag (admin)
+app.get('/api/admin/tags/:tag/users', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT ut.line_user_id, ut.source, ut.created_at, m.display_name, m.picture_url
+      FROM user_tags ut
+      LEFT JOIN members m ON m.line_user_id = ut.line_user_id
+      WHERE ut.tag = $1
+      ORDER BY ut.created_at DESC
+    `, [req.params.tag]);
+    res.json({ success: true, users: result.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
