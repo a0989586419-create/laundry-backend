@@ -529,7 +529,7 @@ async function getUserRole(lineUserId) {
   if (r.rows.length === 0) return { role: 'consumer', groupId: null, permissions: {} };
   // super_admin has group_id = NULL
   const adminRow = r.rows.find(row => row.role === 'super_admin');
-  if (adminRow) return { role: 'super_admin', groupId: null, allGroups: r.rows, permissions: { revenue: true, coupons: true, members: true, machines: true, topup: true, news: true, roles: true } };
+  if (adminRow) return { role: 'super_admin', groupId: null, allGroups: r.rows, permissions: { revenue: true, coupons: true, members: true, machines: true, topup: true, news: true, roles: true, monitor: true } };
   const storeAdminRow = r.rows.find(row => row.role === 'store_admin');
   if (storeAdminRow) return { role: 'store_admin', groupId: storeAdminRow.group_id, allGroups: r.rows, permissions: storeAdminRow.permissions || {} };
   return { role: 'consumer', groupId: null, allGroups: r.rows, permissions: {} };
@@ -1879,6 +1879,255 @@ app.get('/api/tb/config/:storeId', async (req, res) => {
     });
   } catch (e) {
     console.error('[TB Config]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/store/modes/:storeId — 取得店家洗衣模式（TB 動態 + 預設 fallback）
+app.get('/api/store/modes/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+
+    // Default modes (fallback)
+    const DEFAULT_MODES = [
+      { id: 'standard', name: '洗衣+烘衣(標準)', price: 170, minutes: 72, color: '#FF3B30', desc: '標準洗+烘衣', dryMin: 35, wash_program: 1 },
+      { id: 'small',    name: '洗衣+烘衣(少量)', price: 150, minutes: 58, color: '#FF6B6B', desc: '少量洗+烘衣', dryMin: 25, wash_program: 2 },
+      { id: 'washonly', name: '洗衣',            price: 120, minutes: 34, color: '#007AFF', desc: '純洗不烘',     dryMin: 0,  wash_program: 3 },
+      { id: 'dryonly',  name: '烘衣',            price: 10,  minutes: 5,  color: '#FFCC00', desc: '純烘乾',       dryMin: 5,  wash_program: 0 },
+    ];
+
+    const MODE_META = {
+      1: { id: 'standard', color: '#FF3B30', desc: '標準洗+烘衣' },
+      2: { id: 'small',    color: '#FF6B6B', desc: '少量洗+烘衣' },
+      3: { id: 'washonly', color: '#007AFF', desc: '純洗不烘' },
+      0: { id: 'dryonly',  color: '#FFCC00', desc: '純烘乾' },
+    };
+
+    // Try TB config first
+    try {
+      const deviceName = `${storeId}-m1`;
+      const deviceId = await getTBDeviceId(deviceName);
+      if (deviceId) {
+        const attrs = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/attributes/SHARED_SCOPE`);
+        const config = {};
+        for (const item of attrs) config[item.key] = item.value;
+
+        if (config.num_programs) {
+          const modes = [];
+          for (let i = 1; i <= config.num_programs; i++) {
+            const washProg = Number(config[`prog${i}_wash`]) || i;
+            const dryProg = Number(config[`prog${i}_dry`]) || 0;
+            const totalMin = Number(config[`prog${i}_total_min`]) || 0;
+            const priceNt = Number(config[`prog${i}_price_nt`]) || Number(config[`P${i}_price_nt`]) || 0;
+            const coins = Number(config[`prog${i}_coins`]) || Number(config[`P${i}_coins`]) || 0;
+            const coinValue = Number(config.coin_value_nt) || 10;
+            const price = priceNt || (coins * coinValue);
+
+            // Determine name from wash/dry program combo
+            const hasDry = dryProg > 0 || (config[`prog${i}_dry_min`] && Number(config[`prog${i}_dry_min`]) > 0);
+            const dryMin = Number(config[`prog${i}_dry_min`]) || 0;
+            const washMin = totalMin - dryMin;
+
+            let name, desc, id, color;
+            if (washProg === 0 && hasDry) {
+              name = '烘衣'; desc = '純烘乾'; id = `dryonly_${i}`; color = '#FFCC00';
+            } else if (washProg > 0 && !hasDry) {
+              name = '洗衣'; desc = '純洗不烘'; id = `washonly_${i}`; color = '#007AFF';
+            } else {
+              name = config[`prog${i}_name`] || DEFAULT_MODES[i-1]?.name || `洗衣+烘衣 (P${i})`;
+              desc = config[`prog${i}_desc`] || DEFAULT_MODES[i-1]?.desc || `程式 ${i}`;
+              id = DEFAULT_MODES[i-1]?.id || `prog${i}`;
+              color = DEFAULT_MODES[i-1]?.color || '#FF3B30';
+            }
+
+            modes.push({
+              id,
+              name: config[`prog${i}_name`] || name,
+              price: price || DEFAULT_MODES[i-1]?.price || 0,
+              minutes: totalMin || DEFAULT_MODES[i-1]?.minutes || 0,
+              color,
+              desc: config[`prog${i}_desc`] || desc,
+              dryMin: dryMin || DEFAULT_MODES[i-1]?.dryMin || 0,
+              wash_program: washProg,
+            });
+          }
+
+          return res.json({
+            store_id: storeId,
+            source: 'thingsboard',
+            config_updated_at: config.config_updated_at || null,
+            modes,
+          });
+        }
+      }
+    } catch (tbErr) {
+      console.warn(`[Store Modes] TB unavailable for ${storeId}:`, tbErr.message);
+    }
+
+    // Fallback: check if store has custom modes in DB
+    try {
+      const dbModes = await db.query(
+        'SELECT * FROM store_modes WHERE store_id=$1 ORDER BY sort_order',
+        [storeId]
+      );
+      if (dbModes.rows.length > 0) {
+        return res.json({
+          store_id: storeId,
+          source: 'database',
+          modes: dbModes.rows.map(r => ({
+            id: r.mode_id, name: r.name, price: r.price, minutes: r.minutes,
+            color: r.color, desc: r.description, dryMin: r.dry_min || 0, wash_program: r.wash_program || 0,
+          })),
+        });
+      }
+    } catch (dbErr) {
+      // store_modes table might not exist, that's OK
+    }
+
+    // Final fallback: default modes
+    res.json({
+      store_id: storeId,
+      source: 'default',
+      modes: DEFAULT_MODES,
+    });
+  } catch (e) {
+    console.error('[Store Modes]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/monitor/store/:storeId — 機器監控面板（需 monitor 權限）
+app.get('/api/monitor/store/:storeId', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Permission check
+    const { role, permissions } = await getUserRole(userId);
+    if (role !== 'super_admin' && !permissions.monitor) {
+      return res.status(403).json({ error: '無機器監控權限' });
+    }
+
+    const { storeId } = req.params;
+    const keys = 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,required_coins,current_coins,fault,warning';
+
+    // Get machines from DB
+    const machinesRes = await db.query(
+      'SELECT id, name, size, store_id FROM machines WHERE store_id=$1 AND active=true ORDER BY sort_order, name',
+      [storeId]
+    );
+
+    const results = [];
+    let tbAvailable = true;
+
+    for (const machine of machinesRes.rows) {
+      const deviceName = machine.id;
+      const entry = {
+        device: deviceName, name: machine.name, size: machine.size,
+        store_id: machine.store_id, source: 'database'
+      };
+
+      // Try TB telemetry
+      try {
+        const deviceId = await getTBDeviceId(deviceName);
+        if (deviceId && tbAvailable) {
+          const data = await tbGet(`/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keys}`);
+          entry.source = 'thingsboard';
+          for (const [k, arr] of Object.entries(data)) {
+            if (arr && arr.length > 0) {
+              let v = arr[0].value;
+              if (v === 'true') v = true;
+              else if (v === 'false') v = false;
+              else if (!isNaN(v) && v !== '') v = Number(v);
+              entry[k] = v;
+              entry[k + '_ts'] = arr[0].ts;
+            }
+          }
+        }
+      } catch (tbErr) {
+        tbAvailable = false;
+        console.warn(`[Monitor] TB unavailable for ${deviceName}:`, tbErr.message);
+      }
+
+      // Fallback: get state from DB (machine_current_state table)
+      if (entry.source === 'database') {
+        try {
+          const stateRes = await db.query(
+            'SELECT state, remain_sec, updated_at FROM machine_current_state WHERE machine_id=$1',
+            [deviceName]
+          );
+          if (stateRes.rows.length > 0) {
+            entry.state = stateRes.rows[0].state;
+            entry.remain_sec = stateRes.rows[0].remain_sec;
+            entry.state_ts = new Date(stateRes.rows[0].updated_at).getTime();
+          }
+        } catch (dbErr) {
+          // ignore
+        }
+      }
+
+      results.push(entry);
+    }
+
+    res.json({
+      store_id: storeId,
+      machines: results,
+      tb_available: tbAvailable,
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error('[Monitor]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/monitor/overview — 全店監控總覽（需 monitor 權限）
+app.get('/api/monitor/overview', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const { role, permissions } = await getUserRole(userId);
+    if (role !== 'super_admin' && !permissions.monitor) {
+      return res.status(403).json({ error: '無機器監控權限' });
+    }
+
+    // Get all stores
+    const storesRes = await db.query('SELECT id, name FROM stores ORDER BY id');
+    const stores = [];
+
+    for (const store of storesRes.rows) {
+      const machinesRes = await db.query(
+        `SELECT m.id, m.name,
+          COALESCE(cs.state, 'idle') as state,
+          COALESCE(cs.remain_sec, 0) as remain_sec
+        FROM machines m
+        LEFT JOIN machine_current_state cs ON m.id = cs.machine_id
+        WHERE m.store_id=$1 AND m.active=true
+        ORDER BY m.sort_order, m.name`,
+        [store.id]
+      );
+
+      const running = machinesRes.rows.filter(m => m.state === 'running').length;
+      const idle = machinesRes.rows.filter(m => m.state === 'idle' || m.state === 'done' || m.state === 'unknown').length;
+      const fault = machinesRes.rows.filter(m => m.state === 'fault').length;
+
+      stores.push({
+        store_id: store.id,
+        store_name: store.name,
+        total: machinesRes.rows.length,
+        running,
+        idle,
+        fault,
+        machines: machinesRes.rows.map(m => ({
+          id: m.id, name: m.name, state: m.state, remain_sec: parseInt(m.remain_sec) || 0
+        }))
+      });
+    }
+
+    res.json({ stores, timestamp: new Date().toISOString() });
+  } catch (e) {
+    console.error('[Monitor Overview]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
