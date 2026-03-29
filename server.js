@@ -630,31 +630,67 @@ app.get('/api/user/orders', async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
     const offset = Math.max(parseInt(req.query.offset) || 0, 0);
 
+    // Build dynamic WHERE clause for filters
+    let whereConditions = [`mb.line_user_id = $1`, `COALESCE(o.type, 'online') != 'topup'`];
+    const params = [userId];
+    let paramIdx = 2;
+
+    // Filter by order type (e.g., 'online', 'coin_payment')
+    if (req.query.type) {
+      whereConditions.push(`COALESCE(o.type, 'online') = $${paramIdx}`);
+      params.push(req.query.type);
+      paramIdx++;
+    }
+    // Filter by status (e.g., 'paid', 'done', 'pending')
+    if (req.query.status) {
+      whereConditions.push(`o.status = $${paramIdx}`);
+      params.push(req.query.status);
+      paramIdx++;
+    }
+    // Filter by date range
+    if (req.query.startDate) {
+      whereConditions.push(`o.created_at >= $${paramIdx}::date`);
+      params.push(req.query.startDate);
+      paramIdx++;
+    }
+    if (req.query.endDate) {
+      whereConditions.push(`o.created_at < ($${paramIdx}::date + INTERVAL '1 day')`);
+      params.push(req.query.endDate);
+      paramIdx++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
     // Get total count
     const countResult = await db.query(
       `SELECT COUNT(*) FROM orders o
        JOIN members mb ON o.member_id = mb.id
-       WHERE mb.line_user_id = $1 AND COALESCE(o.type, 'online') != 'topup'`,
-      [userId]
+       WHERE ${whereClause}`,
+      params
     );
     const total = parseInt(countResult.rows[0].count);
 
-    // Get paginated orders with store and machine names
+    // Get paginated orders with store, machine, and coupon info
     const ordersResult = await db.query(
       `SELECT o.id, o.store_id, o.machine_id, o.mode, o.addons, o.extend_min, o.temp,
               o.total_amount as amount, o.status, o.created_at, o.paid_at, o.completed_at,
               COALESCE(o.payment_method, 'wallet') as payment_method,
               COALESCE(o.type, 'online') as order_type,
+              COALESCE(o.coupon_id, NULL) as coupon_id,
+              COALESCE(o.discount_amount, 0) as discount_amount,
               s.name as store_name,
-              m.name as machine_name
+              m.name as machine_name,
+              ac.name as coupon_name
        FROM orders o
        JOIN members mb ON o.member_id = mb.id
        LEFT JOIN stores s ON o.store_id = s.id
        LEFT JOIN machines m ON o.machine_id = m.id
-       WHERE mb.line_user_id = $1 AND COALESCE(o.type, 'online') != 'topup'
+       LEFT JOIN user_coupons uc ON o.coupon_id = uc.id
+       LEFT JOIN admin_coupons ac ON uc.coupon_id = ac.id
+       WHERE ${whereClause}
        ORDER BY o.created_at DESC
-       LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
+       LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+      [...params, limit, offset]
     );
 
     res.json({
@@ -664,6 +700,49 @@ app.get('/api/user/orders', async (req, res) => {
     });
   } catch (e) {
     console.error('user orders error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET single order detail
+app.get('/api/user/orders/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const result = await db.query(
+      `SELECT o.id, o.store_id, o.machine_id, o.mode, o.addons, o.extend_min, o.temp,
+              o.total_amount as amount, o.status, o.created_at, o.paid_at, o.completed_at,
+              o.pulses, o.duration_sec,
+              COALESCE(o.payment_method, 'wallet') as payment_method,
+              COALESCE(o.type, 'online') as order_type,
+              COALESCE(o.coupon_id, NULL) as coupon_id,
+              COALESCE(o.discount_amount, 0) as discount_amount,
+              s.name as store_name, s.address as store_address,
+              m.name as machine_name,
+              ac.name as coupon_name, ac.discount as coupon_discount, ac.type as coupon_type
+       FROM orders o
+       JOIN members mb ON o.member_id = mb.id
+       LEFT JOIN stores s ON o.store_id = s.id
+       LEFT JOIN machines m ON o.machine_id = m.id
+       LEFT JOIN user_coupons uc ON o.coupon_id = uc.id
+       LEFT JOIN admin_coupons ac ON uc.coupon_id = ac.id
+       WHERE o.id = $1 AND mb.line_user_id = $2`,
+      [orderId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '訂單不存在' });
+    }
+
+    const order = result.rows[0];
+    // Compute original amount before discount for display
+    order.original_amount = order.amount + (order.discount_amount || 0);
+
+    res.json({ order });
+  } catch (e) {
+    console.error('user order detail error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1284,6 +1363,51 @@ app.post('/api/payment/create', async (req, res) => {
       member = { id };
     }
 
+    // Coupon validation
+    let discountAmount = 0;
+    let validatedCouponId = null;
+    let finalAmount = amount;
+
+    if (couponId) {
+      try {
+        console.log(`[Coupon] Validating coupon userCouponId=${couponId} for userId=${userId}`);
+        const ucRes = await db.query(
+          `SELECT uc.*, c.discount, c.type as coupon_type, c.min_spend, c.name as coupon_name
+           FROM user_coupons uc
+           JOIN admin_coupons c ON uc.coupon_id = c.id
+           WHERE uc.id = $1 AND uc.line_user_id = $2 AND uc.status = 'active' AND uc.uses_remaining > 0`,
+          [couponId, userId]
+        );
+        if (ucRes.rows.length === 0) {
+          return res.status(400).json({ success: false, error: '優惠券無效、已使用完畢或不屬於此帳號' });
+        }
+        const uc = ucRes.rows[0];
+        // Check expiry
+        if (uc.expiry_date && new Date(uc.expiry_date) < new Date()) {
+          return res.status(400).json({ success: false, error: '優惠券已過期' });
+        }
+        // Check min_spend
+        if (uc.min_spend && amount < uc.min_spend) {
+          return res.status(400).json({ success: false, error: `未達最低消費 NT$${uc.min_spend}` });
+        }
+        // Calculate discount
+        if (uc.coupon_type === 'percent') {
+          discountAmount = Math.floor(amount * uc.discount / 100);
+        } else if (uc.coupon_type === 'free') {
+          discountAmount = amount;
+        } else {
+          // fixed discount
+          discountAmount = Math.min(uc.discount, amount);
+        }
+        finalAmount = Math.max(amount - discountAmount, 0);
+        validatedCouponId = couponId;
+        console.log(`[Coupon] Applied "${uc.coupon_name}": original=${amount}, discount=${discountAmount}, final=${finalAmount}`);
+      } catch (couponErr) {
+        console.error('[Coupon] Validation error:', couponErr.message);
+        return res.status(500).json({ success: false, error: '優惠券驗證失敗' });
+      }
+    }
+
     // Create order
     const orderId = 'ORD' + Date.now();
     const pulses = Math.ceil(amount / 10);
@@ -1292,10 +1416,23 @@ app.post('/api/payment/create', async (req, res) => {
     const durationSec = (baseDur + (minutes || 0)) * 60;
 
     await db.query(
-      `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
-       VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending',NOW())`,
-      [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', amount, pulses, durationSec]
+      `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,coupon_id,discount_amount,created_at)
+       VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending',$11,$12,NOW())`,
+      [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', finalAmount, pulses, durationSec, validatedCouponId, discountAmount]
     );
+
+    // Deduct coupon uses after order created
+    if (validatedCouponId) {
+      try {
+        await db.query(
+          `UPDATE user_coupons SET uses_remaining = uses_remaining - 1, status = CASE WHEN uses_remaining - 1 <= 0 THEN 'used' ELSE status END WHERE id = $1`,
+          [validatedCouponId]
+        );
+        console.log(`[Coupon] Deducted 1 use from userCouponId=${validatedCouponId}`);
+      } catch (deductErr) {
+        console.error('[Coupon] Failed to deduct uses:', deductErr.message);
+      }
+    }
 
     // Try LINE Pay
     const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
@@ -1305,8 +1442,8 @@ app.post('/api/payment/create', async (req, res) => {
       const machineName = machineId.includes('-d') ? `烘乾${machineNum}號` : `洗脫烘${machineNum}號(${mode})`;
       const orderName = `${storeName} - ${machineName}`;
       const payBody = {
-        amount, currency: 'TWD', orderId,
-        packages: [{ id: orderId, amount, name: orderName, products: [{ name: orderName, quantity: 1, price: amount }] }],
+        amount: finalAmount, currency: 'TWD', orderId,
+        packages: [{ id: orderId, amount: finalAmount, name: orderName, products: [{ name: orderName, quantity: 1, price: finalAmount }] }],
         redirectUrls: {
           confirmUrl: `${SERVER_URL}/api/payment/confirm`,
           cancelUrl: `${FRONTEND_URL}/?status=cancel&orderId=${orderId}`,
@@ -1315,7 +1452,7 @@ app.post('/api/payment/create', async (req, res) => {
       const result = await linePayRequest('POST', '/v3/payments/request', payBody);
       if (result.returnCode === '0000') {
         await db.query(`UPDATE orders SET status='waiting_payment' WHERE id=$1`, [orderId]);
-        return res.json({ success: true, paymentUrl: result.info.paymentUrl.web, transactionId: result.info.transactionId, orderId });
+        return res.json({ success: true, paymentUrl: result.info.paymentUrl.web, transactionId: result.info.transactionId, orderId, discountAmount, finalAmount });
       }
     } catch (linePayErr) {
       console.warn('LINE Pay unavailable, using demo mode:', linePayErr.message);
@@ -1338,7 +1475,7 @@ app.post('/api/payment/create', async (req, res) => {
       await db.query(`
         INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
         VALUES ($1, $2, 'payment', $3, $4, NOW())
-      `, [userId, store.group_id, -amount, `${storeId} - ${mode}`]);
+      `, [userId, store.group_id, -finalAmount, `${storeId} - ${mode}${discountAmount > 0 ? ` (折扣 NT$${discountAmount})` : ''}`]);
     }
 
     // Try MQTT start command
@@ -1359,12 +1496,12 @@ app.post('/api/payment/create', async (req, res) => {
       const modeLabels = { standard: '標準洗衣', small: '少量快洗', washonly: '單洗程', soft: '柔洗', strong: '強力洗', dryonly: '單烘乾', dryextend: '加烘' };
       sendLineFlexMessage(userId, '付款成功', buildPaymentFlexMessage({
         storeName: sName, machineName: mName, modeName: modeLabels[mode] || mode || '標準洗衣',
-        amount: amount, discount: 0, finalAmount: amount,
+        amount: amount, discount: discountAmount, finalAmount: finalAmount,
         orderId: orderId, paymentMethod: '錢包付款', minutes: mins, supportUrl: demoSupportUrl, supportPhone: demoSupportPhone, groupId: store?.group_id, storeId: storeId
       }), { pushType: 'auto_payment', storeId: storeId, groupId: store?.group_id, description: `Demo付款成功 ${sName} ${mName}` }).catch(() => {});
     }
 
-    res.json({ success: true, orderId, demoMode: true });
+    res.json({ success: true, orderId, demoMode: true, discountAmount, finalAmount });
   } catch (e) {
     console.error('payment/create error:', e);
     res.status(500).json({ success: false, error: e.message });
@@ -4839,6 +4976,9 @@ async function initDB() {
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS type VARCHAR(30) DEFAULT 'online'`).catch(() => {});
     // Add payment_method column to orders for distinguishing wallet vs linepay vs coin
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(30) DEFAULT 'wallet'`).catch(() => {});
+    // Add coupon columns to orders for coupon system
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_id INT DEFAULT NULL`).catch(() => {});
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount INT DEFAULT 0`).catch(() => {});
 
     // Member levels table
     await db.query(`
