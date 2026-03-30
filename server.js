@@ -801,9 +801,14 @@ app.get('/api/wallet/:groupId', async (req, res) => {
 app.post('/api/wallet/topup', async (req, res) => {
   const client = await db.connect();
   try {
-    const { userId, groupId, amount, _internal } = req.body;
+    const { userId, groupId, amount, _internal, source } = req.body;
     if (!userId || !groupId || !amount) return res.status(400).json({ error: 'userId, groupId, amount required' });
     if (amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
+    // Only allow topup from trusted sources
+    const allowedSources = ['linepay_confirm', 'admin_manual'];
+    if (!source || !allowedSources.includes(source)) {
+      return res.status(403).json({ error: 'Unauthorized topup source. Use LINE Pay or admin panel.' });
+    }
 
     await client.query('BEGIN');
     // Upsert wallet
@@ -831,6 +836,10 @@ app.post('/api/wallet/deduct', async (req, res) => {
   try {
     const { userId, groupId, amount, description } = req.body;
     if (!userId || !groupId || !amount) return res.status(400).json({ error: 'missing params' });
+    // Validate userId is a valid LINE user ID (starts with U, length 33)
+    if (typeof userId !== 'string' || !userId.startsWith('U') || userId.length !== 33) {
+      return res.status(403).json({ error: 'Invalid userId format' });
+    }
 
     await client.query('BEGIN');
     // Atomic deduct with balance check in single statement
@@ -1219,45 +1228,49 @@ app.get('/api/admin/consumer/:lineUserId', async (req, res) => {
 //  API: Machines (existing, enhanced)
 // ═══════════════════════════════════════
 app.get('/api/machines/:storeId', async (req, res) => {
-  const r = await db.query(`
-    SELECT m.*,
-    CASE
-      WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
-      ELSE COALESCE(cs.state,'unknown')
-    END as state,
-    CASE
-      WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
-      ELSE 0
-    END as remain_sec,
-    COALESCE(cs.progress,0) as progress,
-    cs.updated_at as last_seen
-    FROM machines m LEFT JOIN machine_current_state cs ON m.id=cs.machine_id
-    WHERE m.store_id=$1 AND m.active=true ORDER BY m.sort_order,m.name
-  `, [req.params.storeId]);
-  res.json(r.rows);
+  try {
+    const r = await db.query(`
+      SELECT m.*,
+      CASE
+        WHEN cs.state = 'running' AND cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int <= 0 THEN 'idle'
+        ELSE COALESCE(cs.state,'unknown')
+      END as state,
+      CASE
+        WHEN cs.state = 'running' THEN GREATEST(0, cs.remain_sec - EXTRACT(EPOCH FROM (NOW() - cs.updated_at))::int)
+        ELSE 0
+      END as remain_sec,
+      COALESCE(cs.progress,0) as progress,
+      cs.updated_at as last_seen
+      FROM machines m LEFT JOIN machine_current_state cs ON m.id=cs.machine_id
+      WHERE m.store_id=$1 AND m.active=true ORDER BY m.sort_order,m.name
+    `, [req.params.storeId]);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════
 //  API: Orders (existing, enhanced)
 // ═══════════════════════════════════════
 app.post('/api/orders/create', async (req, res) => {
-  const { lineUserId, storeId, machineId, mode, addons, extendMin, temp, totalAmount } = req.body;
-  let member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [lineUserId])).rows[0];
-  if (!member) {
-    const id = uuid();
-    await db.query('INSERT INTO members (id,line_user_id,created_at) VALUES ($1,$2,NOW())', [id, lineUserId]);
-    member = { id };
-  }
-  const orderId = 'ORD' + Date.now();
-  const pulses = Math.ceil(totalAmount / 10);
-  const modeDur = { standard:65, small:50, washonly:35, soft:65, strong:75, dryonly:40 };
-  const durationSec = ((modeDur[mode]||65) + parseInt(extendMin||0)) * 60;
-  await db.query(
-    `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NOW())`,
-    [orderId, member.id, storeId, machineId, mode, JSON.stringify(addons||[]), extendMin||0, temp, totalAmount, pulses, durationSec]
-  );
-  res.json({ orderId, totalAmount, pulses });
+  try {
+    const { lineUserId, storeId, machineId, mode, addons, extendMin, temp, totalAmount } = req.body;
+    let member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [lineUserId])).rows[0];
+    if (!member) {
+      const id = uuid();
+      await db.query('INSERT INTO members (id,line_user_id,created_at) VALUES ($1,$2,NOW())', [id, lineUserId]);
+      member = { id };
+    }
+    const orderId = 'ORD' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const pulses = Math.ceil(totalAmount / 10);
+    const modeDur = { standard:65, small:50, washonly:35, soft:65, strong:75, dryonly:40 };
+    const durationSec = ((modeDur[mode]||65) + parseInt(extendMin||0)) * 60;
+    await db.query(
+      `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NOW())`,
+      [orderId, member.id, storeId, machineId, mode, JSON.stringify(addons||[]), extendMin||0, temp, totalAmount, pulses, durationSec]
+    );
+    res.json({ orderId, totalAmount, pulses });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/orders/:lineUserId', async (req, res) => {
@@ -1302,8 +1315,8 @@ app.get('/api/payment/confirm', async (req, res) => {
   try {
     const { transactionId, orderId } = req.query;
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
-    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
-    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=error&msg=order_not_found`);
+    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1 AND status NOT IN ($2, $3)', [orderId, 'paid', 'completed']);
+    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}&already_confirmed=1`);
     const order = orderResult.rows[0];
     const body = { amount: order.total_amount, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
@@ -1415,30 +1428,38 @@ app.post('/api/payment/create', async (req, res) => {
       }
     }
 
-    // Create order
-    const orderId = 'ORD' + Date.now();
+    // Create order (with coupon deduction in transaction)
+    const orderId = 'ORD' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
     const pulses = Math.ceil(amount / 10);
     const modeDur = { standard: 65, small: 50, washonly: 35, soft: 65, strong: 75, dryonly: 40, dryextend: 0 };
     const baseDur = modeDur[mode] || 0;
     const durationSec = (baseDur + (minutes || 0)) * 60;
 
-    await db.query(
-      `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,coupon_id,discount_amount,created_at)
-       VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending',$11,$12,NOW())`,
-      [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', finalAmount, pulses, durationSec, validatedCouponId, discountAmount]
-    );
-
-    // Deduct coupon uses after order created
-    if (validatedCouponId) {
-      try {
-        await db.query(
-          `UPDATE user_coupons SET uses_remaining = uses_remaining - 1, status = CASE WHEN uses_remaining - 1 <= 0 THEN 'used' ELSE status END WHERE id = $1`,
+    const txClient = await db.connect();
+    try {
+      await txClient.query('BEGIN');
+      await txClient.query(
+        `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,coupon_id,discount_amount,created_at)
+         VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending',$11,$12,NOW())`,
+        [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', finalAmount, pulses, durationSec, validatedCouponId, discountAmount]
+      );
+      // Deduct coupon uses atomically
+      if (validatedCouponId) {
+        const couponDeduct = await txClient.query(
+          `UPDATE user_coupons SET uses_remaining = uses_remaining - 1, status = CASE WHEN uses_remaining - 1 <= 0 THEN 'used' ELSE status END WHERE id = $1 AND uses_remaining > 0 RETURNING id`,
           [validatedCouponId]
         );
+        if (couponDeduct.rows.length === 0) {
+          throw new Error('優惠券已用完');
+        }
         console.log(`[Coupon] Deducted 1 use from userCouponId=${validatedCouponId}`);
-      } catch (deductErr) {
-        console.error('[Coupon] Failed to deduct uses:', deductErr.message);
       }
+      await txClient.query('COMMIT');
+    } catch (txErr) {
+      await txClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      txClient.release();
     }
 
     // Try LINE Pay
@@ -1536,7 +1557,7 @@ app.post('/api/topup/linepay', async (req, res) => {
   try {
     const { userId, groupId, amount } = req.body;
     if (!userId || !groupId || !amount || amount <= 0) return res.status(400).json({ error: 'missing params' });
-    const orderId = 'TOP' + Date.now();
+    const orderId = 'TOP' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
     const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
     // Get group name
@@ -1545,7 +1566,7 @@ app.post('/api/topup/linepay', async (req, res) => {
 
     try {
       // Store topup order in DB for tamper-proof confirm
-      await db.query(`INSERT INTO orders (id, store_id, member_id, machine_id, mode, amount, status, created_at) VALUES ($1, 'topup', $2, $3, 'topup', $4, 'pending', NOW()) ON CONFLICT DO NOTHING`, [orderId, userId, groupId, amount]);
+      await db.query(`INSERT INTO orders (id, store_id, member_id, machine_id, mode, total_amount, status, created_at) VALUES ($1, 'topup', $2, $3, 'topup', $4, 'pending', NOW()) ON CONFLICT DO NOTHING`, [orderId, userId, groupId, amount]);
       const payBody = {
         amount, currency: 'TWD', orderId,
         packages: [{ id: orderId, amount, name: `${groupName} 儲值`, products: [{ name: `${groupName} 點數儲值 ${amount}點`, quantity: 1, price: amount }] }],
@@ -1573,11 +1594,11 @@ app.get('/api/topup/confirm', async (req, res) => {
     // Retrieve order from DB (tamper-proof) or fallback to legacy URL params
     let userId, groupId, amountInt;
     if (orderId) {
-      const orderRow = (await db.query('SELECT member_id, machine_id, amount FROM orders WHERE id=$1 AND status=$2', [orderId, 'pending'])).rows[0];
-      if (!orderRow) return res.redirect(`${FRONTEND_URL}/?status=topup_fail&reason=order_not_found`);
+      const orderRow = (await db.query('SELECT member_id, machine_id, total_amount FROM orders WHERE id=$1 AND status NOT IN ($2, $3)', [orderId, 'paid', 'completed'])).rows[0];
+      if (!orderRow) return res.redirect(`${FRONTEND_URL}/?status=topup_success&already_confirmed=1`);
       userId = orderRow.member_id;
       groupId = orderRow.machine_id; // stored groupId in machine_id field for topup orders
-      amountInt = orderRow.amount;
+      amountInt = orderRow.total_amount;
       await db.query('UPDATE orders SET status=$1 WHERE id=$2', ['confirming', orderId]);
     } else {
       // Legacy fallback for old URLs
@@ -2818,7 +2839,7 @@ app.post('/api/coupons/purchase', async (req, res) => {
     if (paymentMethod === 'linepay') {
       if (price <= 0) return res.status(400).json({ error: 'Free coupons do not need LINE Pay' });
       // Create a coupon_purchase order
-      const orderId = 'CPORD' + Date.now();
+      const orderId = 'CPORD' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
       const member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [userId])).rows[0];
       const memberId = member ? member.id : null;
       await db.query(
@@ -2853,37 +2874,51 @@ app.post('/api/coupons/purchase', async (req, res) => {
       }
     }
 
-    // === Wallet (points) flow (default, unchanged) ===
-    // Check wallet balance
-    if (price > 0 && effectiveGroupId) {
-      const walletRes = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
-      const balance = walletRes.rows[0]?.balance || 0;
-      if (balance < price) return res.status(400).json({ error: 'Insufficient balance', balance, required: price });
-      // Deduct points
-      await db.query('UPDATE wallets SET balance = balance - $1 WHERE line_user_id=$2 AND group_id=$3', [price, userId, effectiveGroupId]);
-      // Record transaction
-      await db.query('INSERT INTO transactions (line_user_id, group_id, type, amount, description) VALUES ($1,$2,$3,$4,$5)',
-        [userId, effectiveGroupId, 'payment', -price, `購買優惠券: ${coupon.name}`]);
+    // === Wallet (points) flow (default) — wrapped in transaction ===
+    const walletClient = await db.connect();
+    try {
+      await walletClient.query('BEGIN');
+      // Check wallet balance and deduct atomically
+      if (price > 0 && effectiveGroupId) {
+        const deductRes = await walletClient.query(
+          'UPDATE wallets SET balance = balance - $1 WHERE line_user_id=$2 AND group_id=$3 AND balance >= $1 RETURNING balance',
+          [price, userId, effectiveGroupId]
+        );
+        if (deductRes.rows.length === 0) {
+          await walletClient.query('ROLLBACK');
+          const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
+          return res.status(400).json({ error: 'Insufficient balance', balance: wr.rows[0]?.balance || 0, required: price });
+        }
+        // Record transaction
+        await walletClient.query('INSERT INTO transactions (line_user_id, group_id, type, amount, description) VALUES ($1,$2,$3,$4,$5)',
+          [userId, effectiveGroupId, 'payment', -price, `購買優惠券: ${coupon.name}`]);
+      }
+      // Calculate expiry date from validity
+      let expiryDate = coupon.expiry;
+      const validityMatch = (coupon.validity || '').match(/(\d+)日/);
+      if (validityMatch) {
+        const days = parseInt(validityMatch[1]);
+        expiryDate = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
+      }
+      // Insert user_coupon
+      const ucRes = await walletClient.query(`
+        INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
+        VALUES ($1, $2, $3, $4, $5, 'active') RETURNING id
+      `, [userId, couponId, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
+      await walletClient.query('COMMIT');
+      // Fetch new balance
+      let newBalance;
+      if (price > 0 && effectiveGroupId) {
+        const newBal = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
+        newBalance = newBal.rows[0]?.balance || 0;
+      }
+      res.json({ success: true, paymentMethod: 'wallet', userCouponId: ucRes.rows[0].id, newBalance });
+    } catch (walletErr) {
+      await walletClient.query('ROLLBACK').catch(() => {});
+      throw walletErr;
+    } finally {
+      walletClient.release();
     }
-    // Calculate expiry date from validity
-    let expiryDate = coupon.expiry;
-    const validityMatch = (coupon.validity || '').match(/(\d+)日/);
-    if (validityMatch) {
-      const days = parseInt(validityMatch[1]);
-      expiryDate = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
-    }
-    // Insert user_coupon
-    const ucRes = await db.query(`
-      INSERT INTO user_coupons (line_user_id, coupon_id, group_id, uses_remaining, expiry_date, status)
-      VALUES ($1, $2, $3, $4, $5, 'active') RETURNING id
-    `, [userId, couponId, effectiveGroupId, coupon.max_uses || 1, expiryDate]);
-    // Fetch new balance
-    let newBalance;
-    if (price > 0 && effectiveGroupId) {
-      const newBal = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, effectiveGroupId]);
-      newBalance = newBal.rows[0]?.balance || 0;
-    }
-    res.json({ success: true, paymentMethod: 'wallet', userCouponId: ucRes.rows[0].id, newBalance });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2894,9 +2929,9 @@ app.get('/api/coupons/purchase/confirm', async (req, res) => {
     const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
     if (!transactionId || !orderId) return res.redirect(`${FRONTEND_URL}/?status=error&msg=missing_params`);
 
-    // Fetch the coupon_purchase order
-    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1', [orderId]);
-    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=error&msg=order_not_found`);
+    // Fetch the coupon_purchase order (idempotency: skip if already paid/completed)
+    const orderResult = await db.query('SELECT * FROM orders WHERE id=$1 AND status NOT IN ($2, $3)', [orderId, 'paid', 'completed']);
+    if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=success&type=coupon_purchase&orderId=${orderId}&already_confirmed=1`);
     const order = orderResult.rows[0];
 
     // Confirm with LINE Pay
@@ -5421,7 +5456,7 @@ async function trackInteraction(userId, type) {
 
 function buildWelcomeFlexMessage() {
   return {
-    type: 'flex', altText: '歡迎來到雲管家 Cloud Monster！',
+    type: 'flex', altText: '歡迎來到 YPURE 雲管家！',
     contents: {
       type: 'bubble', size: 'mega',
       header: {
@@ -5432,7 +5467,7 @@ function buildWelcomeFlexMessage() {
             type: 'box', layout: 'vertical', backgroundColor: '#FFFFFF20',
             cornerRadius: '12px', paddingAll: '16px', margin: 'none',
             contents: [
-              { type: 'text', text: '雲管家 Cloud Monster', color: BRAND_GOLD, weight: 'bold', size: 'lg', align: 'center' },
+              { type: 'text', text: 'YPURE 雲管家', color: BRAND_GOLD, weight: 'bold', size: 'lg', align: 'center' },
               { type: 'text', text: 'IoT 智慧洗衣解決方案', color: '#FFFFFFBB', size: 'sm', align: 'center', margin: 'sm' }
             ]
           }
@@ -5441,7 +5476,8 @@ function buildWelcomeFlexMessage() {
       body: {
         type: 'box', layout: 'vertical', spacing: 'lg', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '在開始之前，讓我先了解一下：\n你是想了解我們的智慧洗衣系統？\n還是已經是合作店家的顧客？', size: 'sm', wrap: true, color: '#555555' }
+          { type: 'text', text: '歡迎！你是哪一種身份？', size: 'md', wrap: true, weight: 'bold', color: '#333333' },
+          { type: 'text', text: '請選擇最符合你的選項，我們會提供最適合的資訊。', size: 'sm', wrap: true, color: '#888888', margin: 'sm' }
         ]
       },
       footer: {
@@ -5449,11 +5485,15 @@ function buildWelcomeFlexMessage() {
         contents: [
           {
             type: 'button', style: 'primary', color: BRAND_PRIMARY, height: 'md',
-            action: { type: 'postback', label: '💼 我想了解系統 / 加盟', data: 'action=welcome_business', displayText: '我想了解智慧洗衣系統' }
+            action: { type: 'postback', label: '💼 我是店主／想開店', data: 'action=welcome_business', displayText: '我是店主／想開店' }
           },
           {
-            type: 'button', style: 'secondary', color: '#888888', height: 'md',
-            action: { type: 'postback', label: '🧺 我是洗衣店顧客', data: 'action=welcome_customer', displayText: '我是洗衣店顧客' }
+            type: 'button', style: 'secondary', height: 'md',
+            action: { type: 'postback', label: '🧺 我是洗衣顧客', data: 'action=welcome_customer', displayText: '我是洗衣顧客' }
+          },
+          {
+            type: 'button', style: 'primary', color: BRAND_GOLD, height: 'md',
+            action: { type: 'postback', label: '🤝 我想了解加盟合作', data: 'action=welcome_franchise', displayText: '我想了解加盟合作' }
           }
         ]
       }
@@ -5538,95 +5578,75 @@ function buildCustomerWelcomeReply() {
 // Business welcome: returns ARRAY of messages (B2B focused)
 function buildBusinessWelcomeReply() {
   const overviewCard = {
-    type: 'flex', altText: '雲管家智慧洗衣系統',
+    type: 'flex', altText: '歡迎了解雲管家系統',
     contents: {
       type: 'bubble', size: 'mega',
       header: {
-        type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
+        type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px',
         contents: [
-          { type: 'text', text: '💼 雲管家智慧洗衣系統', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+          { type: 'text', text: '💼 歡迎了解雲管家系統', color: '#FFFFFF', weight: 'bold', size: 'lg' }
         ]
       },
       body: {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '感謝你的興趣！雲管家是專為自助洗衣店打造的 IoT 管理系統。', size: 'sm', wrap: true, color: '#555555' },
+          { type: 'text', text: '雲管家是專為自助洗衣店打造的 IoT 管理系統', size: 'sm', wrap: true, color: '#555555', weight: 'bold' },
           {
-            type: 'box', layout: 'horizontal', margin: 'lg', spacing: 'md',
-            contents: [
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '📱', size: 'xl', align: 'center' },
-                { type: 'text', text: 'LINE Pay', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '行動支付', size: 'xxs', align: 'center', color: '#888888', wrap: true }
-              ]},
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '📊', size: 'xl', align: 'center' },
-                { type: 'text', text: '雲端報表', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '營收報表', size: 'xxs', align: 'center', color: '#888888', wrap: true }
-              ]},
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '🔔', size: 'xl', align: 'center' },
-                { type: 'text', text: '異常通知', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '即時通知', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+            type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+              { type: 'text', text: '📱', size: 'lg', flex: 1 },
+              { type: 'box', layout: 'vertical', flex: 8, contents: [
+                { type: 'text', text: 'LINE Pay 行動支付', size: 'sm', weight: 'bold' },
+                { type: 'text', text: '營收自動入帳', size: 'xs', color: '#888888', wrap: true }
               ]}
             ]
           },
           {
-            type: 'box', layout: 'horizontal', margin: 'md', spacing: 'md',
-            contents: [
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '🎁', size: 'xl', align: 'center' },
-                { type: 'text', text: '優惠券', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '會員系統', size: 'xxs', align: 'center', color: '#888888', wrap: true }
-              ]},
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '🏪', size: 'xl', align: 'center' },
-                { type: 'text', text: '多店管理', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '統一管理', size: 'xxs', align: 'center', color: '#888888', wrap: true }
-              ]},
-              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
-                { type: 'text', text: '⚡', size: 'xl', align: 'center' },
-                { type: 'text', text: '快速上線', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
-                { type: 'text', text: '最快7天', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+            type: 'box', layout: 'horizontal', margin: 'md', contents: [
+              { type: 'text', text: '📊', size: 'lg', flex: 1 },
+              { type: 'box', layout: 'vertical', flex: 8, contents: [
+                { type: 'text', text: '雲端即時報表', size: 'sm', weight: 'bold' },
+                { type: 'text', text: '手機隨時看營收', size: 'xs', color: '#888888', wrap: true }
+              ]}
+            ]
+          },
+          {
+            type: 'box', layout: 'horizontal', margin: 'md', contents: [
+              { type: 'text', text: '🔔', size: 'lg', flex: 1 },
+              { type: 'box', layout: 'vertical', flex: 8, contents: [
+                { type: 'text', text: '異常自動通知', size: 'sm', weight: 'bold' },
+                { type: 'text', text: '遠端管理免到場', size: 'xs', color: '#888888', wrap: true }
+              ]}
+            ]
+          },
+          {
+            type: 'box', layout: 'horizontal', margin: 'md', contents: [
+              { type: 'text', text: '🎯', size: 'lg', flex: 1 },
+              { type: 'box', layout: 'vertical', flex: 8, contents: [
+                { type: 'text', text: '會員+優惠券', size: 'sm', weight: 'bold' },
+                { type: 'text', text: '回購率提升 40%', size: 'xs', color: '#888888', wrap: true }
               ]}
             ]
           },
           { type: 'separator', margin: 'lg' },
-          { type: 'text', text: '5家門市 | 30+機台 | 99.9%穩定', size: 'sm', align: 'center', color: BRAND_GOLD, weight: 'bold', margin: 'md' }
+          { type: 'text', text: '💰 月租方案 NT$5,000 起｜最快 7 天上線', size: 'sm', align: 'center', color: BRAND_GOLD, weight: 'bold', margin: 'md', wrap: true }
         ]
       },
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📋 查看方案價格', data: 'action=show_plans', displayText: '查看方案價格' } },
-          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📊 成功案例', data: 'action=success_cases', displayText: '成功案例' } },
-          { type: 'button', style: 'link', color: BRAND_PRIMARY, action: { type: 'uri', label: '🌐 參觀官網', uri: OFFICIAL_WEBSITE } }
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📋 查看方案與報價', data: 'action=show_plans', displayText: '查看方案與報價' } },
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約免費 Demo', uri: LINE_OA_CHAT_URL } }
         ]
       }
     }
   };
 
-  const quickInquiryCard = {
-    type: 'flex', altText: '快速了解雲管家',
-    contents: {
-      type: 'bubble', size: 'mega',
-      body: {
-        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
-        contents: [
-          { type: 'text', text: '想更快了解？直接輸入關鍵字：', size: 'sm', weight: 'bold', wrap: true },
-          { type: 'text', text: '「方案」→ 查看三種訂閱方案\n「案例」→ 合作店家成功故事\n「比較」→ 傳統 vs 智慧洗衣\n「Demo」→ 預約免費線上展示\n「報價」→ 客製化需求報價', size: 'sm', wrap: true, margin: 'md', color: '#555555' }
-        ]
-      },
-      footer: {
-        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
-        contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約 Demo', uri: LINE_OA_CHAT_URL } }
-        ]
-      }
-    }
+  const keywordGuide = {
+    type: 'text',
+    text: '📩 也可以直接輸入關鍵字：\n\n「方案」→ 查看三種方案詳情\n「成功案例」→ 看其他店主的成效\n「比較」→ 傳統 vs 智慧洗衣對比\n「免費Demo」→ 預約線上展示\n「獲利分析」→ 投報率試算'
   };
 
-  return [overviewCard, quickInquiryCard];
+  return [overviewCard, keywordGuide];
 }
 
 // Keep backward compatibility alias
@@ -6237,7 +6257,7 @@ function buildPlansCard() {
     header: {
       type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
       contents: [
-        { type: 'text', text: '📱 月租方案', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        { type: 'text', text: '🟢 月租方案', color: '#FFFFFF', weight: 'bold', size: 'lg' }
       ]
     },
     body: {
@@ -6245,14 +6265,15 @@ function buildPlansCard() {
       contents: [
         { type: 'text', text: 'NT$ 5,000 /月', size: 'xl', weight: 'bold', color: BRAND_GOLD },
         { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '✅ LINE Pay 行動支付', size: 'sm', margin: 'lg', wrap: true },
-        { type: 'text', text: '✅ 雲端營收報表', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 機台即時監控', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 推播通知系統', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 基礎優惠券功能', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 線上客服支援', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '適合：剛起步、想先試水溫', size: 'xs', color: '#888888', margin: 'sm', wrap: true },
         { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '適合：剛起步、想試用的店家', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+        { type: 'text', text: '✅ LINE Pay 支付', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ 會員儲值系統', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 營收報表', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 機台狀態監控', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 洗好推播通知', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '✅ 7天快速上線', size: 'sm', color: GREEN, weight: 'bold', margin: 'md', wrap: true }
       ]
     },
     footer: {
@@ -6268,23 +6289,21 @@ function buildPlansCard() {
     header: {
       type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px',
       contents: [
-        { type: 'text', text: '⭐ 年租方案（最熱門）', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        { type: 'text', text: '🔵 年租方案（最熱門）', color: '#FFFFFF', weight: 'bold', size: 'lg' }
       ]
     },
     body: {
       type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
       contents: [
         { type: 'text', text: 'NT$ 50,000 /年', size: 'xl', weight: 'bold', color: BRAND_GOLD },
-        { type: 'text', text: '省下 NT$10,000！', size: 'sm', weight: 'bold', color: '#E74C3C', margin: 'sm' },
+        { type: 'text', text: '等於月付 $4,167，省下兩個月！', size: 'sm', weight: 'bold', color: '#E74C3C', margin: 'sm', wrap: true },
+        { type: 'text', text: '適合：確定長期經營的店主', size: 'xs', color: '#888888', margin: 'sm', wrap: true },
         { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '✅ 月租方案全部功能', size: 'sm', margin: 'lg', wrap: true },
-        { type: 'text', text: '✅ 多店管理後台', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 進階會員系統', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 月租全部功能', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ 優惠券系統', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 多店管理', size: 'sm', margin: 'sm', wrap: true },
         { type: 'text', text: '✅ 數據分析報告', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 優先技術支援', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 免費系統導入輔導', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '適合：穩定經營、想長期合作的店家', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+        { type: 'text', text: '✅ 優先技術支援', size: 'sm', margin: 'sm', wrap: true }
       ]
     },
     footer: {
@@ -6300,7 +6319,7 @@ function buildPlansCard() {
     header: {
       type: 'box', layout: 'vertical', backgroundColor: '#2ECC71', paddingAll: '20px',
       contents: [
-        { type: 'text', text: '🏢 客製化 / 買斷', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        { type: 'text', text: '🟡 客製化 / 買斷', color: '#FFFFFF', weight: 'bold', size: 'lg' }
       ]
     },
     body: {
@@ -6308,20 +6327,19 @@ function buildPlansCard() {
       contents: [
         { type: 'text', text: '依需求報價', size: 'xl', weight: 'bold', color: '#2ECC71' },
         { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '✅ 全部功能解鎖', size: 'sm', margin: 'lg', wrap: true },
-        { type: 'text', text: '✅ 品牌客製化介面', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ API 串接整合', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 專屬客戶經理', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 到場安裝教育訓練', size: 'sm', margin: 'sm', wrap: true },
-        { type: 'text', text: '✅ 終身免費更新', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '適合：多店連鎖、特殊整合需求', size: 'xs', color: '#888888', margin: 'sm', wrap: true },
         { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '適合：連鎖品牌、大型加盟體系', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+        { type: 'text', text: '✅ 年租全部功能', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ API 客製整合', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 專屬品牌介面', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 硬體客製', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 專案經理服務', size: 'sm', margin: 'sm', wrap: true }
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
-        { type: 'button', style: 'primary', color: '#2ECC71', action: { type: 'uri', label: '預約 Demo', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: '#2ECC71', action: { type: 'uri', label: '預約評估', uri: LINE_OA_CHAT_URL } }
       ]
     }
   };
@@ -6412,12 +6430,16 @@ const KEYWORD_REPLIES = {
     messages: [buildTraditionalVsSmartCard()]
   },
   '方案': {
-    tags: ['業主_評估方案'],
-    messages: [buildPricingCard()]
+    tags: ['B2B_方案查詢'],
+    messages: [buildPlansCard()]
   },
   'Demo': {
     tags: ['B2B_Demo預約'],
-    messages: [{ type: 'text', text: '🎯 感謝你想預約 Demo！\n\n請提供以下資訊，我們會在一個工作天內安排：\n\n1️⃣ 您的姓名\n2️⃣ 聯絡電話\n3️⃣ 目前經營狀況（新開店/已有店面/連鎖品牌）\n4️⃣ 門市數量\n5️⃣ 方便的時間\n\n或直接撥打 ' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+    messages: [{ type: 'text', text: '🎯 太好了！預約免費 Demo 只需要 30 秒：\n\n請回覆以下資訊：\n1️⃣ 你的姓名\n2️⃣ 目前身份（準備開店 / 已有洗衣店 / 連鎖業者）\n3️⃣ 方便的聯繫時間\n4️⃣ 聯絡電話或 Email\n\n我們會在 24 小時內安排專人與你聯繫！\n\n📞 急件可撥：' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+  },
+  '免費Demo': {
+    tags: ['B2B_Demo預約'],
+    messages: [{ type: 'text', text: '🎯 太好了！預約免費 Demo 只需要 30 秒：\n\n請回覆以下資訊：\n1️⃣ 你的姓名\n2️⃣ 目前身份（準備開店 / 已有洗衣店 / 連鎖業者）\n3️⃣ 方便的聯繫時間\n4️⃣ 聯絡電話或 Email\n\n我們會在 24 小時內安排專人與你聯繫！\n\n📞 急件可撥：' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
   },
   '報價': {
     tags: ['B2B_報價需求'],
@@ -6539,8 +6561,8 @@ function verifyLineSignature(rawBody, signature) {
 
 // ---- Enhanced Fuzzy Matching Map ----
 const FUZZY_MAP = [
-  // Franchise
-  { keywords: ['創業', '開店', '加盟'], reply: '我要創業' },
+  // Franchise / B2B entry
+  { keywords: ['創業', '開店', '加盟', '店主', '業主'], reply: '我要創業' },
   { keywords: ['獲利', '賺錢', '投報率', 'ROI', '回收'], reply: '獲利分析' },
   { keywords: ['區域', '地點', '選址'], reply: '區域評估' },
   { keywords: ['成功案例', '案例'], reply: '成功案例' },
@@ -6548,7 +6570,7 @@ const FUZZY_MAP = [
   // B2B - pricing plans
   { keywords: ['方案', '價格', '費用', '多少錢', '月租', '年租', '訂閱', '系統費用'], reply: '方案' },
   // B2B - demo
-  { keywords: ['Demo', 'demo', '展示', '預約', '試用', '預約Demo'], reply: 'Demo' },
+  { keywords: ['Demo', 'demo', 'DEMO', '展示', '預約', '試用', '預約Demo', '免費Demo', '免費demo'], reply: '免費Demo' },
   // B2B - quote
   { keywords: ['報價', '客製', '客製化', '買斷'], reply: '報價' },
   // Customer - pricing (use more specific terms to avoid overlap with B2B '方案')
@@ -6641,14 +6663,14 @@ async function handlePostback(event, userId) {
       break;
     }
     case 'welcome_business': {
-      await addUserTag(userId, 'B2B_興趣');
+      await addUserTag(userId, 'B2B_業主');
       await removeUserTag(userId, '新好友');
       const bizMsgs = buildBusinessWelcomeReply();
       await lineReply(event.replyToken, bizMsgs);
       break;
     }
     case 'show_plans': {
-      await addUserTag(userId, 'B2B_看方案');
+      await addUserTag(userId, 'B2B_方案查詢');
       await lineReply(event.replyToken, [buildPlansCard()]);
       break;
     }
