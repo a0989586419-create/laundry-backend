@@ -94,7 +94,7 @@ mqttClient.on('message', async (topic, payload) => {
 } // end if (mqttClient)
 
 // ===== IoT API Key middleware for device endpoints =====
-const IOT_API_KEY = process.env.IOT_API_KEY || 'ypure-iot-2026-default-key';
+const IOT_API_KEY = process.env.IOT_API_KEY || (() => { console.warn('[SECURITY] IOT_API_KEY using fallback - set env var!'); return 'ypure-iot-2026-default-key'; })();
 function requireIotApiKey(req, res, next) {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== IOT_API_KEY) return res.status(401).json({ error: 'Invalid or missing API key' });
@@ -111,8 +111,8 @@ async function getTBToken() {
   if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
   try {
     const { data } = await axios.post(`${TB_BASE}/api/auth/login`, {
-      username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
-      password: process.env.TB_PASSWORD || 's85010805',
+      username: process.env.TB_USERNAME || (() => { console.warn('[SECURITY] TB_USERNAME using fallback - set env var!'); return 'sl6963693171@gmail.com'; })(),
+      password: process.env.TB_PASSWORD || (() => { console.warn('[SECURITY] TB_PASSWORD using fallback - set env var!'); return 's85010805'; })(),
     }, { timeout: 10000 });
     tbToken = data.token;
     tbTokenExpiry = Date.now() + 3600000;
@@ -758,6 +758,8 @@ app.get('/api/user/orders/:orderId', async (req, res) => {
 //  API: Stores & Store Groups
 // ═══════════════════════════════════════
 app.get('/api/store-groups', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'Missing userId parameter' });
   try {
     const gr = await db.query('SELECT * FROM store_groups ORDER BY name');
     for (const g of gr.rows) {
@@ -1328,7 +1330,7 @@ app.get('/api/payment/confirm', async (req, res) => {
         VALUES ($1, 'running', $2, 0, NOW())
         ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
       `, [order.machine_id, order.duration_sec || 3600]);
-      publishStartCommand(order);
+      await publishStartCommand(order);
       // LINE Push: payment success
       const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
       if (memberRow) {
@@ -1507,7 +1509,7 @@ app.post('/api/payment/create', async (req, res) => {
     }
 
     // Try MQTT start command
-    try { publishStartCommand({ id: orderId, store_id: storeId, machine_id: machineId, mode, temp: dryTemp || 'high', total_amount: amount }); } catch (e) {}
+    try { await publishStartCommand({ id: orderId, store_id: storeId, machine_id: machineId, mode, temp: dryTemp || 'high', total_amount: amount }); } catch (e) {}
 
     // LINE Push: payment success (demo mode)
     {
@@ -1736,7 +1738,7 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
 // ═══════════════════════════════════════
 //  API: ThingsBoard Webhook (machine_done notification)
 // ═══════════════════════════════════════
-const TB_WEBHOOK_TOKEN = process.env.TB_WEBHOOK_TOKEN || 'e002afa25100c2fa5033db4d839e777d400d701c932d138598a372cf5d492819';
+const TB_WEBHOOK_TOKEN = process.env.TB_WEBHOOK_TOKEN || (() => { console.warn('[SECURITY] TB_WEBHOOK_TOKEN using fallback - set env var!'); return 'e002afa25100c2fa5033db4d839e777d400d701c932d138598a372cf5d492819'; })();
 
 app.post('/api/thingsboard/webhook', async (req, res) => {
   const token = req.headers['x-tb-webhook-token'];
@@ -1813,8 +1815,8 @@ app.get('/api/tb/diag', async (req, res) => {
   try {
     // Step 1: Login
     const loginRes = await axios.post(`${TB_BASE}/api/auth/login`, {
-      username: process.env.TB_USERNAME || 'sl6963693171@gmail.com',
-      password: process.env.TB_PASSWORD || 's85010805',
+      username: process.env.TB_USERNAME || (() => { console.warn('[SECURITY] TB_USERNAME using fallback - set env var!'); return 'sl6963693171@gmail.com'; })(),
+      password: process.env.TB_PASSWORD || (() => { console.warn('[SECURITY] TB_PASSWORD using fallback - set env var!'); return 's85010805'; })(),
     }, { timeout: 10000 });
     steps.login = { status: loginRes.status, hasToken: !!loginRes.data?.token };
     const token = loginRes.data.token;
@@ -4798,33 +4800,39 @@ app.get('/api/owner/revenue', async (req, res) => {
       dateGroup = `DATE(created_at)`;
     }
 
+    const params = [safeDays];
+    let pidx = 2;
     let query = `SELECT ${dateGroup} as date, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
-      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
-    const params = [];
+      FROM orders WHERE created_at >= NOW() - make_interval(days => $1::int) AND status != 'cancelled'`;
     if (storeId) {
-      query += ` AND store_id = $1`;
+      query += ` AND store_id = $${pidx}`;
       params.push(storeId);
+      pidx++;
     }
     query += ` GROUP BY ${dateGroup} ORDER BY date ASC`;
 
     const r = await db.query(query, params);
 
     // Top modes
-    let modeQuery = `SELECT mode, COUNT(*) as count, COALESCE(SUM(total_amount),0) as revenue FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
-    const modeParams = [];
+    const modeParams = [safeDays];
+    let mpidx = 2;
+    let modeQuery = `SELECT mode, COUNT(*) as count, COALESCE(SUM(total_amount),0) as revenue FROM orders WHERE created_at >= NOW() - make_interval(days => $1::int) AND status != 'cancelled'`;
     if (storeId) {
-      modeQuery += ` AND store_id = $1`;
+      modeQuery += ` AND store_id = $${mpidx}`;
       modeParams.push(storeId);
+      mpidx++;
     }
     modeQuery += ` GROUP BY mode ORDER BY count DESC LIMIT 5`;
     const modeR = await db.query(modeQuery, modeParams);
 
     // Peak hours
-    let peakQuery = `SELECT EXTRACT(HOUR FROM created_at) as hour, COUNT(*) as count FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
-    const peakParams = [];
+    const peakParams = [safeDays];
+    let ppidx = 2;
+    let peakQuery = `SELECT EXTRACT(HOUR FROM created_at) as hour, COUNT(*) as count FROM orders WHERE created_at >= NOW() - make_interval(days => $1::int) AND status != 'cancelled'`;
     if (storeId) {
-      peakQuery += ` AND store_id = $1`;
+      peakQuery += ` AND store_id = $${ppidx}`;
       peakParams.push(storeId);
+      ppidx++;
     }
     peakQuery += ` GROUP BY hour ORDER BY hour`;
     const peakR = await db.query(peakQuery, peakParams);
@@ -4841,9 +4849,12 @@ app.get('/api/owner/revenue', async (req, res) => {
 
 // Super admin: add a store owner
 app.post('/api/admin/store-owners', async (req, res) => {
-  const { userId, storeId, ownerName, phone } = req.body;
+  const { userId, storeId, ownerName, phone, adminUserId } = req.body;
   if (!userId || !storeId) return res.status(400).json({ error: 'Missing userId or storeId' });
   try {
+    // Require super_admin to create/update store owners
+    const roleInfo = await getUserRole(adminUserId || req.query.userId);
+    if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden: super_admin only' });
     await db.query(
       `INSERT INTO store_owners (user_id, store_id, owner_name, phone)
        VALUES ($1,$2,$3,$4)
@@ -4876,23 +4887,27 @@ app.get('/api/admin/revenue', async (req, res) => {
       dateGroup = `DATE(created_at)`;
     }
 
+    const params = [safeDays];
+    let pidx = 2;
     let query = `SELECT ${dateGroup} as date, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
-      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
-    const params = [];
+      FROM orders WHERE created_at >= NOW() - make_interval(days => $1::int) AND status != 'cancelled'`;
     if (storeId) {
-      query += ` AND store_id = $1`;
+      query += ` AND store_id = $${pidx}`;
       params.push(storeId);
+      pidx++;
     }
     query += ` GROUP BY ${dateGroup} ORDER BY date ASC`;
     const r = await db.query(query, params);
 
     // Per-store breakdown
+    const storeParams = [safeDays];
+    let spidx = 2;
     let storeQuery = `SELECT store_id, COALESCE(SUM(total_amount),0) as revenue, COUNT(*) as orders
-      FROM orders WHERE created_at >= NOW() - INTERVAL '${safeDays} days' AND status != 'cancelled'`;
-    const storeParams = [];
+      FROM orders WHERE created_at >= NOW() - make_interval(days => $1::int) AND status != 'cancelled'`;
     if (storeId) {
-      storeQuery += ` AND store_id = $1`;
+      storeQuery += ` AND store_id = $${spidx}`;
       storeParams.push(storeId);
+      spidx++;
     }
     storeQuery += ` GROUP BY store_id ORDER BY revenue DESC`;
     const storeR = await db.query(storeQuery, storeParams);
@@ -4911,12 +4926,17 @@ app.get('/api/admin/revenue', async (req, res) => {
 // ═══════════════════════════════════════
 
 app.get('/api/mqtt/config', (req, res) => {
+  const { userId } = req.query;
+  // Validate userId is a valid LINE user ID format (U + 32 hex chars)
+  if (!userId || !/^U[0-9a-f]{32}$/.test(userId)) {
+    return res.status(401).json({ error: 'Valid userId required' });
+  }
   res.json({
     host: process.env.MQTT_HOST || 'f29e89cd32414b9c826381e76ef8baaf.s1.eu.hivemq.cloud',
     port: 8884,
     protocol: 'wss',
     username: process.env.MQTT_USER || 'ypure-iot',
-    password: process.env.MQTT_PASS || 'Ypure2025!'
+    // Do not expose raw password; client should use read-only topics only
   });
 });
 
