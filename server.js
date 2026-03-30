@@ -1556,29 +1556,9 @@ app.post('/api/topup/linepay', async (req, res) => {
         return res.json({ success: true, paymentUrl: result.info.paymentUrl.web, transactionId: result.info.transactionId, orderId });
       }
     } catch (linePayErr) {
-      console.warn('LINE Pay topup unavailable, using demo mode:', linePayErr.message);
+      console.error('LINE Pay topup error:', linePayErr.message);
+      return res.status(500).json({ success: false, error: 'LINE Pay 服務暫時無法使用，請稍後再試' });
     }
-
-    // Demo mode fallback: add points directly
-    await db.query(`
-      INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
-      ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
-    `, [userId, groupId, amount]);
-    await db.query(`
-      INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
-      VALUES ($1, $2, 'topup', $3, $4, NOW())
-    `, [userId, groupId, amount, `儲值 +${amount}`]);
-    const wr = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
-    // LINE Push: topup success
-    let topupSupportUrl = '';
-    let topupSupportPhone = '';
-    if (groupId) {
-      const sgr = (await db.query('SELECT support_url, support_phone FROM store_groups WHERE id=$1', [groupId])).rows[0];
-      topupSupportUrl = sgr?.support_url || '';
-      topupSupportPhone = sgr?.support_phone || '';
-    }
-    sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: groupName, amount: amount, balance: wr.rows[0]?.balance || 0, supportUrl: topupSupportUrl, supportPhone: topupSupportPhone }), { pushType: 'auto_topup', groupId: groupId, description: `Demo儲值成功 ${groupName} NT$${amount}` }).catch(() => {});
-    res.json({ success: true, demoMode: true, balance: wr.rows[0]?.balance || 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
