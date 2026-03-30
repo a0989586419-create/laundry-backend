@@ -6351,6 +6351,31 @@ const KEYWORD_REPLIES = {
   '空機': {
     tags: [],
     messages: [{ type: 'text', text: '🔍 想查看空機狀態？\n\n點選下方連結，即可查看各店即時空機情況：\n👉 ' + LIFF_WASH + '\n\n出門前先看，不用白跑一趟！' }]
+  },
+  '故障報修': {
+    tags: [],
+    messages: [{
+      type: 'flex', altText: '故障報修',
+      contents: {
+        type: 'bubble', size: 'mega',
+        header: { type: 'box', layout: 'vertical', backgroundColor: '#E74C3C', paddingAll: '20px', contents: [
+          { type: 'text', text: '🔧 故障報修', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+        ]},
+        body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+          { type: 'text', text: '遇到機器問題了嗎？請提供以下資訊，我們會盡快處理：', size: 'sm', wrap: true },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '請回覆以下格式：', size: 'sm', weight: 'bold', margin: 'lg', wrap: true },
+          { type: 'text', text: '1️⃣ 哪家門市？（例如：悠洗自助洗衣）\n2️⃣ 哪台機器？（例如：洗衣機2號）\n3️⃣ 什麼問題？（例如：無法啟動）\n4️⃣ 是否有投幣/付款？', size: 'sm', wrap: true, margin: 'sm', color: '#555555' },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '💡 常見快速排除：', size: 'sm', weight: 'bold', margin: 'md', wrap: true },
+          { type: 'text', text: '• 門沒關好 → 確認機門完全關閉再按啟動\n• 投幣沒反應 → 試試用 LINE Pay 付款\n• 洗到一半停了 → 可能斷電，等2分鐘會自動恢復', size: 'xs', wrap: true, color: '#888888', margin: 'sm' }
+        ]},
+        footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
+          { type: 'button', style: 'primary', color: '#E74C3C', action: { type: 'uri', label: '直接聯繫客服', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', action: { type: 'uri', label: '查看門市地址', uri: LIFF_WASH } }
+        ]}
+      }
+    }]
   }
 };
 
@@ -6414,7 +6439,8 @@ const FUZZY_MAP = [
   // Customer - tips
   { keywords: ['洗衣知識', '小常識', '洗衣技巧', '小撇步', '知識'], reply: '洗衣知識' },
   // Legacy
-  { keywords: ['不穩', '故障', '壞了', '當機'], reply: '系統不穩怎麼辦' },
+  { keywords: ['不穩', '當機'], reply: '系統不穩怎麼辦' },
+  { keywords: ['故障', '壞了', '報修', '維修', '沒反應', '不能用'], reply: '故障報修' },
   { keywords: ['支付', '付款', 'LINE Pay', 'linepay'], reply: '行動支付' },
   { keywords: ['空機', '有沒有位', '還有機器', '有位子'], reply: '空機' },
 ];
