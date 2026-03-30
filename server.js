@@ -239,6 +239,9 @@ const LIFF_URL = 'https://liff.line.me/2009552592-xkDKSJ1Y';
 const LIFF_WASH = LIFF_URL + '?tab=wash';
 const LIFF_PROFILE = LIFF_URL + '?tab=profile';
 const LINE_OA_CHAT_URL = 'https://line.me/R/ti/p/@016kcwrh';
+const OFFICIAL_WEBSITE = 'https://cloudmonster-website.vercel.app';
+const CONTACT_PHONE = '0800-018-888';
+const CONTACT_EMAIL = 'contact@cloudmonster.com.tw';
 const DEFAULT_SUPPORT_PHONE = '0800-018-888';
 const BRAND_PRIMARY = '#3A3A8C';
 const BRAND_GOLD = '#E5B94C';
@@ -5418,7 +5421,7 @@ async function trackInteraction(userId, type) {
 
 function buildWelcomeFlexMessage() {
   return {
-    type: 'flex', altText: '歡迎加入 YPURE 雲管家！',
+    type: 'flex', altText: '歡迎來到雲管家 Cloud Monster！',
     contents: {
       type: 'bubble', size: 'mega',
       header: {
@@ -5429,9 +5432,8 @@ function buildWelcomeFlexMessage() {
             type: 'box', layout: 'vertical', backgroundColor: '#FFFFFF20',
             cornerRadius: '12px', paddingAll: '16px', margin: 'none',
             contents: [
-              { type: 'text', text: 'YPURE', color: BRAND_GOLD, weight: 'bold', size: 'xxl', align: 'center' },
-              { type: 'text', text: '雲管家', color: '#FFFFFF', weight: 'bold', size: 'xl', align: 'center', margin: 'xs' },
-              { type: 'text', text: '智慧洗衣 . 輕鬆管理', color: '#FFFFFFBB', size: 'sm', align: 'center', margin: 'sm' }
+              { type: 'text', text: '雲管家 Cloud Monster', color: BRAND_GOLD, weight: 'bold', size: 'lg', align: 'center' },
+              { type: 'text', text: 'IoT 智慧洗衣解決方案', color: '#FFFFFFBB', size: 'sm', align: 'center', margin: 'sm' }
             ]
           }
         ]
@@ -5439,10 +5441,7 @@ function buildWelcomeFlexMessage() {
       body: {
         type: 'box', layout: 'vertical', spacing: 'lg', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '歡迎加入！', size: 'lg', weight: 'bold', wrap: true },
-          { type: 'text', text: '我是雲管家智慧助理，不論你是想找附近自助洗衣，或是對自助洗衣加盟有興趣，都能幫你。', size: 'sm', wrap: true, color: '#555555', margin: 'md' },
-          { type: 'separator', margin: 'lg' },
-          { type: 'text', text: '請先告訴我你的需求：', size: 'md', wrap: true, weight: 'bold', margin: 'lg' }
+          { type: 'text', text: '在開始之前，讓我先了解一下：\n你是想了解我們的智慧洗衣系統？\n還是已經是合作店家的顧客？', size: 'sm', wrap: true, color: '#555555' }
         ]
       },
       footer: {
@@ -5450,11 +5449,11 @@ function buildWelcomeFlexMessage() {
         contents: [
           {
             type: 'button', style: 'primary', color: BRAND_PRIMARY, height: 'md',
-            action: { type: 'postback', label: '🧺 我要洗衣服', data: 'action=welcome_customer', displayText: '我要洗衣服！' }
+            action: { type: 'postback', label: '💼 我想了解系統 / 加盟', data: 'action=welcome_business', displayText: '我想了解智慧洗衣系統' }
           },
           {
-            type: 'button', style: 'primary', color: BRAND_GOLD, height: 'md',
-            action: { type: 'postback', label: '💼 我想了解加盟', data: 'action=welcome_franchise', displayText: '我想了解加盟' }
+            type: 'button', style: 'secondary', color: '#888888', height: 'md',
+            action: { type: 'postback', label: '🧺 我是洗衣店顧客', data: 'action=welcome_customer', displayText: '我是洗衣店顧客' }
           }
         ]
       }
@@ -5536,74 +5535,103 @@ function buildCustomerWelcomeReply() {
   return [featureCard, quickActionCard];
 }
 
-// Franchise welcome: returns ARRAY of messages
-function buildFranchiseWelcomeReply() {
+// Business welcome: returns ARRAY of messages (B2B focused)
+function buildBusinessWelcomeReply() {
   const overviewCard = {
-    type: 'flex', altText: '感謝你對雲管家加盟的興趣！',
+    type: 'flex', altText: '雲管家智慧洗衣系統',
     contents: {
       type: 'bubble', size: 'mega',
       header: {
-        type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px',
+        type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
         contents: [
-          { type: 'text', text: '💼 自助洗衣智慧加盟', color: '#FFFFFF', weight: 'bold', size: 'lg' },
-          { type: 'text', text: 'YPURE 雲管家合作方案', color: '#FFFFFFCC', size: 'xs', margin: 'sm' }
+          { type: 'text', text: '💼 雲管家智慧洗衣系統', color: '#FFFFFF', weight: 'bold', size: 'lg' }
         ]
       },
       body: {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '為什麼選擇智慧自助洗衣？', size: 'md', weight: 'bold', wrap: true },
-          { type: 'separator', margin: 'md' },
+          { type: 'text', text: '感謝你的興趣！雲管家是專為自助洗衣店打造的 IoT 管理系統。', size: 'sm', wrap: true, color: '#555555' },
           {
-            type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-              { type: 'text', text: '💰', size: 'lg', flex: 1 },
-              { type: 'box', layout: 'vertical', flex: 8, contents: [
-                { type: 'text', text: '低人力成本', size: 'sm', weight: 'bold' },
-                { type: 'text', text: '遠端管理，每天只需15分鐘', size: 'xs', color: '#888888', wrap: true }
+            type: 'box', layout: 'horizontal', margin: 'lg', spacing: 'md',
+            contents: [
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '📱', size: 'xl', align: 'center' },
+                { type: 'text', text: 'LINE Pay', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '行動支付', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+              ]},
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '📊', size: 'xl', align: 'center' },
+                { type: 'text', text: '雲端報表', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '營收報表', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+              ]},
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '🔔', size: 'xl', align: 'center' },
+                { type: 'text', text: '異常通知', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '即時通知', size: 'xxs', align: 'center', color: '#888888', wrap: true }
               ]}
             ]
           },
           {
-            type: 'box', layout: 'horizontal', margin: 'md', contents: [
-              { type: 'text', text: '📊', size: 'lg', flex: 1 },
-              { type: 'box', layout: 'vertical', flex: 8, contents: [
-                { type: 'text', text: '穩定現金流', size: 'sm', weight: 'bold' },
-                { type: 'text', text: '月均營收 NT$8-15萬，14-20個月回收', size: 'xs', color: '#888888', wrap: true }
+            type: 'box', layout: 'horizontal', margin: 'md', spacing: 'md',
+            contents: [
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '🎁', size: 'xl', align: 'center' },
+                { type: 'text', text: '優惠券', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '會員系統', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+              ]},
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '🏪', size: 'xl', align: 'center' },
+                { type: 'text', text: '多店管理', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '統一管理', size: 'xxs', align: 'center', color: '#888888', wrap: true }
+              ]},
+              { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
+                { type: 'text', text: '⚡', size: 'xl', align: 'center' },
+                { type: 'text', text: '快速上線', size: 'xxs', align: 'center', weight: 'bold', wrap: true },
+                { type: 'text', text: '最快7天', size: 'xxs', align: 'center', color: '#888888', wrap: true }
               ]}
             ]
           },
-          {
-            type: 'box', layout: 'horizontal', margin: 'md', contents: [
-              { type: 'text', text: '🎯', size: 'lg', flex: 1 },
-              { type: 'box', layout: 'vertical', flex: 8, contents: [
-                { type: 'text', text: '會員系統加持', size: 'sm', weight: 'bold' },
-                { type: 'text', text: '行動支付客單價比投幣高18%', size: 'xs', color: '#888888', wrap: true }
-              ]}
-            ]
-          },
-          {
-            type: 'box', layout: 'horizontal', margin: 'md', contents: [
-              { type: 'text', text: '🔧', size: 'lg', flex: 1 },
-              { type: 'box', layout: 'vertical', flex: 8, contents: [
-                { type: 'text', text: '遠端監控', size: 'sm', weight: 'bold' },
-                { type: 'text', text: '設備異常即時通知，免到場排除', size: 'xs', color: '#888888', wrap: true }
-              ]}
-            ]
-          }
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: '5家門市 | 30+機台 | 99.9%穩定', size: 'sm', align: 'center', color: BRAND_GOLD, weight: 'bold', margin: 'md' }
         ]
       },
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📘 創業指南', data: 'action=keyword_startup', displayText: '我要創業' } },
-          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📊 獲利分析', data: 'action=keyword_profit', displayText: '獲利分析' } },
-          { type: 'button', style: 'link', color: BRAND_PRIMARY, action: { type: 'uri', label: '預約 Demo', uri: LINE_OA_CHAT_URL } }
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📋 查看方案價格', data: 'action=show_plans', displayText: '查看方案價格' } },
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📊 成功案例', data: 'action=success_cases', displayText: '成功案例' } },
+          { type: 'button', style: 'link', color: BRAND_PRIMARY, action: { type: 'uri', label: '🌐 參觀官網', uri: OFFICIAL_WEBSITE } }
         ]
       }
     }
   };
 
-  return [overviewCard];
+  const quickInquiryCard = {
+    type: 'flex', altText: '快速了解雲管家',
+    contents: {
+      type: 'bubble', size: 'mega',
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '想更快了解？直接輸入關鍵字：', size: 'sm', weight: 'bold', wrap: true },
+          { type: 'text', text: '「方案」→ 查看三種訂閱方案\n「案例」→ 合作店家成功故事\n「比較」→ 傳統 vs 智慧洗衣\n「Demo」→ 預約免費線上展示\n「報價」→ 客製化需求報價', size: 'sm', wrap: true, margin: 'md', color: '#555555' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約 Demo', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+
+  return [overviewCard, quickInquiryCard];
+}
+
+// Keep backward compatibility alias
+function buildFranchiseWelcomeReply() {
+  return buildBusinessWelcomeReply();
 }
 
 // ---- Customer Keyword Flex Builders ----
@@ -6062,7 +6090,7 @@ function buildSuccessCasesCarousel() {
       name: '林老闆',
       store: '苗栗玉清店',
       period: '加入 8 個月',
-      quote: '導入雲管家後，月營收成長 20%，遠端管理讓我不用天天跑店，省時省力！',
+      quote: '導入雲管家系統後，月營收成長 20%，遠端管理讓我不用天天跑店，省時省力！',
       stats: [
         { label: '月營收成長', value: '+20%' },
         { label: '管理時間', value: '每天15分鐘' },
@@ -6119,26 +6147,26 @@ function buildSuccessCasesCarousel() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '10px',
       contents: [
-        { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '我也想加盟', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '我也想導入雲管家', uri: LINE_OA_CHAT_URL } }
       ]
     }
   }));
 
   return {
-    type: 'flex', altText: '雲管家加盟成功案例',
+    type: 'flex', altText: '雲管家客戶成功案例',
     contents: { type: 'carousel', contents: bubbles }
   };
 }
 
 function buildTraditionalVsSmartCard() {
   return {
-    type: 'flex', altText: '傳統 vs 智慧洗衣比較',
+    type: 'flex', altText: '傳統投幣 vs 雲管家智慧系統比較',
     contents: {
       type: 'bubble', size: 'mega',
       header: {
         type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
         contents: [
-          { type: 'text', text: '⚡ 傳統 vs 智慧洗衣', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+          { type: 'text', text: '⚡ 傳統投幣 vs 雲管家智慧系統', color: '#FFFFFF', weight: 'bold', size: 'md', wrap: true }
         ]
       },
       body: {
@@ -6188,18 +6216,125 @@ function buildTraditionalVsSmartCard() {
             { type: 'text', text: '~65%', size: 'xs', flex: 3, align: 'center', color: GREEN, weight: 'bold' }
           ]},
           { type: 'separator', margin: 'lg' },
-          { type: 'text', text: '💡 智慧系統平均提升營收 25-40%', size: 'xs', color: BRAND_GOLD, weight: 'bold', margin: 'md', wrap: true }
+          { type: 'text', text: '💡 雲管家智慧系統平均提升營收 25-40%', size: 'xs', color: BRAND_GOLD, weight: 'bold', margin: 'md', wrap: true }
         ]
       },
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
           { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '查看成功案例', data: 'action=success_cases', displayText: '成功案例' } },
-          { type: 'button', style: 'link', action: { type: 'uri', label: '預約免費 Demo', uri: LINE_OA_CHAT_URL } }
+          { type: 'button', style: 'link', action: { type: 'uri', label: '🌐 瀏覽官網了解更多', uri: OFFICIAL_WEBSITE } }
         ]
       }
     }
   };
+}
+
+// ---- Plans Card (B2B Carousel) ----
+function buildPlansCard() {
+  const monthlyBubble = {
+    type: 'bubble', size: 'mega',
+    header: {
+      type: 'box', layout: 'vertical', backgroundColor: BRAND_PRIMARY, paddingAll: '20px',
+      contents: [
+        { type: 'text', text: '📱 月租方案', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+      ]
+    },
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+      contents: [
+        { type: 'text', text: 'NT$ 5,000 /月', size: 'xl', weight: 'bold', color: BRAND_GOLD },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '✅ LINE Pay 行動支付', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ 雲端營收報表', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 機台即時監控', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 推播通知系統', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 基礎優惠券功能', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 線上客服支援', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '適合：剛起步、想試用的店家', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+      ]
+    },
+    footer: {
+      type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+      contents: [
+        { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } }
+      ]
+    }
+  };
+
+  const annualBubble = {
+    type: 'bubble', size: 'mega',
+    header: {
+      type: 'box', layout: 'vertical', backgroundColor: BRAND_GOLD, paddingAll: '20px',
+      contents: [
+        { type: 'text', text: '⭐ 年租方案（最熱門）', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+      ]
+    },
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+      contents: [
+        { type: 'text', text: 'NT$ 50,000 /年', size: 'xl', weight: 'bold', color: BRAND_GOLD },
+        { type: 'text', text: '省下 NT$10,000！', size: 'sm', weight: 'bold', color: '#E74C3C', margin: 'sm' },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '✅ 月租方案全部功能', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ 多店管理後台', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 進階會員系統', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 數據分析報告', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 優先技術支援', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 免費系統導入輔導', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '適合：穩定經營、想長期合作的店家', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+      ]
+    },
+    footer: {
+      type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+      contents: [
+        { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } }
+      ]
+    }
+  };
+
+  const customBubble = {
+    type: 'bubble', size: 'mega',
+    header: {
+      type: 'box', layout: 'vertical', backgroundColor: '#2ECC71', paddingAll: '20px',
+      contents: [
+        { type: 'text', text: '🏢 客製化 / 買斷', color: '#FFFFFF', weight: 'bold', size: 'lg' }
+      ]
+    },
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+      contents: [
+        { type: 'text', text: '依需求報價', size: 'xl', weight: 'bold', color: '#2ECC71' },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '✅ 全部功能解鎖', size: 'sm', margin: 'lg', wrap: true },
+        { type: 'text', text: '✅ 品牌客製化介面', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ API 串接整合', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 專屬客戶經理', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 到場安裝教育訓練', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'text', text: '✅ 終身免費更新', size: 'sm', margin: 'sm', wrap: true },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '適合：連鎖品牌、大型加盟體系', size: 'xs', color: '#888888', margin: 'md', wrap: true }
+      ]
+    },
+    footer: {
+      type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+      contents: [
+        { type: 'button', style: 'primary', color: '#2ECC71', action: { type: 'uri', label: '預約 Demo', uri: LINE_OA_CHAT_URL } }
+      ]
+    }
+  };
+
+  return {
+    type: 'flex', altText: '雲管家方案價格',
+    contents: { type: 'carousel', contents: [monthlyBubble, annualBubble, customBubble] }
+  };
+}
+
+// Keep backward compatibility alias
+function buildPricingCard() {
+  return buildPlansCard();
 }
 
 // ---- Keyword Auto-Reply Responses ----
@@ -6275,6 +6410,18 @@ const KEYWORD_REPLIES = {
   '傳統比較': {
     tags: [],
     messages: [buildTraditionalVsSmartCard()]
+  },
+  '方案': {
+    tags: ['業主_評估方案'],
+    messages: [buildPricingCard()]
+  },
+  'Demo': {
+    tags: ['B2B_Demo預約'],
+    messages: [{ type: 'text', text: '🎯 感謝你想預約 Demo！\n\n請提供以下資訊，我們會在一個工作天內安排：\n\n1️⃣ 您的姓名\n2️⃣ 聯絡電話\n3️⃣ 目前經營狀況（新開店/已有店面/連鎖品牌）\n4️⃣ 門市數量\n5️⃣ 方便的時間\n\n或直接撥打 ' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+  },
+  '報價': {
+    tags: ['B2B_報價需求'],
+    messages: [{ type: 'text', text: '💼 感謝你的報價需求！\n\n為了提供最精準的報價，請提供以下資訊：\n\n1️⃣ 您的姓名 / 公司名稱\n2️⃣ 聯絡電話\n3️⃣ 門市數量與地點\n4️⃣ 目前機台數量與品牌\n5️⃣ 需要的客製化功能\n6️⃣ 預計導入時間\n\n或直接撥打 ' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL + '\n🌐 ' + OFFICIAL_WEBSITE }]
   },
 
   // === Customer keywords ===
@@ -6398,8 +6545,14 @@ const FUZZY_MAP = [
   { keywords: ['區域', '地點', '選址'], reply: '區域評估' },
   { keywords: ['成功案例', '案例'], reply: '成功案例' },
   { keywords: ['傳統', '比較', '差別'], reply: '傳統比較' },
-  // Customer - pricing
-  { keywords: ['價格', '多少錢', '費用', '收費'], reply: '價格' },
+  // B2B - pricing plans
+  { keywords: ['方案', '價格', '費用', '多少錢', '月租', '年租', '訂閱', '系統費用'], reply: '方案' },
+  // B2B - demo
+  { keywords: ['Demo', 'demo', '展示', '預約', '試用', '預約Demo'], reply: 'Demo' },
+  // B2B - quote
+  { keywords: ['報價', '客製', '客製化', '買斷'], reply: '報價' },
+  // Customer - pricing (use more specific terms to avoid overlap with B2B '方案')
+  { keywords: ['洗衣價格', '洗衣多少錢', '洗一次', '收費', '洗衣費用'], reply: '價格' },
   // Customer - topup
   { keywords: ['儲值', '加值', '充值'], reply: '儲值' },
   // Customer - promotions
@@ -6487,10 +6640,23 @@ async function handlePostback(event, userId) {
       await lineReply(event.replyToken, msgs);
       break;
     }
+    case 'welcome_business': {
+      await addUserTag(userId, 'B2B_興趣');
+      await removeUserTag(userId, '新好友');
+      const bizMsgs = buildBusinessWelcomeReply();
+      await lineReply(event.replyToken, bizMsgs);
+      break;
+    }
+    case 'show_plans': {
+      await addUserTag(userId, 'B2B_看方案');
+      await lineReply(event.replyToken, [buildPlansCard()]);
+      break;
+    }
     case 'welcome_franchise': {
-      await addUserTag(userId, '加盟_興趣');
+      await addUserTag(userId, '業主_興趣');
       await removeUserTag(userId, '新好友');
       const msgs = buildFranchiseWelcomeReply();
+      msgs.push(buildFranchiseSegmentReply());
       await lineReply(event.replyToken, msgs);
       break;
     }
