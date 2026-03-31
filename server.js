@@ -263,52 +263,56 @@ function buildSupportFooterButtons(supportUrl, supportPhone) {
 function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, discount, finalAmount, orderId, paymentMethod, minutes, supportUrl, supportPhone, groupId, storeId }) {
   return {
     type: 'bubble',
+    styles: {
+      body: { backgroundColor: '#0D0D1A' },
+      footer: { backgroundColor: '#0D0D1A', separator: false }
+    },
     body: {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: '收據', color: GREEN, size: 'sm', weight: 'bold' },
-        { type: 'text', text: `${storeName || '雲管家'}`, size: 'lg', weight: 'bold' },
-        { type: 'text', text: machineName || '', color: '#888888', size: 'sm' },
-        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: '✅ 付款成功', color: '#4ADE80', size: 'sm', weight: 'bold' },
+        { type: 'text', text: `${storeName || '雲管家'}`, size: 'lg', weight: 'bold', color: '#E5B94C' },
+        { type: 'text', text: machineName || '', color: '#999999', size: 'sm' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'lg' },
         { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-          { type: 'text', text: modeName || '洗衣+烘乾(標準)', flex: 5, size: 'md', weight: 'bold' },
-          { type: 'text', text: `$ ${amount || 0}`, flex: 3, size: 'md', align: 'end' },
+          { type: 'text', text: modeName || '洗衣+烘乾(標準)', flex: 5, size: 'md', weight: 'bold', color: '#E0E0E0' },
+          { type: 'text', text: `$ ${amount || 0}`, flex: 3, size: 'md', align: 'end', color: '#E0E0E0' },
         ]},
         { type: 'box', layout: 'horizontal', contents: [
-          { type: 'text', text: '使用店家點數折抵', flex: 5, size: 'sm', color: GREEN },
-          { type: 'text', text: `-${discount || 0}`, flex: 3, size: 'sm', align: 'end', color: GREEN },
+          { type: 'text', text: '使用店家點數折抵', flex: 5, size: 'sm', color: '#4ADE80' },
+          { type: 'text', text: `-${discount || 0}`, flex: 3, size: 'sm', align: 'end', color: '#4ADE80' },
         ]},
-        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
-          { type: 'text', text: '付款金額', flex: 5, size: 'md', weight: 'bold' },
-          { type: 'text', text: `NT $ ${finalAmount || amount || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: GREEN },
+          { type: 'text', text: '付款金額', flex: 5, size: 'md', weight: 'bold', color: '#FFFFFF' },
+          { type: 'text', text: `NT $ ${finalAmount || amount || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#E5B94C' },
         ]},
-        { type: 'separator', margin: 'lg' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'lg' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '訂單編號', size: 'xs', color: '#AAAAAA', flex: 3 },
-            { type: 'text', text: `#${orderId || '---'}`, size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
+            { type: 'text', text: '訂單編號', size: 'xs', color: '#777777', flex: 3 },
+            { type: 'text', text: `#${orderId || '---'}`, size: 'xs', color: '#999999', flex: 5, align: 'end' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '交易時間', size: 'xs', color: '#AAAAAA', flex: 3 },
-            { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
+            { type: 'text', text: '交易時間', size: 'xs', color: '#777777', flex: 3 },
+            { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#999999', flex: 5, align: 'end' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '付款方式', size: 'xs', color: '#AAAAAA', flex: 3 },
-            { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#AAAAAA', flex: 5, align: 'end' },
+            { type: 'text', text: '付款方式', size: 'xs', color: '#777777', flex: 3 },
+            { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#999999', flex: 5, align: 'end' },
           ]},
         ]},
-        { type: 'separator', margin: 'md' },
-        { type: 'box', layout: 'horizontal', margin: 'md', contents: [
-          { type: 'text', text: `預計 ${minutes || 65} 分鐘完成`, size: 'sm', color: RED, weight: 'bold' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '10px', backgroundColor: '#1A1A3A', cornerRadius: '8px', contents: [
+          { type: 'text', text: `⏱ 預計 ${minutes || 65} 分鐘完成`, size: 'sm', color: '#F87171', weight: 'bold' },
         ]},
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}&store=${storeId || ''}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'link', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}&store=${storeId || ''}` : LIFF_WASH }, style: 'primary', color: '#E5B94C', height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'link', color: '#E5B94C', height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -319,33 +323,37 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPho
   const machineStatusUrl = groupId ? `${LIFF_WASH}&group=${groupId}&store=${storeId || ''}` : LIFF_WASH;
   return {
     type: 'bubble',
+    styles: {
+      body: { backgroundColor: '#0D0D1A' },
+      footer: { backgroundColor: '#0D0D1A', separator: false }
+    },
     body: {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'text', text: '!', size: 'xxl', color: '#E67E22', weight: 'bold' },
-          { type: 'text', text: '洗衣完成', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
+          { type: 'text', text: '🎉', size: 'xxl' },
+          { type: 'text', text: '洗衣完成', size: 'lg', weight: 'bold', color: '#E5B94C', gravity: 'center' },
         ]},
-        { type: 'separator', margin: 'lg' },
-        { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！！', size: 'md', wrap: true, margin: 'lg' },
-        { type: 'separator', margin: 'lg' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'lg' },
+        { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！', size: 'md', wrap: true, margin: 'lg', color: '#E0E0E0' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'lg' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
-            { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
+            { type: 'text', text: '門市', size: 'sm', color: '#777777', flex: 2 },
+            { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold', color: '#FFFFFF' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
-            { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
+            { type: 'text', text: '機器', size: 'sm', color: '#777777', flex: 2 },
+            { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end', color: '#CCCCCC' },
           ]},
         ]},
-        { type: 'text', text: '提醒：本訊息內容由店家發送。', size: 'xs', color: '#AAAAAA', margin: 'lg' },
+        { type: 'text', text: '提醒：本訊息內容由店家發送。', size: 'xs', color: '#666666', margin: 'lg' },
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看機器狀態', uri: machineStatusUrl }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看機器狀態', uri: machineStatusUrl }, style: 'primary', color: '#E5B94C', height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -355,31 +363,35 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPho
 function buildTopupFlexMessage({ groupName, amount, balance, supportUrl, supportPhone }) {
   return {
     type: 'bubble',
+    styles: {
+      body: { backgroundColor: '#0D0D1A' },
+      footer: { backgroundColor: '#0D0D1A', separator: false }
+    },
     body: {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
-        { type: 'text', text: '儲值成功', color: GREEN, size: 'sm', weight: 'bold' },
-        { type: 'text', text: groupName || '雲管家', size: 'lg', weight: 'bold' },
-        { type: 'separator', margin: 'md' },
+        { type: 'text', text: '💰 儲值成功', color: '#4ADE80', size: 'sm', weight: 'bold' },
+        { type: 'text', text: groupName || '雲管家', size: 'lg', weight: 'bold', color: '#E5B94C' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
-          { type: 'text', text: '儲值金額', flex: 3, size: 'md' },
-          { type: 'text', text: `+NT$ ${amount}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: GREEN },
+          { type: 'text', text: '儲值金額', flex: 3, size: 'md', color: '#E0E0E0' },
+          { type: 'text', text: `+NT$ ${amount}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#4ADE80' },
         ]},
-        { type: 'separator', margin: 'md' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
-          { type: 'text', text: '目前餘額', flex: 3, size: 'md', weight: 'bold' },
-          { type: 'text', text: `NT$ ${balance || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold' },
+          { type: 'text', text: '目前餘額', flex: 3, size: 'md', weight: 'bold', color: '#FFFFFF' },
+          { type: 'text', text: `NT$ ${balance || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#E5B94C' },
         ]},
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
-          { type: 'text', text: '交易時間', size: 'xs', color: '#AAA', flex: 3 },
-          { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#AAA', flex: 5, align: 'end' },
+          { type: 'text', text: '交易時間', size: 'xs', color: '#777777', flex: 3 },
+          { type: 'text', text: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), size: 'xs', color: '#999999', flex: 5, align: 'end' },
         ]},
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '查看會員點數', uri: LIFF_PROFILE }, style: 'primary', color: '#E5B94C', height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -389,35 +401,39 @@ function buildTopupFlexMessage({ groupName, amount, balance, supportUrl, support
 function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUrl, supportPhone, groupId, storeId) {
   return {
     type: 'bubble',
+    styles: {
+      body: { backgroundColor: '#0D0D1A' },
+      footer: { backgroundColor: '#0D0D1A', separator: false }
+    },
     body: {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'box', layout: 'horizontal', spacing: 'md', contents: [
-          { type: 'text', text: '!', size: 'xxl', color: '#E67E22', weight: 'bold' },
-          { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E67E22', gravity: 'center' },
+          { type: 'text', text: '⏰', size: 'xxl' },
+          { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E5B94C', gravity: 'center' },
         ]},
-        { type: 'separator', margin: 'md' },
-        { type: 'text', text: '您的洗衣即將完成，可以準備前往取衣了！', size: 'md', wrap: true, margin: 'md' },
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+        { type: 'text', text: '您的洗衣即將完成，可以準備前往取衣了！', size: 'md', wrap: true, margin: 'md', color: '#E0E0E0' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '門市', size: 'sm', color: '#888888', flex: 2 },
-            { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold' },
+            { type: 'text', text: '門市', size: 'sm', color: '#777777', flex: 2 },
+            { type: 'text', text: storeName || '門市', size: 'sm', flex: 3, align: 'end', weight: 'bold', color: '#FFFFFF' },
           ]},
           { type: 'box', layout: 'horizontal', contents: [
-            { type: 'text', text: '機器', size: 'sm', color: '#888888', flex: 2 },
-            { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end' },
+            { type: 'text', text: '機器', size: 'sm', color: '#777777', flex: 2 },
+            { type: 'text', text: machineName || '機器', size: 'sm', flex: 3, align: 'end', color: '#CCCCCC' },
           ]},
         ]},
-        { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '12px', backgroundColor: '#FFF3CD', cornerRadius: '8px', contents: [
-          { type: 'text', text: '剩餘時間', size: 'sm', color: '#856404', flex: 2, weight: 'bold' },
-          { type: 'text', text: `約 ${remainMin} 分鐘`, size: 'lg', color: '#856404', flex: 3, align: 'end', weight: 'bold' },
+        { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '12px', backgroundColor: '#1A1A3A', cornerRadius: '8px', contents: [
+          { type: 'text', text: '⏱ 剩餘時間', size: 'sm', color: '#E5B94C', flex: 2, weight: 'bold' },
+          { type: 'text', text: `約 ${remainMin} 分鐘`, size: 'lg', color: '#F87171', flex: 3, align: 'end', weight: 'bold' },
         ]},
       ]
     },
     footer: {
       type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
       contents: [
-        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}&store=${storeId || ''}` : LIFF_WASH }, style: 'primary', color: BRAND_GOLD, height: 'sm' },
+        { type: 'button', action: { type: 'uri', label: '運轉剩餘時間', uri: groupId ? `${LIFF_WASH}&group=${groupId}&store=${storeId || ''}` : LIFF_WASH }, style: 'primary', color: '#E5B94C', height: 'sm' },
         ...buildSupportFooterButtons(supportUrl, supportPhone),
       ]
     }
@@ -6197,8 +6213,8 @@ function buildStoreListCarousel() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '10px',
       contents: [
-        { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'uri', label: '查看空機', uri: LIFF_WASH } },
-        { type: 'button', style: 'link', height: 'sm', action: { type: 'uri', label: '導航前往', uri: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.addr)}` } }
+        { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看空機', uri: LIFF_WASH } },
+        { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '導航前往', uri: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.addr)}` } }
       ]
     }
   }));
