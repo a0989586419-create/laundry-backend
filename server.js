@@ -5311,6 +5311,57 @@ async function initDB() {
     await db.query(`CREATE INDEX IF NOT EXISTS idx_user_store_bindings_user ON user_store_bindings (line_user_id)`).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_user_store_bindings_store ON user_store_bindings (store_id)`).catch(() => {});
 
+    // Customer service sessions table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS customer_service_sessions (
+        id SERIAL PRIMARY KEY,
+        customer_line_id VARCHAR(100) NOT NULL,
+        store_id VARCHAR(20) NOT NULL,
+        store_admin_line_id VARCHAR(100),
+        status VARCHAR(20) DEFAULT 'active',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        ended_at TIMESTAMPTZ
+      )
+    `).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_cs_sessions_customer ON customer_service_sessions (customer_line_id, status)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_cs_sessions_admin ON customer_service_sessions (store_admin_line_id, status)`).catch(() => {});
+
+    // B2B inquiries table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS b2b_inquiries (
+        id SERIAL PRIMARY KEY,
+        line_user_id VARCHAR(100) NOT NULL,
+        display_name VARCHAR(100),
+        contact_name VARCHAR(100),
+        phone VARCHAR(30),
+        plan_type VARCHAR(30),
+        has_store BOOLEAN,
+        store_name VARCHAR(200),
+        store_address VARCHAR(500),
+        machine_count INT,
+        machine_brand VARCHAR(200),
+        has_protocol BOOLEAN,
+        protocol_info TEXT,
+        store_size VARCHAR(50),
+        monthly_revenue VARCHAR(50),
+        timeline VARCHAR(100),
+        notes TEXT,
+        status VARCHAR(20) DEFAULT 'new',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Survey progress table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS survey_progress (
+        line_user_id VARCHAR(100) PRIMARY KEY,
+        current_step VARCHAR(30) DEFAULT 'name',
+        data JSONB DEFAULT '{}',
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
@@ -5427,6 +5478,17 @@ async function lineReply(replyToken, messages) {
     if (!res.ok) console.error('[LINE Reply] Error:', await res.json().catch(() => ({})));
     return res.ok;
   } catch (e) { console.error('[LINE Reply] Failed:', e.message); return false; }
+}
+
+// Get LINE user profile
+async function getLineProfile(userId) {
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+      headers: { 'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch(e) { return null; }
 }
 
 // ---- Rich Menu Per-Audience Assignment ----
@@ -6425,7 +6487,8 @@ function buildPlansCard() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
-        { type: 'button', style: 'primary', color: '#3A3A8C', action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: '#3A3A8C', action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } },
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
       ]
     }
   };
@@ -6463,7 +6526,8 @@ function buildPlansCard() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
-        { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } },
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
       ]
     }
   };
@@ -6498,7 +6562,8 @@ function buildPlansCard() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
-        { type: 'button', style: 'primary', color: '#5B5BD6', action: { type: 'uri', label: '預約評估', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: '#5B5BD6', action: { type: 'uri', label: '預約評估', uri: LINE_OA_CHAT_URL } },
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
       ]
     }
   };
@@ -6634,10 +6699,7 @@ const KEYWORD_REPLIES = {
     tags: [],
     messages: [buildStoreListCarousel()]
   },
-  '客服': {
-    tags: [],
-    messages: [{ type: 'text', text: '👋 需要真人客服嗎？\n\n我們的客服團隊會在上班時間（09:00-18:00）盡快回覆您。\n\n請直接在這裡留言描述您的問題，或點選下方連結：\n👉 ' + LINE_OA_CHAT_URL + '\n\n緊急問題請撥打店內公告電話。' }]
-  },
+  // '客服' is now handled as special logic in handleTextMessage (customer service forwarding system)
   '會員': {
     tags: [],
     messages: [buildMemberLevelCard()]
@@ -6767,7 +6829,7 @@ const FUZZY_MAP = [
   // Customer - stores
   { keywords: ['地址', '在哪', '怎麼去', '門市', '哪裡'], reply: '門市' },
   // Customer - support
-  { keywords: ['客服', '真人', '人工', '找人'], reply: '客服' },
+  { keywords: ['客服', '真人', '人工', '找人'], reply: '__customer_service__' },
   // Customer - membership
   { keywords: ['會員', '等級', '點數', '積分'], reply: '會員' },
   // Customer - tips
@@ -6989,6 +7051,133 @@ async function handlePostback(event, userId) {
       await lineReply(event.replyToken, [{ type: 'text', text: '很高興你已經在洗衣業了！\n\n雲管家可以幫你現有的店升級智慧系統，不需要換機器。\n\n我們會安排專人為你做免費的系統 Demo 和報價。\n\n請提供：\n1️⃣ 你的店名和地址\n2️⃣ 目前機器數量和品牌\n3️⃣ 方便聯繫的時間\n\n直接回覆即可！' }]);
       break;
     }
+    case 'start_survey': {
+      // Check if already in progress
+      const existing = await db.query('SELECT * FROM survey_progress WHERE line_user_id = $1', [userId]);
+      if (existing.rows.length > 0) {
+        await db.query('DELETE FROM survey_progress WHERE line_user_id = $1', [userId]);
+      }
+
+      await db.query(
+        `INSERT INTO survey_progress (line_user_id, current_step, data, started_at, updated_at) VALUES ($1, 'name', '{}', NOW(), NOW())`,
+        [userId]
+      );
+
+      await lineReply(event.replyToken, [{
+        type: 'flex', altText: '雲管家諮詢表',
+        contents: {
+          type: 'bubble',
+          styles: { body: { backgroundColor: '#0D0D1A' } },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+            contents: [
+              { type: 'text', text: '📋 雲管家諮詢表', color: '#E5B94C', weight: 'bold', size: 'lg' },
+              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+              { type: 'text', text: '我們需要了解您的基本資訊，以便提供最適合的方案。', color: '#E0E0E0', size: 'sm', wrap: true, margin: 'md' },
+              { type: 'text', text: '📝 共 8-10 個問題，約 2 分鐘完成', color: '#999999', size: 'xs', margin: 'sm' },
+              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+              { type: 'text', text: '👤 請輸入您的姓名：', color: '#FFFFFF', weight: 'bold', size: 'md', margin: 'md' }
+            ]
+          }
+        }
+      }]);
+      break;
+    }
+    case 'survey_answer': {
+      const answerStep = data.get('step');
+      const answerValue = data.get('value');
+
+      const surveyRow = await db.query('SELECT * FROM survey_progress WHERE line_user_id = $1', [userId]);
+      if (surveyRow.rows.length === 0) {
+        await lineReply(event.replyToken, [{ type: 'text', text: '⚠️ 問卷已過期，請重新開始。輸入「方案」查看方案。' }]);
+        break;
+      }
+
+      const surveyData = surveyRow.rows[0].data || {};
+      let nextStep = null;
+      let nextQuestion = null;
+
+      switch (answerStep) {
+        case 'plan': {
+          const planLabels = { monthly: '月租方案', annual: '年租方案', custom: '客製化', undecided: '未決定' };
+          surveyData.plan_type = planLabels[answerValue] || answerValue;
+          nextStep = 'has_store';
+          nextQuestion = '🏪 您目前是否已有洗衣店？\n\n請回覆「有」或「沒有」';
+          break;
+        }
+        case 'has_protocol': {
+          if (answerValue === 'yes_know') {
+            surveyData.has_protocol = true;
+            nextStep = 'protocol_info';
+            nextQuestion = '📡 請輸入通訊協議/控制板的資訊：\n（型號、品牌、介面類型等）';
+          } else if (answerValue === 'yes_unknown') {
+            surveyData.has_protocol = true;
+            surveyData.protocol_info = '有，但不確定型號';
+            nextStep = 'timeline';
+          } else {
+            surveyData.has_protocol = false;
+            nextStep = 'timeline';
+          }
+          break;
+        }
+        case 'store_size': {
+          const sizeLabels = { small: '小型(3-5台)', medium: '中型(6-10台)', large: '大型(11+台)' };
+          surveyData.store_size = sizeLabels[answerValue] || answerValue;
+          nextStep = 'machine_brand';
+          nextQuestion = '🏭 預計使用什麼品牌/型號的機器？\n（例如：海爾、LG、自組機、還沒決定 等）';
+          break;
+        }
+        case 'timeline': {
+          const timeLabels = { '1month': '1個月內', '1-3months': '1-3個月', '3months+': '3個月以上', exploring: '只是先了解' };
+          surveyData.timeline = timeLabels[answerValue] || answerValue;
+          nextStep = 'notes';
+          nextQuestion = '💬 還有什麼想告訴我們的嗎？\n（特殊需求、問題等，沒有請輸入「無」）';
+          break;
+        }
+        default:
+          break;
+      }
+
+      if (nextStep) {
+        await db.query(
+          'UPDATE survey_progress SET current_step = $1, data = $2, updated_at = NOW() WHERE line_user_id = $3',
+          [nextStep, JSON.stringify(surveyData), userId]
+        );
+      }
+
+      // If nextStep needs postback buttons (timeline from has_protocol)
+      if (nextStep === 'timeline' && answerStep !== 'timeline') {
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '預計上線時間',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+            body: { type: 'box', layout: 'vertical', paddingAll: '16px', contents: [{ type: 'text', text: '⏱ 預計何時要上線？', color: '#E5B94C', weight: 'bold', size: 'md' }] },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '1 個月內', data: 'action=survey_answer&step=timeline&value=1month', displayText: '1個月內' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '1-3 個月', data: 'action=survey_answer&step=timeline&value=1-3months', displayText: '1-3個月' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '3 個月以上', data: 'action=survey_answer&step=timeline&value=3months+', displayText: '3個月以上' } },
+                { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '只是先了解', data: 'action=survey_answer&step=timeline&value=exploring', displayText: '先了解' } }
+              ]
+            }
+          }
+        }]);
+        break;
+      }
+
+      // If nextStep needs store_size buttons (from store_size answer to machine_brand)
+      if (nextStep === 'machine_brand' && answerStep === 'store_size') {
+        await lineReply(event.replyToken, [{ type: 'text', text: nextQuestion }]);
+        break;
+      }
+
+      if (nextQuestion) {
+        await lineReply(event.replyToken, [{ type: 'text', text: nextQuestion }]);
+      }
+      break;
+    }
     default:
       console.log(`[Webhook] Unknown postback action: ${action}`);
   }
@@ -7008,6 +7197,63 @@ const GREETINGS = ['你好', '哈囉', 'hi', 'hello', '嗨', '安安', '早安',
 // Thank-you keywords
 const THANKS = ['謝謝', '感謝', '感恩', 'thanks', 'thx', '3q', 'thank you', '多謝'];
 
+// === Customer Service Trigger Handler ===
+async function handleCustomerServiceTrigger(event, userId) {
+  try {
+    // Find user's most recently bound store
+    const boundStore = await db.query(
+      `SELECT usb.store_id, s.name, s.group_id FROM user_store_bindings usb
+       JOIN stores s ON usb.store_id = s.id
+       WHERE usb.line_user_id = $1 ORDER BY usb.bound_at DESC LIMIT 1`,
+      [userId]
+    );
+
+    if (boundStore.rows.length === 0) {
+      await lineReply(event.replyToken, [{ type: 'text', text: '⚠️ 您尚未綁定任何門市。\n請先掃描門市 QR Code 綁定後再使用客服功能。' }]);
+      return;
+    }
+
+    const storeInfo = boundStore.rows[0];
+
+    // Find store admin for this store's group
+    const storeAdmin = await db.query(
+      `SELECT line_user_id FROM user_roles WHERE group_id = $1 AND role = 'store_admin' LIMIT 1`,
+      [storeInfo.group_id]
+    );
+    const adminLineId = storeAdmin.rows.length > 0 ? storeAdmin.rows[0].line_user_id : null;
+
+    // Create customer service session
+    await db.query(
+      `INSERT INTO customer_service_sessions (customer_line_id, store_id, store_admin_line_id, status, created_at)
+       VALUES ($1, $2, $3, 'active', NOW())`,
+      [userId, storeInfo.store_id, adminLineId]
+    );
+
+    await lineReply(event.replyToken, [{
+      type: 'flex', altText: '已連線門市客服',
+      contents: {
+        type: 'bubble',
+        styles: { body: { backgroundColor: '#0D0D1A' } },
+        body: {
+          type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+          contents: [
+            { type: 'text', text: '💬 門市客服', color: '#E5B94C', weight: 'bold', size: 'lg' },
+            { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+            { type: 'text', text: `已連線至 ${storeInfo.name} 客服`, color: '#FFFFFF', size: 'md', margin: 'md', wrap: true },
+            { type: 'text', text: '請直接輸入您的問題，我們會盡快為您回覆。', color: '#999999', size: 'sm', margin: 'sm', wrap: true },
+            { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+            { type: 'text', text: '⏱ 客服對話 30 分鐘內有效', color: '#666666', size: 'xxs', margin: 'sm' },
+            { type: 'text', text: '💡 輸入「結束客服」可結束對話', color: '#666666', size: 'xxs' }
+          ]
+        }
+      }
+    }]);
+  } catch (e) {
+    console.error('[CS Trigger]', e.message);
+    await lineReply(event.replyToken, [{ type: 'text', text: '⚠️ 客服系統暫時無法使用，請稍後再試。' }]);
+  }
+}
+
 async function handleTextMessage(event, userId, text) {
   console.log(`[Webhook] Message: ${userId} → "${text}"`);
 
@@ -7015,6 +7261,351 @@ async function handleTextMessage(event, userId, text) {
   await trackInteraction(userId, 'message');
 
   const lowerText = text.toLowerCase();
+
+  // === (1) Check if user is in active customer service session ===
+  try {
+    const activeCS = await db.query(
+      `SELECT cs.*, s.name as store_name FROM customer_service_sessions cs
+       JOIN stores s ON cs.store_id = s.id
+       WHERE cs.customer_line_id = $1 AND cs.status = 'active'
+       AND cs.created_at > NOW() - INTERVAL '30 minutes'
+       ORDER BY cs.created_at DESC LIMIT 1`,
+      [userId]
+    );
+
+    if (activeCS.rows.length > 0) {
+      const session = activeCS.rows[0];
+
+      // Check if user wants to end
+      if (['結束客服', '結束', '離開客服'].includes(text.trim())) {
+        await db.query(`UPDATE customer_service_sessions SET status='ended', ended_at=NOW() WHERE id=$1`, [session.id]);
+        await lineReply(event.replyToken, [{ type: 'text', text: `✅ 客服對話已結束。\n感謝您的諮詢，如需再次聯繫門市客服，請輸入「客服」。` }]);
+        return;
+      }
+
+      // Forward message to store admin
+      if (session.store_admin_line_id) {
+        const profile = await getLineProfile(userId);
+        const customerName = profile?.displayName || '顧客';
+        await sendLinePush(session.store_admin_line_id, [{
+          type: 'flex', altText: `${session.store_name} 客服訊息`,
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'text', text: `💬 ${session.store_name} 客服`, color: '#E5B94C', weight: 'bold', size: 'sm' },
+                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'sm' },
+                { type: 'text', text: `來自：${customerName}`, color: '#999999', size: 'xs', margin: 'sm' },
+                { type: 'text', text: text, color: '#FFFFFF', size: 'md', wrap: true, margin: 'md' },
+                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+                { type: 'text', text: `回覆方式：@回覆 ${customerName} 您的回覆內容`, color: '#666666', size: 'xxs', wrap: true, margin: 'sm' }
+              ]
+            }
+          }
+        }]);
+        await lineReply(event.replyToken, [{ type: 'text', text: `📨 訊息已轉發給 ${session.store_name} 客服，請稍候回覆。\n\n輸入「結束客服」可結束對話。` }]);
+      } else {
+        await lineReply(event.replyToken, [{ type: 'text', text: `⚠️ 此門市尚未設定客服人員，請直接撥打門市電話。\n\n輸入「結束客服」可結束對話。` }]);
+      }
+      return;
+    }
+  } catch (e) { console.error('[CS Session Check]', e.message); }
+
+  // === (2) Check if store admin is replying to customer ===
+  if (text.startsWith('@回覆 ') || text.startsWith('@回覆')) {
+    try {
+      const roleInfo = await getUserRole(userId);
+      if (roleInfo.role === 'store_admin' || roleInfo.role === 'super_admin') {
+        const match = text.match(/^@回覆\s+(\S+)\s+([\s\S]+)/);
+        if (match) {
+          const targetName = match[1];
+          const replyContent = match[2].trim();
+
+          const adminSession = await db.query(
+            `SELECT cs.*, s.name as store_name FROM customer_service_sessions cs
+             JOIN stores s ON cs.store_id = s.id
+             WHERE cs.store_admin_line_id = $1 AND cs.status = 'active'
+             AND cs.created_at > NOW() - INTERVAL '30 minutes'
+             ORDER BY cs.created_at DESC LIMIT 1`,
+            [userId]
+          );
+
+          if (adminSession.rows.length > 0) {
+            const sess = adminSession.rows[0];
+            await sendLinePush(sess.customer_line_id, [{
+              type: 'flex', altText: `${sess.store_name} 客服回覆`,
+              contents: {
+                type: 'bubble',
+                styles: { body: { backgroundColor: '#0D0D1A' } },
+                body: {
+                  type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+                  contents: [
+                    { type: 'text', text: `💬 ${sess.store_name} 客服回覆`, color: '#4CAF50', weight: 'bold', size: 'sm' },
+                    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'sm' },
+                    { type: 'text', text: replyContent, color: '#FFFFFF', size: 'md', wrap: true, margin: 'md' }
+                  ]
+                }
+              }
+            }]);
+            // Refresh session timeout
+            await db.query(`UPDATE customer_service_sessions SET created_at=NOW() WHERE id=$1`, [sess.id]);
+            await lineReply(event.replyToken, [{ type: 'text', text: `✅ 已回覆顧客「${targetName}」` }]);
+          } else {
+            await lineReply(event.replyToken, [{ type: 'text', text: '⚠️ 沒有找到進行中的客服對話。' }]);
+          }
+          return;
+        }
+      }
+    } catch (e) { console.error('[CS Admin Reply]', e.message); }
+  }
+
+  // === (3) Check if user is in survey progress ===
+  try {
+    const surveyProgress = await db.query(
+      `SELECT * FROM survey_progress WHERE line_user_id = $1 AND updated_at > NOW() - INTERVAL '1 hour'`,
+      [userId]
+    );
+
+    if (surveyProgress.rows.length > 0) {
+      const progress = surveyProgress.rows[0];
+      const surveyData = progress.data || {};
+      const step = progress.current_step;
+      const userInput = text.trim();
+
+      let nextStep = null;
+      let nextQuestion = null;
+
+      switch (step) {
+        case 'name':
+          surveyData.contact_name = userInput;
+          nextStep = 'phone';
+          nextQuestion = '📱 請輸入您的聯絡電話：';
+          break;
+        case 'phone':
+          surveyData.phone = userInput;
+          nextStep = 'plan';
+          nextQuestion = null;
+          break;
+        case 'has_store':
+          if (userInput === '是' || userInput === '有') {
+            surveyData.has_store = true;
+            nextStep = 'store_name';
+            nextQuestion = '🏪 請輸入您洗衣店的名稱：';
+          } else {
+            surveyData.has_store = false;
+            nextStep = 'store_size';
+            nextQuestion = null;
+          }
+          break;
+        case 'store_name':
+          surveyData.store_name = userInput;
+          nextStep = 'store_address';
+          nextQuestion = '📍 請輸入洗衣店的地址：';
+          break;
+        case 'store_address':
+          surveyData.store_address = userInput;
+          nextStep = 'machine_count';
+          nextQuestion = '🔢 目前有幾台機器？（輸入數字）';
+          break;
+        case 'machine_count':
+          surveyData.machine_count = parseInt(userInput) || 0;
+          nextStep = 'machine_brand';
+          nextQuestion = '🏭 機器品牌/型號？（例如：海爾、LG、自組機 等）';
+          break;
+        case 'machine_brand':
+          surveyData.machine_brand = userInput;
+          nextStep = 'has_protocol';
+          nextQuestion = null;
+          break;
+        case 'protocol_info':
+          surveyData.protocol_info = userInput;
+          nextStep = 'timeline';
+          nextQuestion = null;
+          break;
+        case 'notes':
+          surveyData.notes = userInput;
+          nextStep = 'done';
+          break;
+        default:
+          nextStep = 'done';
+          break;
+      }
+
+      if (nextStep === 'done') {
+        // Save completed survey
+        const profile = await getLineProfile(userId);
+        await db.query(
+          `INSERT INTO b2b_inquiries (line_user_id, display_name, contact_name, phone, plan_type, has_store, store_name, store_address, machine_count, machine_brand, has_protocol, protocol_info, store_size, timeline, notes, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'new',NOW())`,
+          [userId, profile?.displayName, surveyData.contact_name, surveyData.phone, surveyData.plan_type,
+           surveyData.has_store || false, surveyData.store_name, surveyData.store_address,
+           surveyData.machine_count, surveyData.machine_brand, surveyData.has_protocol || false,
+           surveyData.protocol_info, surveyData.store_size, surveyData.timeline, surveyData.notes]
+        );
+
+        await db.query('DELETE FROM survey_progress WHERE line_user_id = $1', [userId]);
+
+        // Notify super admin
+        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+        await sendLinePush(SUPER_ADMIN_ID, [{
+          type: 'flex', altText: '📋 新買家諮詢表',
+          contents: {
+            type: 'bubble',
+            styles: { header: { backgroundColor: '#1A1A3A' }, body: { backgroundColor: '#0D0D1A' } },
+            header: {
+              type: 'box', layout: 'vertical', paddingAll: '16px',
+              contents: [{ type: 'text', text: '📋 新買家諮詢表', color: '#E5B94C', weight: 'bold', size: 'lg' }]
+            },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'text', text: `👤 ${surveyData.contact_name || '未填'}`, color: '#FFFFFF', size: 'md' },
+                { type: 'text', text: `📱 ${surveyData.phone || '未填'}`, color: '#E0E0E0', size: 'sm' },
+                { type: 'text', text: `📦 方案：${surveyData.plan_type || '未選'}`, color: '#E0E0E0', size: 'sm' },
+                { type: 'text', text: `🏪 ${surveyData.has_store ? '有店' : '尚無店面'}：${surveyData.store_name || '-'}`, color: '#E0E0E0', size: 'sm', wrap: true },
+                { type: 'text', text: `📍 ${surveyData.store_address || '-'}`, color: '#999999', size: 'xs', wrap: true },
+                { type: 'text', text: `🔧 機器：${surveyData.machine_count || 0}台 ${surveyData.machine_brand || '-'}`, color: '#E0E0E0', size: 'sm', wrap: true },
+                { type: 'text', text: `📡 通訊協議：${surveyData.has_protocol ? surveyData.protocol_info || '有' : '無/不確定'}`, color: '#E0E0E0', size: 'sm', wrap: true },
+                { type: 'text', text: `⏱ 預計：${surveyData.timeline || '-'}`, color: '#E0E0E0', size: 'sm' },
+                { type: 'text', text: `💬 備註：${surveyData.notes || '-'}`, color: '#999999', size: 'xs', wrap: true },
+                { type: 'text', text: `LINE: ${profile?.displayName || userId}`, color: '#666666', size: 'xxs', margin: 'md' }
+              ]
+            }
+          }
+        }]);
+
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '感謝您填寫諮詢表！',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+              contents: [
+                { type: 'text', text: '✅ 諮詢表已送出', color: '#4CAF50', weight: 'bold', size: 'lg' },
+                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'md' },
+                { type: 'text', text: '感謝您的填寫！我們的顧問會在 1-2 個工作天內與您聯繫。', color: '#E0E0E0', size: 'sm', wrap: true, margin: 'md' },
+                { type: 'text', text: '如有急需，可直接聯繫：\n📞 0800-018-888\n📧 contact@cloudmonster.com.tw', color: '#999999', size: 'xs', wrap: true, margin: 'md' }
+              ]
+            }
+          }
+        }]);
+        return;
+      }
+
+      // Save progress and ask next question
+      await db.query(
+        `UPDATE survey_progress SET current_step = $1, data = $2, updated_at = NOW() WHERE line_user_id = $3`,
+        [nextStep, JSON.stringify(surveyData), userId]
+      );
+
+      // Questions that need postback buttons
+      if (nextStep === 'plan') {
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '請選擇方案',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px',
+              contents: [{ type: 'text', text: '📦 您感興趣的方案？', color: '#E5B94C', weight: 'bold', size: 'md' }]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '月租 NT$5,000/月', data: 'action=survey_answer&step=plan&value=monthly', displayText: '月租方案' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '年租 NT$50,000/年', data: 'action=survey_answer&step=plan&value=annual', displayText: '年租方案' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '客製化 / 買斷', data: 'action=survey_answer&step=plan&value=custom', displayText: '客製化方案' } },
+                { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '還沒決定', data: 'action=survey_answer&step=plan&value=undecided', displayText: '還沒決定' } }
+              ]
+            }
+          }
+        }]);
+        return;
+      }
+
+      if (nextStep === 'has_protocol') {
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '機器通訊協議',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px',
+              contents: [
+                { type: 'text', text: '📡 機器是否有通訊協議/控制板？', color: '#E5B94C', weight: 'bold', size: 'md' },
+                { type: 'text', text: '例如：Modbus RTU、RS485、觸控螢幕控制板 等', color: '#999999', size: 'xs', wrap: true, margin: 'sm' }
+              ]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '有，我知道型號', data: 'action=survey_answer&step=has_protocol&value=yes_know', displayText: '有通訊協議' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '有，但不確定型號', data: 'action=survey_answer&step=has_protocol&value=yes_unknown', displayText: '有但不確定' } },
+                { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '沒有 / 不清楚', data: 'action=survey_answer&step=has_protocol&value=no', displayText: '沒有通訊協議' } }
+              ]
+            }
+          }
+        }]);
+        return;
+      }
+
+      if (nextStep === 'store_size') {
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '預計店面規模',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px',
+              contents: [{ type: 'text', text: '📐 預計的店面規模？', color: '#E5B94C', weight: 'bold', size: 'md' }]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '小型（3-5台）', data: 'action=survey_answer&step=store_size&value=small', displayText: '小型 3-5台' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '中型（6-10台）', data: 'action=survey_answer&step=store_size&value=medium', displayText: '中型 6-10台' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '大型（11台以上）', data: 'action=survey_answer&step=store_size&value=large', displayText: '大型 11台以上' } }
+              ]
+            }
+          }
+        }]);
+        return;
+      }
+
+      if (nextStep === 'timeline') {
+        await lineReply(event.replyToken, [{
+          type: 'flex', altText: '預計上線時間',
+          contents: {
+            type: 'bubble',
+            styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '16px',
+              contents: [{ type: 'text', text: '⏱ 預計何時要上線？', color: '#E5B94C', weight: 'bold', size: 'md' }]
+            },
+            footer: {
+              type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+              contents: [
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '1 個月內', data: 'action=survey_answer&step=timeline&value=1month', displayText: '1個月內' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '1-3 個月', data: 'action=survey_answer&step=timeline&value=1-3months', displayText: '1-3個月' } },
+                { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm', action: { type: 'postback', label: '3 個月以上', data: 'action=survey_answer&step=timeline&value=3months+', displayText: '3個月以上' } },
+                { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '只是先了解', data: 'action=survey_answer&step=timeline&value=exploring', displayText: '先了解' } }
+              ]
+            }
+          }
+        }]);
+        return;
+      }
+
+      // Text input question
+      if (nextQuestion) {
+        await lineReply(event.replyToken, [{ type: 'text', text: nextQuestion }]);
+      }
+      return;
+    }
+  } catch (e) { console.error('[Survey Check]', e.message); }
 
   // --- Greeting detection ---
   if (GREETINGS.some(g => lowerText.includes(g.toLowerCase()))) {
@@ -7059,6 +7650,11 @@ async function handleTextMessage(event, userId, text) {
   }
 
   // Check exact keyword match first
+  // Special handling for '客服' keyword (customer service forwarding)
+  if (text === '客服') {
+    await handleCustomerServiceTrigger(event, userId);
+    return;
+  }
   const entry = KEYWORD_REPLIES[text];
   if (entry) {
     for (const tag of (entry.tags || [])) await addUserTag(userId, tag);
@@ -7069,6 +7665,11 @@ async function handleTextMessage(event, userId, text) {
   // Fuzzy keyword matching
   for (const { keywords, reply } of FUZZY_MAP) {
     if (keywords.some(k => lowerText.includes(k.toLowerCase()))) {
+      // Special handling for customer service fuzzy match
+      if (reply === '__customer_service__') {
+        await handleCustomerServiceTrigger(event, userId);
+        return;
+      }
       const matched = KEYWORD_REPLIES[reply];
       if (matched) {
         for (const tag of (matched.tags || [])) await addUserTag(userId, tag);
@@ -7236,6 +7837,102 @@ app.delete('/api/user/tags', async (req, res) => {
   if (role.rows.length === 0) return res.status(403).json({ error: 'Admin only' });
   const ok = await removeUserTag(userId, tag);
   res.json({ success: ok });
+});
+
+// ===== Store QR Code Binding APIs =====
+
+// POST /api/user/bind-store - Bind user to a store via QR Code
+app.post('/api/user/bind-store', async (req, res) => {
+  const { lineUserId, storeId } = req.body;
+  if (!lineUserId || !storeId) return res.status(400).json({ error: 'lineUserId and storeId required' });
+
+  try {
+    // Verify store exists
+    const store = await db.query('SELECT id, name, group_id FROM stores WHERE id = $1', [storeId]);
+    if (store.rows.length === 0) return res.status(404).json({ error: 'Store not found' });
+
+    // Bind user to store
+    await db.query(
+      `INSERT INTO user_store_bindings (line_user_id, store_id, bound_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (line_user_id, store_id) DO UPDATE SET bound_at = NOW()`,
+      [lineUserId, storeId]
+    );
+
+    // Auto-tag as customer
+    await addUserTag(lineUserId, '顧客');
+
+    // Switch to B2C menu
+    await linkRichMenuToUser(lineUserId, 'b2c');
+
+    // Send welcome push with store name
+    const storeName = store.rows[0].name;
+    try {
+      await sendLinePush(lineUserId, [{
+        type: 'flex', altText: `已綁定 ${storeName}`,
+        contents: {
+          type: 'bubble',
+          styles: { body: { backgroundColor: '#0D0D1A' }, footer: { backgroundColor: '#0D0D1A', separator: false } },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '24px', spacing: 'md',
+            contents: [
+              { type: 'text', text: '✅ 門市綁定成功', color: '#4CAF50', weight: 'bold', size: 'lg' },
+              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#333355', margin: 'lg' },
+              { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+                { type: 'text', text: '綁定門市', size: 'sm', color: '#999999', flex: 3 },
+                { type: 'text', text: storeName, size: 'sm', color: '#FFFFFF', flex: 5, align: 'end', weight: 'bold' }
+              ]},
+              { type: 'text', text: '您現在可以使用以下功能：', size: 'sm', color: '#999999', margin: 'lg', wrap: true },
+              { type: 'text', text: '🔍 查空機  💰 線上付款  🔔 洗好通知', size: 'sm', color: '#E5B94C', margin: 'sm', wrap: true },
+              { type: 'text', text: '💬 輸入「客服」可聯繫門市客服', size: 'xs', color: '#999999', margin: 'lg', wrap: true }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+            contents: [
+              { type: 'button', style: 'primary', color: '#3A3A8C', height: 'sm',
+                action: { type: 'uri', label: '立即查空機', uri: `https://liff.line.me/2009552592-xkDKSJ1Y?tab=wash` } }
+            ]
+          }
+        }
+      }]);
+    } catch(e) { console.error('[Bind] Push error:', e.message); }
+
+    res.json({ success: true, storeName, storeId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/user/bound-stores - Get user's bound stores
+app.get('/api/user/bound-stores', async (req, res) => {
+  const lineUserId = req.query.lineUserId;
+  if (!lineUserId) return res.status(400).json({ error: 'lineUserId required' });
+  try {
+    const result = await db.query(
+      `SELECT usb.store_id, s.name as store_name, s.address, usb.bound_at
+       FROM user_store_bindings usb
+       JOIN stores s ON usb.store_id = s.id
+       WHERE usb.line_user_id = $1
+       ORDER BY usb.bound_at DESC`,
+      [lineUserId]
+    );
+    res.json({ stores: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/inquiries - List B2B inquiries
+app.get('/api/admin/inquiries', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM b2b_inquiries ORDER BY created_at DESC LIMIT 50`
+    );
+    res.json({ inquiries: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // List all tags with user count (admin analytics)
