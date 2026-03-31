@@ -7,6 +7,8 @@ const { v4: uuid } = require('uuid');
 const crypto = require('crypto');
 const https = require('https');
 
+const path = require('path');
+const fs = require('fs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
@@ -5188,6 +5190,22 @@ async function initDB() {
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_created_at ON push_logs (created_at)`).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_group_id ON push_logs (group_id)`).catch(() => {});
 
+    // Scheduled broadcasts table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+        id SERIAL PRIMARY KEY,
+        messages JSONB NOT NULL,
+        target_tags TEXT[],
+        exclude_tags TEXT[],
+        scheduled_at TIMESTAMPTZ NOT NULL,
+        status TEXT DEFAULT 'pending',
+        sent_count INT DEFAULT 0,
+        created_by TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        sent_at TIMESTAMPTZ
+      )
+    `).catch(() => {});
+
     // Store push balance & topup tables
     await db.query(`
       CREATE TABLE IF NOT EXISTS store_push_balance (
@@ -6620,6 +6638,27 @@ const FUZZY_MAP = [
   { keywords: ['空機', '有沒有位', '還有機器', '有位子'], reply: '空機' },
 ];
 
+// ===== Static Assets for LINE Imagemap =====
+// Serve imagemap images: GET /assets/:name/:width
+// LINE requires: baseUrl/240, baseUrl/300, baseUrl/460, baseUrl/700, baseUrl/1040
+app.get('/assets/:name/:width', (req, res) => {
+  const { name, width } = req.params;
+  const validWidths = ['240', '300', '460', '700', '1040'];
+  if (!validWidths.includes(width)) {
+    return res.status(400).json({ error: 'Invalid width. Valid: 240, 300, 460, 700, 1040' });
+  }
+  // Sanitize name to prevent path traversal
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');
+  const filePath = path.join(__dirname, 'public', 'assets', `${safeName}.png`);
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    fs.createReadStream(filePath).pipe(res);
+  } else {
+    res.status(404).json({ error: 'Asset not found' });
+  }
+});
+
 // ---- LINE Webhook Endpoint ----
 app.post('/api/line/webhook', async (req, res) => {
   // Verify signature
@@ -6746,11 +6785,69 @@ async function handlePostback(event, userId) {
   }
 }
 
+// Helper: get time-based greeting for Taiwan timezone (UTC+8)
+function getTimeGreeting() {
+  const now = new Date();
+  const h = (now.getUTCHours() + 8) % 24;
+  if (h >= 5 && h < 12) return '早安';
+  if (h >= 12 && h < 18) return '午安';
+  return '晚安';
+}
+
+// Greeting keywords
+const GREETINGS = ['你好', '哈囉', 'hi', 'hello', '嗨', '安安', '早安', '午安', '晚安', '嘿', 'hey'];
+// Thank-you keywords
+const THANKS = ['謝謝', '感謝', '感恩', 'thanks', 'thx', '3q', 'thank you', '多謝'];
+
 async function handleTextMessage(event, userId, text) {
   console.log(`[Webhook] Message: ${userId} → "${text}"`);
 
   // Track interaction
   await trackInteraction(userId, 'message');
+
+  const lowerText = text.toLowerCase();
+
+  // --- Greeting detection ---
+  if (GREETINGS.some(g => lowerText.includes(g.toLowerCase()))) {
+    let displayName = '你';
+    try {
+      const profileRes = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+        headers: { 'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+      });
+      if (profileRes.ok) {
+        const profile = await profileRes.json();
+        displayName = profile.displayName || '你';
+      }
+    } catch (e) { /* ignore profile fetch errors */ }
+
+    // Check user tags to personalize greeting
+    let isB2B = false;
+    try {
+      const tagResult = await db.query('SELECT tag FROM user_tags WHERE line_user_id = $1', [userId]);
+      const tags = tagResult.rows.map(r => r.tag);
+      isB2B = tags.includes('B2B_業主') || tags.includes('加盟_興趣') || tags.includes('加盟_熱leads');
+    } catch (e) { /* ignore */ }
+
+    const timeGreeting = getTimeGreeting();
+    let greeting = '';
+    if (isB2B) {
+      greeting = `${displayName} 老闆${timeGreeting}！\n\n我是雲管家智慧洗衣系統的專屬顧問。\n\n想了解什麼呢？\n📋 回覆「方案」查看報價\n📊 回覆「成功案例」看實際成效\n🎯 回覆「免費Demo」預約展示`;
+    } else {
+      greeting = `${displayName} ${timeGreeting}！\n\n歡迎使用雲管家洗衣服務！\n\n我可以幫你：\n🔍 回覆「空機」查看即時空位\n💰 回覆「儲值」了解優惠\n📍 回覆「門市」查看地址\n❓ 回覆「教學」看使用指南`;
+    }
+
+    await lineReply(event.replyToken, [{ type: 'text', text: greeting }]);
+    return;
+  }
+
+  // --- Thank-you detection ---
+  if (THANKS.some(t => lowerText.includes(t.toLowerCase()))) {
+    await lineReply(event.replyToken, [{
+      type: 'text',
+      text: `不客氣！很高興能幫到您 😊\n\n有任何問題隨時問我，祝您洗衣愉快！`
+    }]);
+    return;
+  }
 
   // Check exact keyword match first
   const entry = KEYWORD_REPLIES[text];
@@ -6762,7 +6859,7 @@ async function handleTextMessage(event, userId, text) {
 
   // Fuzzy keyword matching
   for (const { keywords, reply } of FUZZY_MAP) {
-    if (keywords.some(k => text.toLowerCase().includes(k.toLowerCase()))) {
+    if (keywords.some(k => lowerText.includes(k.toLowerCase()))) {
       const matched = KEYWORD_REPLIES[reply];
       if (matched) {
         for (const tag of (matched.tags || [])) await addUserTag(userId, tag);
@@ -6772,7 +6869,32 @@ async function handleTextMessage(event, userId, text) {
     }
   }
 
-  // No keyword matched — don't reply (let human customer service handle it)
+  // --- Smart fallback for unmatched messages ---
+  // Try to find partial matches and suggest closest keywords
+  const suggestions = [];
+  if (text.length >= 2) {
+    const prefix = text.substring(0, 2);
+    for (const { keywords, reply } of FUZZY_MAP) {
+      for (const k of keywords) {
+        if (k.includes(prefix) || prefix.includes(k.substring(0, 2))) {
+          if (!suggestions.includes(reply)) suggestions.push(reply);
+        }
+      }
+    }
+  }
+
+  if (suggestions.length > 0) {
+    const suggestText = suggestions.slice(0, 3).map(s => `「${s}」`).join('、');
+    await lineReply(event.replyToken, [{
+      type: 'text',
+      text: `抱歉，我不太確定您的需求 🤔\n\n您是不是想問：\n${suggestText}\n\n或者直接輸入以下關鍵字：\n🔍 空機、門市、價格\n💰 儲值、優惠、會員\n📖 教學、烘衣、客服\n💼 方案、Demo、報價`
+    }]);
+  } else {
+    await lineReply(event.replyToken, [{
+      type: 'text',
+      text: `感謝您的訊息！\n\n您可以試試以下關鍵字：\n\n🧺 顧客服務：\n空機 | 門市 | 價格 | 儲值 | 優惠 | 教學\n\n💼 業主諮詢：\n方案 | Demo | 成功案例 | 獲利分析\n\n需要真人客服？請直接回覆「客服」👋`
+    }]);
+  }
 }
 
 // ---- Scheduled Follow-up API ----
@@ -6931,6 +7053,376 @@ app.get('/api/admin/tags/:tag/users', async (req, res) => {
     res.json({ success: true, users: result.rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ===== Broadcast API (群發訊息) =====
+
+// Helper: Build a VOOM-style flex message with hero image
+function buildVoomFlexPost({ imageUrl, title, description, linkUrl, linkLabel }) {
+  return {
+    type: 'flex',
+    altText: title || '雲管家最新消息',
+    contents: {
+      type: 'bubble', size: 'mega',
+      hero: {
+        type: 'image',
+        url: imageUrl,
+        size: 'full',
+        aspectRatio: '1:1',
+        aspectMode: 'cover'
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: title || '', weight: 'bold', size: 'lg', wrap: true },
+          { type: 'text', text: description || '', size: 'sm', color: '#888888', wrap: true, margin: 'md' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_PRIMARY,
+            action: { type: 'uri', label: linkLabel || '了解更多', uri: linkUrl || OFFICIAL_WEBSITE }
+          }
+        ]
+      }
+    }
+  };
+}
+
+// Helper: Execute a broadcast (used by both immediate and scheduled)
+async function executeBroadcast(messages, targetTags, excludeTags, createdBy) {
+  let sentCount = 0;
+
+  try {
+    if (!targetTags || targetTags.length === 0) {
+      // No tag filter: use LINE broadcast API (sends to all followers)
+      const res = await fetch('https://api.line.me/v2/bot/message/broadcast', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        },
+        body: JSON.stringify({ messages }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error('[Broadcast] LINE API error:', data);
+        return { success: false, error: data.message || 'LINE API error', sentCount: 0 };
+      }
+      sentCount = -1; // broadcast API doesn't return count; -1 means "all followers"
+      console.log('[Broadcast] Sent to all followers');
+    } else {
+      // Tag filter: query users and use multicast API
+      let query = `SELECT DISTINCT line_user_id FROM user_tags WHERE tag = ANY($1)`;
+      const params = [targetTags];
+
+      if (excludeTags && excludeTags.length > 0) {
+        query += ` AND line_user_id NOT IN (SELECT DISTINCT line_user_id FROM user_tags WHERE tag = ANY($2))`;
+        params.push(excludeTags);
+      }
+
+      const result = await db.query(query, params);
+      const userIds = result.rows.map(r => r.line_user_id);
+
+      if (userIds.length === 0) {
+        return { success: true, sentCount: 0, message: 'No users matched the tag filter' };
+      }
+
+      // Multicast in batches of 500
+      for (let i = 0; i < userIds.length; i += 500) {
+        const batch = userIds.slice(i, i + 500);
+        try {
+          const res = await fetch('https://api.line.me/v2/bot/message/multicast', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+            },
+            body: JSON.stringify({ to: batch, messages }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok) {
+            sentCount += batch.length;
+          } else {
+            console.error(`[Broadcast] Multicast batch error:`, data);
+          }
+        } catch (batchErr) {
+          console.error(`[Broadcast] Multicast batch failed:`, batchErr.message);
+        }
+      }
+      console.log(`[Broadcast] Multicast sent to ${sentCount} users`);
+    }
+
+    // Log to push_logs
+    try {
+      await db.query(`
+        INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [
+        'broadcast',
+        sentCount === -1 ? 0 : sentCount,
+        messages.length,
+        createdBy,
+        targetTags ? `Tags: ${targetTags.join(', ')}` : 'All followers',
+        true
+      ]);
+    } catch (logErr) { console.error('[Broadcast] Push log error:', logErr.message); }
+
+    return { success: true, sentCount };
+
+  } catch (e) {
+    console.error('[Broadcast] Error:', e.message);
+    return { success: false, error: e.message, sentCount: 0 };
+  }
+}
+
+// POST /api/admin/broadcast - Send broadcast messages
+app.post('/api/admin/broadcast', async (req, res) => {
+  const { adminUserId, messages, targetTags, excludeTags, schedule } = req.body;
+
+  if (!adminUserId) return res.status(400).json({ error: 'adminUserId required' });
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array required (1-5 LINE message objects)' });
+  }
+  if (messages.length > 5) {
+    return res.status(400).json({ error: 'Maximum 5 messages per broadcast' });
+  }
+
+  try {
+    // Verify super_admin
+    const roleCheck = await db.query(
+      'SELECT role FROM user_roles WHERE line_user_id = $1 AND role = $2',
+      [adminUserId, 'super_admin']
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Only super_admin can broadcast' });
+    }
+
+    // Scheduled broadcast
+    if (schedule) {
+      const scheduledAt = new Date(schedule);
+      if (isNaN(scheduledAt.getTime())) {
+        return res.status(400).json({ error: 'Invalid schedule date format. Use ISO 8601.' });
+      }
+      if (scheduledAt <= new Date()) {
+        return res.status(400).json({ error: 'Schedule time must be in the future' });
+      }
+
+      const insertResult = await db.query(`
+        INSERT INTO scheduled_broadcasts (messages, target_tags, exclude_tags, scheduled_at, created_by)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, scheduled_at
+      `, [
+        JSON.stringify(messages),
+        targetTags || null,
+        excludeTags || null,
+        scheduledAt,
+        adminUserId
+      ]);
+
+      return res.json({
+        success: true,
+        scheduled: true,
+        broadcastId: insertResult.rows[0].id,
+        scheduledAt: insertResult.rows[0].scheduled_at
+      });
+    }
+
+    // Immediate broadcast
+    const result = await executeBroadcast(messages, targetTags, excludeTags, adminUserId);
+    res.json(result);
+
+  } catch (e) {
+    console.error('[Broadcast API] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/broadcast/history - View past broadcasts
+app.get('/api/admin/broadcast/history', async (req, res) => {
+  const { adminUserId, limit: queryLimit } = req.query;
+
+  try {
+    if (adminUserId) {
+      const roleCheck = await db.query(
+        'SELECT role FROM user_roles WHERE line_user_id = $1 AND role IN ($2, $3)',
+        [adminUserId, 'super_admin', 'store_admin']
+      );
+      if (roleCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Admin only' });
+      }
+    }
+
+    const rowLimit = Math.min(parseInt(queryLimit) || 50, 200);
+
+    // Get push_logs for broadcast type
+    const pushLogs = await db.query(`
+      SELECT id, push_type, recipient_count, message_count, triggered_by, description, success, created_at
+      FROM push_logs
+      WHERE push_type = 'broadcast'
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [rowLimit]);
+
+    // Get scheduled broadcasts
+    const scheduled = await db.query(`
+      SELECT id, target_tags, exclude_tags, scheduled_at, status, sent_count, created_by, created_at, sent_at
+      FROM scheduled_broadcasts
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [rowLimit]);
+
+    res.json({
+      success: true,
+      broadcasts: pushLogs.rows,
+      scheduled: scheduled.rows
+    });
+  } catch (e) {
+    console.error('[Broadcast History] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/broadcast/scheduled/:id - Cancel a scheduled broadcast
+app.delete('/api/admin/broadcast/scheduled/:id', async (req, res) => {
+  const { adminUserId } = req.body;
+  const broadcastId = req.params.id;
+
+  try {
+    const roleCheck = await db.query(
+      'SELECT role FROM user_roles WHERE line_user_id = $1 AND role = $2',
+      [adminUserId, 'super_admin']
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Only super_admin can cancel broadcasts' });
+    }
+
+    const result = await db.query(
+      `UPDATE scheduled_broadcasts SET status = 'cancelled' WHERE id = $1 AND status = 'pending' RETURNING id`,
+      [broadcastId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Scheduled broadcast not found or already processed' });
+    }
+
+    res.json({ success: true, cancelled: true, broadcastId: parseInt(broadcastId) });
+  } catch (e) {
+    console.error('[Cancel Broadcast] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== LINE VOOM Post API =====
+
+// POST /api/admin/voom-post - Send a VOOM-style flex message broadcast
+app.post('/api/admin/voom-post', async (req, res) => {
+  const { adminUserId, imageUrl, title, description, linkUrl, linkLabel, altText } = req.body;
+
+  if (!adminUserId) return res.status(400).json({ error: 'adminUserId required' });
+  if (!imageUrl || !title) return res.status(400).json({ error: 'imageUrl and title required' });
+
+  try {
+    // Verify super_admin
+    const roleCheck = await db.query(
+      'SELECT role FROM user_roles WHERE line_user_id = $1 AND role = $2',
+      [adminUserId, 'super_admin']
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Only super_admin can post VOOM messages' });
+    }
+
+    const flexMessage = buildVoomFlexPost({
+      imageUrl,
+      title,
+      description: description || '',
+      linkUrl: linkUrl || OFFICIAL_WEBSITE,
+      linkLabel: linkLabel || '了解更多'
+    });
+
+    // Broadcast to all followers
+    const broadcastRes = await fetch('https://api.line.me/v2/bot/message/broadcast', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({ messages: [flexMessage] }),
+    });
+
+    const data = await broadcastRes.json().catch(() => ({}));
+
+    if (!broadcastRes.ok) {
+      console.error('[VOOM Post] LINE API error:', data);
+      return res.status(500).json({ error: data.message || 'LINE API error' });
+    }
+
+    // Log to push_logs
+    try {
+      await db.query(`
+        INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, ['voom_post', 0, 1, adminUserId, `VOOM: ${title}`, true]);
+    } catch (logErr) { console.error('[VOOM Post] Push log error:', logErr.message); }
+
+    console.log(`[VOOM Post] Broadcast sent: "${title}"`);
+    res.json({ success: true, title, message: 'VOOM-style post broadcasted to all followers' });
+
+  } catch (e) {
+    console.error('[VOOM Post] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Scheduled Broadcast Processor =====
+// Runs every 60 seconds to check and execute pending scheduled broadcasts
+setInterval(async () => {
+  try {
+    const pending = await db.query(`
+      SELECT id, messages, target_tags, exclude_tags, created_by
+      FROM scheduled_broadcasts
+      WHERE status = 'pending' AND scheduled_at <= NOW()
+      ORDER BY scheduled_at ASC
+      LIMIT 5
+    `);
+
+    for (const broadcast of pending.rows) {
+      try {
+        console.log(`[Scheduler] Processing broadcast #${broadcast.id}`);
+        const messages = typeof broadcast.messages === 'string'
+          ? JSON.parse(broadcast.messages)
+          : broadcast.messages;
+
+        const result = await executeBroadcast(
+          messages,
+          broadcast.target_tags,
+          broadcast.exclude_tags,
+          broadcast.created_by
+        );
+
+        await db.query(`
+          UPDATE scheduled_broadcasts
+          SET status = $1, sent_count = $2, sent_at = NOW()
+          WHERE id = $3
+        `, [
+          result.success ? 'sent' : 'failed',
+          result.sentCount || 0,
+          broadcast.id
+        ]);
+
+        console.log(`[Scheduler] Broadcast #${broadcast.id} ${result.success ? 'sent' : 'failed'}`);
+      } catch (broadcastErr) {
+        console.error(`[Scheduler] Broadcast #${broadcast.id} error:`, broadcastErr.message);
+        await db.query(
+          `UPDATE scheduled_broadcasts SET status = 'failed' WHERE id = $1`,
+          [broadcast.id]
+        ).catch(() => {});
+      }
+    }
+  } catch (e) {
+    // Silently ignore scheduler errors to avoid polluting logs
+  }
+}, 60000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
