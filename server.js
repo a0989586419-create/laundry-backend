@@ -5407,6 +5407,36 @@ async function lineReply(replyToken, messages) {
   } catch (e) { console.error('[LINE Reply] Failed:', e.message); return false; }
 }
 
+// ---- Rich Menu Per-Audience Assignment ----
+const RICH_MENU_IDS = {
+  default: process.env.RICHMENU_DEFAULT_ID || '',
+  b2c: process.env.RICHMENU_B2C_ID || '',
+  b2b: process.env.RICHMENU_B2B_ID || '',
+};
+
+async function linkRichMenuToUser(userId, menuType) {
+  const richMenuId = RICH_MENU_IDS[menuType];
+  if (!richMenuId || !LINE_CHANNEL_ACCESS_TOKEN) {
+    console.log(`[RichMenu] Skip: no ${menuType} menu ID configured`);
+    return false;
+  }
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/user/${userId}/richmenu/${richMenuId}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.error(`[RichMenu] Error linking ${menuType}:`, err);
+    }
+    console.log(`[RichMenu] Linked ${menuType} menu to ${userId}`);
+    return res.ok;
+  } catch (e) {
+    console.error(`[RichMenu] Failed:`, e.message);
+    return false;
+  }
+}
+
 // Helper: add tag to user
 async function addUserTag(lineUserId, tag, source = 'auto') {
   try {
@@ -6563,7 +6593,27 @@ const KEYWORD_REPLIES = {
         ]}
       }
     }]
-  }
+  },
+  '退款': {
+    tags: [],
+    messages: [{ type: 'text', text: '💳 退款政策說明：\n\n1️⃣ 機器故障導致未啟動 → 全額退回錢包\n2️⃣ 洗程中斷 → 依剩餘時間比例退回\n3️⃣ 儲值退款 → 聯繫客服處理\n\n⏰ 退款處理時間：1-3 個工作天\n\n需要申請退款？請回覆「客服」聯繫真人客服。' }]
+  },
+  '棉被': {
+    tags: [],
+    messages: [{ type: 'text', text: '🛏️ 大型衣物洗滌指南：\n\n✅ 可洗：棉被、毛毯、窗簾、大浴巾\n❌ 不建議：羽絨被（建議乾洗）、電毯\n\n💡 洗滌建議：\n1. 選擇「大物洗」模式\n2. 一次只洗一件大型物品\n3. 建議加購洗劑效果更好\n4. 烘乾選中溫 60°C，時間加長\n\n價格：大物洗 NT$90 起\n\n👉 查看空機：' + LIFF_WASH }]
+  },
+  '推薦碼': {
+    tags: [],
+    messages: [{ type: 'text', text: '🎁 推薦好友計畫：\n\n分享你的推薦碼，好友首次消費時輸入：\n👉 雙方各得 NT$10 洗衣金！\n\n如何取得推薦碼？\n1. 開啟雲管家 → 我的帳戶\n2. 點選「推薦好友」\n3. 複製推薦碼分享給朋友\n\n📱 立即查看：' + LIFF_PROFILE }]
+  },
+  '合約': {
+    tags: ['B2B_合約查詢'],
+    messages: [{ type: 'text', text: '📄 雲管家合約說明：\n\n📋 月租方案：\n• 最短 3 個月起簽\n• 每月自動續約\n• 提前 30 天通知可終止\n\n📋 年租方案：\n• 一年期合約\n• 年付享 2 個月折扣\n• 含免費系統教學\n\n📋 客製化：\n• 依專案需求議定\n• 含 SLA 服務保障\n\n📞 詳細合約內容請聯繫顧問：\n' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+  },
+  '安裝': {
+    tags: ['B2B_安裝查詢'],
+    messages: [{ type: 'text', text: '🔧 安裝與導入流程：\n\n📅 標準時程：7-14 個工作天\n\n1️⃣ 簽約後 Day 1-2\n   → 現場場勘 + 網路環境確認\n\n2️⃣ Day 3-5\n   → 工控機安裝 + 通訊線路佈建\n\n3️⃣ Day 5-7\n   → 系統設定 + 機台串接測試\n\n4️⃣ Day 7-14\n   → 試營運 + 店主教育訓練\n\n✅ 全程免費安裝\n✅ 不需更換現有機器\n✅ 遠端支援 + 到場服務\n\n📞 預約場勘：' + CONTACT_PHONE }]
+  },
 };
 
 // ---- Franchise secondary segmentation ----
@@ -6636,6 +6686,11 @@ const FUZZY_MAP = [
   { keywords: ['故障', '壞了', '報修', '維修', '沒反應', '不能用'], reply: '故障報修' },
   { keywords: ['支付', '付款', 'LINE Pay', 'linepay'], reply: '行動支付' },
   { keywords: ['空機', '有沒有位', '還有機器', '有位子'], reply: '空機' },
+  { keywords: ['退款', '退費', '退錢', '退回'], reply: '退款' },
+  { keywords: ['棉被', '被子', '大型', '窗簾', '毛毯'], reply: '棉被' },
+  { keywords: ['推薦碼', '邀請碼', '推薦好友', '分享碼'], reply: '推薦碼' },
+  { keywords: ['合約', '簽約', '合同', '契約'], reply: '合約' },
+  { keywords: ['安裝', '施工', '工期', '場勘', '導入'], reply: '安裝' },
 ];
 
 // ===== Static Assets for LINE Imagemap =====
@@ -6681,7 +6736,16 @@ app.post('/api/line/webhook', async (req, res) => {
         case 'unfollow': await handleUnfollow(userId); break;
         case 'postback': await handlePostback(event, userId); break;
         case 'message': {
-          if (event.message?.type === 'text') await handleTextMessage(event, userId, event.message.text.trim());
+          if (event.message?.type === 'text') {
+            await handleTextMessage(event, userId, event.message.text.trim());
+          } else if (event.message?.type === 'location') {
+            await handleLocationMessage(event, userId, event.message);
+          } else if (['image', 'sticker', 'audio', 'video'].includes(event.message?.type)) {
+            await lineReply(event.replyToken, [{
+              type: 'text',
+              text: '感謝您的訊息！目前我只能處理文字喔 📝\n\n試試輸入關鍵字：\n🔍 空機 | 📍 門市 | 💰 價格\n📖 教學 | 🎁 優惠 | 🔧 故障報修'
+            }]);
+          }
           break;
         }
       }
@@ -6696,12 +6760,63 @@ app.post('/api/line/webhook', async (req, res) => {
 async function handleFollow(event, userId) {
   console.log(`[Webhook] Follow: ${userId}`);
   await addUserTag(userId, '新好友');
-  await lineReply(event.replyToken, [buildWelcomeFlexMessage()]);
+
+  // Check if returning user (has existing tags)
+  const existingTags = await db.query('SELECT tag FROM user_tags WHERE line_user_id = $1 AND tag NOT IN ($2, $3)', [userId, '新好友', '已封鎖']);
+  if (existingTags.rows.some(r => ['顧客', '新會員', '活躍會員'].includes(r.tag))) {
+    // Returning customer
+    await linkRichMenuToUser(userId, 'b2c');
+    const msgs = buildCustomerWelcomeReply();
+    await lineReply(event.replyToken, msgs);
+  } else if (existingTags.rows.some(r => ['B2B_業主', '業主_興趣', '加盟_興趣'].includes(r.tag))) {
+    // Returning business user
+    await linkRichMenuToUser(userId, 'b2b');
+    const msgs = buildBusinessWelcomeReply();
+    await lineReply(event.replyToken, msgs);
+  } else {
+    // New user - show identity selection
+    await linkRichMenuToUser(userId, 'default');
+    await lineReply(event.replyToken, [buildWelcomeFlexMessage()]);
+  }
 }
 
 async function handleUnfollow(userId) {
   console.log(`[Webhook] Unfollow: ${userId}`);
   await addUserTag(userId, '已封鎖', 'system');
+}
+
+async function handleLocationMessage(event, userId, location) {
+  console.log(`[Webhook] Location: ${userId} → lat:${location.latitude}, lng:${location.longitude}`);
+
+  const stores = [
+    { name: '悠洗自助洗衣', lat: 23.4800, lng: 120.4491, addr: '嘉義市東區文雅街181號' },
+    { name: '吼你洗 玉清店', lat: 24.5700, lng: 120.8200, addr: '苗栗市玉清路51號' },
+    { name: '吼你洗 農會店', lat: 24.5650, lng: 120.8180, addr: '苗栗市為公路290號' },
+    { name: '熊愛洗自助洗衣', lat: 24.1810, lng: 120.6460, addr: '台中市西屯區福聯街22巷2號' },
+    { name: '上好洗自助洗衣', lat: 22.6273, lng: 120.3560, addr: '高雄市鳳山區北平路214號' },
+  ];
+
+  // Calculate distances and find nearest
+  function calcDist(lat1, lng1, lat2, lng2) {
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  const sorted = stores.map(s => ({
+    ...s,
+    dist: calcDist(location.latitude, location.longitude, s.lat, s.lng)
+  })).sort((a, b) => a.dist - b.dist);
+
+  const nearest = sorted[0];
+  const second = sorted[1];
+
+  await lineReply(event.replyToken, [{
+    type: 'text',
+    text: `📍 離您最近的門市：\n\n🥇 ${nearest.name}\n📍 ${nearest.addr}\n📏 約 ${nearest.dist.toFixed(1)} 公里\n\n🥈 ${second.name}\n📍 ${second.addr}\n📏 約 ${second.dist.toFixed(1)} 公里\n\n🔍 查看空機狀態：\n${LIFF_WASH}\n\n📱 Google Maps 導航：\nhttps://www.google.com/maps/search/?api=1&query=${encodeURIComponent(nearest.addr)}`
+  }]);
 }
 
 async function handlePostback(event, userId) {
@@ -6717,6 +6832,7 @@ async function handlePostback(event, userId) {
       await addUserTag(userId, '顧客');
       await addUserTag(userId, '新會員');
       await removeUserTag(userId, '新好友');
+      await linkRichMenuToUser(userId, 'b2c');
       const msgs = buildCustomerWelcomeReply();
       await lineReply(event.replyToken, msgs);
       break;
@@ -6724,6 +6840,7 @@ async function handlePostback(event, userId) {
     case 'welcome_business': {
       await addUserTag(userId, 'B2B_業主');
       await removeUserTag(userId, '新好友');
+      await linkRichMenuToUser(userId, 'b2b');
       const bizMsgs = buildBusinessWelcomeReply();
       await lineReply(event.replyToken, bizMsgs);
       break;
@@ -6736,6 +6853,7 @@ async function handlePostback(event, userId) {
     case 'welcome_franchise': {
       await addUserTag(userId, '業主_興趣');
       await removeUserTag(userId, '新好友');
+      await linkRichMenuToUser(userId, 'b2b');
       const msgs = buildFranchiseWelcomeReply();
       msgs.push(buildFranchiseSegmentReply());
       await lineReply(event.replyToken, msgs);
