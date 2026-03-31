@@ -1336,6 +1336,10 @@ app.get('/api/payment/confirm', async (req, res) => {
       // LINE Push: payment success
       const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
       if (memberRow) {
+        // Auto-bind user to store
+        try {
+          await db.query(`INSERT INTO user_store_bindings (line_user_id, store_id, bound_at) VALUES ($1, $2, NOW()) ON CONFLICT (line_user_id, store_id) DO UPDATE SET bound_at = NOW()`, [memberRow.line_user_id, order.store_id]);
+        } catch(e) {}
         const storeRow = (await db.query('SELECT name, group_id FROM stores WHERE id=$1', [order.store_id])).rows[0];
         const sName = storeRow?.name || order.store_id;
         let paymentSupportUrl = '';
@@ -1531,6 +1535,10 @@ app.post('/api/payment/create', async (req, res) => {
         amount: amount, discount: discountAmount, finalAmount: finalAmount,
         orderId: orderId, paymentMethod: '錢包付款', minutes: mins, supportUrl: demoSupportUrl, supportPhone: demoSupportPhone, groupId: store?.group_id, storeId: storeId
       }), { pushType: 'auto_payment', storeId: storeId, groupId: store?.group_id, description: `Demo付款成功 ${sName} ${mName}` }).catch(() => {});
+      // Auto-bind user to store
+      try {
+        await db.query(`INSERT INTO user_store_bindings (line_user_id, store_id, bound_at) VALUES ($1, $2, NOW()) ON CONFLICT (line_user_id, store_id) DO UPDATE SET bound_at = NOW()`, [userId, storeId]);
+      } catch(e) {}
     }
 
     res.json({ success: true, orderId, demoMode: true, discountAmount, finalAmount });
@@ -5205,6 +5213,7 @@ async function initDB() {
         sent_at TIMESTAMPTZ
       )
     `).catch(() => {});
+    await db.query(`ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS target_store_ids TEXT[]`).catch(() => {});
 
     // Store push balance & topup tables
     await db.query(`
@@ -5288,6 +5297,19 @@ async function initDB() {
     `).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_user_tags_user ON user_tags (line_user_id)`).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags (tag)`).catch(() => {});
+
+    // User-store bindings table (auto-bound on payment)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS user_store_bindings (
+        id SERIAL PRIMARY KEY,
+        line_user_id VARCHAR(100) NOT NULL,
+        store_id VARCHAR(20) NOT NULL,
+        bound_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(line_user_id, store_id)
+      )
+    `).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_store_bindings_user ON user_store_bindings (line_user_id)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_store_bindings_store ON user_store_bindings (store_id)`).catch(() => {});
 
   } catch (e) { /* column might already exist */ }
 
@@ -7208,11 +7230,59 @@ function buildVoomFlexPost({ imageUrl, title, description, linkUrl, linkLabel })
 }
 
 // Helper: Execute a broadcast (used by both immediate and scheduled)
-async function executeBroadcast(messages, targetTags, excludeTags, createdBy) {
+async function executeBroadcast(messages, targetTags, excludeTags, createdBy, targetStoreIds) {
   let sentCount = 0;
 
   try {
-    if (!targetTags || targetTags.length === 0) {
+    if (targetStoreIds && targetStoreIds.length > 0) {
+      // Store-specific broadcast: query users bound to these stores
+      let query = `SELECT DISTINCT usb.line_user_id FROM user_store_bindings usb WHERE usb.store_id = ANY($1)`;
+      const params = [targetStoreIds];
+
+      // Also apply tag filters if provided
+      if (targetTags && targetTags.length > 0) {
+        query = `SELECT DISTINCT usb.line_user_id FROM user_store_bindings usb
+                 INNER JOIN user_tags ut ON usb.line_user_id = ut.line_user_id
+                 WHERE usb.store_id = ANY($1) AND ut.tag = ANY($2)`;
+        params.push(targetTags);
+      }
+
+      if (excludeTags && excludeTags.length > 0) {
+        query += ` AND usb.line_user_id NOT IN (SELECT DISTINCT line_user_id FROM user_tags WHERE tag = ANY($${params.length + 1}))`;
+        params.push(excludeTags);
+      }
+
+      const result = await db.query(query, params);
+      const userIds = result.rows.map(r => r.line_user_id);
+
+      if (userIds.length === 0) {
+        return { success: true, sentCount: 0, message: 'No users found for these stores' };
+      }
+
+      // Multicast in batches of 500
+      for (let i = 0; i < userIds.length; i += 500) {
+        const batch = userIds.slice(i, i + 500);
+        try {
+          const res = await fetch('https://api.line.me/v2/bot/message/multicast', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+            },
+            body: JSON.stringify({ to: batch, messages }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok) {
+            sentCount += batch.length;
+          } else {
+            console.error(`[Broadcast] Store multicast batch error:`, data);
+          }
+        } catch (batchErr) {
+          console.error(`[Broadcast] Store multicast batch failed:`, batchErr.message);
+        }
+      }
+      console.log(`[Broadcast] Store-filtered multicast sent to ${sentCount} users for stores: ${targetStoreIds.join(', ')}`);
+    } else if (!targetTags || targetTags.length === 0) {
       // No tag filter: use LINE broadcast API (sends to all followers)
       const res = await fetch('https://api.line.me/v2/bot/message/broadcast', {
         method: 'POST',
@@ -7294,9 +7364,25 @@ async function executeBroadcast(messages, targetTags, excludeTags, createdBy) {
   }
 }
 
+// GET /api/admin/store-bindings - Get user counts per store
+app.get('/api/admin/store-bindings', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT usb.store_id, s.name as store_name, COUNT(DISTINCT usb.line_user_id) as user_count
+      FROM user_store_bindings usb
+      LEFT JOIN stores s ON usb.store_id = s.id
+      GROUP BY usb.store_id, s.name
+      ORDER BY user_count DESC
+    `);
+    res.json({ stores: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/admin/broadcast - Send broadcast messages
 app.post('/api/admin/broadcast', async (req, res) => {
-  const { adminUserId, messages, targetTags, excludeTags, schedule } = req.body;
+  const { adminUserId, messages, targetTags, excludeTags, targetStoreIds, schedule } = req.body;
 
   if (!adminUserId) return res.status(400).json({ error: 'adminUserId required' });
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -7327,15 +7413,16 @@ app.post('/api/admin/broadcast', async (req, res) => {
       }
 
       const insertResult = await db.query(`
-        INSERT INTO scheduled_broadcasts (messages, target_tags, exclude_tags, scheduled_at, created_by)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO scheduled_broadcasts (messages, target_tags, exclude_tags, scheduled_at, created_by, target_store_ids)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id, scheduled_at
       `, [
         JSON.stringify(messages),
         targetTags || null,
         excludeTags || null,
         scheduledAt,
-        adminUserId
+        adminUserId,
+        targetStoreIds || null
       ]);
 
       return res.json({
@@ -7347,7 +7434,7 @@ app.post('/api/admin/broadcast', async (req, res) => {
     }
 
     // Immediate broadcast
-    const result = await executeBroadcast(messages, targetTags, excludeTags, adminUserId);
+    const result = await executeBroadcast(messages, targetTags, excludeTags, adminUserId, targetStoreIds);
     res.json(result);
 
   } catch (e) {
@@ -7497,7 +7584,7 @@ app.post('/api/admin/voom-post', async (req, res) => {
 setInterval(async () => {
   try {
     const pending = await db.query(`
-      SELECT id, messages, target_tags, exclude_tags, created_by
+      SELECT id, messages, target_tags, exclude_tags, created_by, target_store_ids
       FROM scheduled_broadcasts
       WHERE status = 'pending' AND scheduled_at <= NOW()
       ORDER BY scheduled_at ASC
@@ -7515,7 +7602,8 @@ setInterval(async () => {
           messages,
           broadcast.target_tags,
           broadcast.exclude_tags,
-          broadcast.created_by
+          broadcast.created_by,
+          broadcast.target_store_ids
         );
 
         await db.query(`
