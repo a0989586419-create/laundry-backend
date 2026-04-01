@@ -5218,11 +5218,21 @@ app.post('/api/admin/cleanup', async (req, res) => {
 //  API: Member Level (spending-based)
 // ═══════════════════════════════════════
 
+const MEMBER_LEVELS_MAP = {
+  normal:   { name: '一般會員', minSpent: 0,     discount: 0,  icon: '⬜', color: '#999999' },
+  bronze:   { name: '銅卡會員', minSpent: 500,   discount: 3,  icon: '🥉', color: '#CD7F32' },
+  silver:   { name: '銀卡會員', minSpent: 2000,  discount: 5,  icon: '🥈', color: '#C0C0C0' },
+  gold:     { name: '金卡會員', minSpent: 5000,  discount: 8,  icon: '🥇', color: '#E5B94C' },
+  diamond:  { name: '鑽石會員', minSpent: 10000, discount: 12, icon: '💎', color: '#B9F2FF' },
+};
+const MEMBER_LEVELS_ORDER = ['normal', 'bronze', 'silver', 'gold', 'diamond'];
+// Legacy compat: array sorted descending by threshold for calculateMemberLevel
 const MEMBER_LEVELS = [
-  { name: '鑽石', threshold: 8000, discount: 8 },
-  { name: '金卡', threshold: 3000, discount: 5 },
-  { name: '銀卡', threshold: 1000, discount: 2 },
-  { name: '銅卡', threshold: 0, discount: 0 },
+  { name: '鑽石會員', threshold: 10000, discount: 12, key: 'diamond' },
+  { name: '金卡會員', threshold: 5000,  discount: 8,  key: 'gold' },
+  { name: '銀卡會員', threshold: 2000,  discount: 5,  key: 'silver' },
+  { name: '銅卡會員', threshold: 500,   discount: 3,  key: 'bronze' },
+  { name: '一般會員', threshold: 0,     discount: 0,  key: 'normal' },
 ];
 
 function calculateMemberLevel(totalSpent) {
@@ -5230,20 +5240,26 @@ function calculateMemberLevel(totalSpent) {
     if (totalSpent >= lvl.threshold) {
       const currentIndex = MEMBER_LEVELS.indexOf(lvl);
       const nextLevel = currentIndex > 0 ? MEMBER_LEVELS[currentIndex - 1] : null;
+      const levelMeta = MEMBER_LEVELS_MAP[lvl.key] || {};
       return {
+        key: lvl.key,
         level: lvl.name,
         discount: lvl.discount,
+        icon: levelMeta.icon || '⬜',
+        color: levelMeta.color || '#999999',
         totalSpent,
         nextLevel: nextLevel ? nextLevel.name : null,
+        nextLevelKey: nextLevel ? nextLevel.key : null,
         nextThreshold: nextLevel ? nextLevel.threshold : null,
+        amountToNext: nextLevel ? Math.max(0, nextLevel.threshold - totalSpent) : 0,
         progress: nextLevel
           ? Math.min(100, Math.round(((totalSpent - lvl.threshold) / (nextLevel.threshold - lvl.threshold)) * 100))
           : 100,
       };
     }
   }
-  // Fallback (should not reach here)
-  return { level: '銅卡', discount: 0, totalSpent, nextLevel: '銀卡', nextThreshold: 1000, progress: 0 };
+  // Fallback
+  return { key: 'normal', level: '一般會員', discount: 0, icon: '⬜', color: '#999999', totalSpent, nextLevel: '銅卡會員', nextLevelKey: 'bronze', nextThreshold: 500, amountToNext: 500 - totalSpent, progress: 0 };
 }
 
 app.get('/api/user/member-level', async (req, res) => {
@@ -5251,8 +5267,9 @@ app.get('/api/user/member-level', async (req, res) => {
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
+    // Get total spent from orders
     const result = await db.query(
-      `SELECT COALESCE(SUM(o.total_amount), 0) as total_spent
+      `SELECT COALESCE(SUM(o.total_amount), 0) as total_spent, COUNT(*)::int as total_washes
        FROM orders o
        JOIN members m ON o.member_id = m.id
        WHERE m.line_user_id = $1 AND o.status = 'completed'`,
@@ -5260,11 +5277,82 @@ app.get('/api/user/member-level', async (req, res) => {
     );
 
     const totalSpent = parseInt(result.rows[0].total_spent) || 0;
+    const totalWashes = parseInt(result.rows[0].total_washes) || 0;
     const levelInfo = calculateMemberLevel(totalSpent);
 
-    res.json(levelInfo);
+    // Sync to members table
+    await db.query(
+      `UPDATE members SET total_spent = $1, member_level = $2, level_updated_at = NOW() WHERE line_user_id = $3`,
+      [totalSpent, levelInfo.key, userId]
+    ).catch(() => {});
+
+    res.json({ ...levelInfo, totalWashes });
   } catch (e) {
     console.error('member-level error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/user/add-spending - Add spending and check level upgrade
+app.post('/api/user/add-spending', async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+    if (!userId || !amount) return res.status(400).json({ error: 'userId and amount required' });
+
+    const amountInt = parseInt(amount);
+    if (isNaN(amountInt) || amountInt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    // Get current level before update
+    const beforeResult = await db.query(
+      `SELECT COALESCE(total_spent, 0) as total_spent, COALESCE(member_level, 'normal') as member_level FROM members WHERE line_user_id = $1`,
+      [userId]
+    );
+    const beforeSpent = beforeResult.rows.length > 0 ? parseInt(beforeResult.rows[0].total_spent) || 0 : 0;
+    const beforeLevel = beforeResult.rows.length > 0 ? beforeResult.rows[0].member_level : 'normal';
+
+    const newTotalSpent = beforeSpent + amountInt;
+
+    // Update total_spent
+    await db.query(
+      `UPDATE members SET total_spent = $1 WHERE line_user_id = $2`,
+      [newTotalSpent, userId]
+    );
+
+    const newLevelInfo = calculateMemberLevel(newTotalSpent);
+
+    // Check if level changed
+    let leveledUp = false;
+    if (newLevelInfo.key !== beforeLevel) {
+      const oldIdx = MEMBER_LEVELS_ORDER.indexOf(beforeLevel);
+      const newIdx = MEMBER_LEVELS_ORDER.indexOf(newLevelInfo.key);
+      if (newIdx > oldIdx) {
+        leveledUp = true;
+        // Update level
+        await db.query(
+          `UPDATE members SET member_level = $1, level_updated_at = NOW() WHERE line_user_id = $2`,
+          [newLevelInfo.key, userId]
+        );
+        // Send level-up push notification
+        try {
+          const notification = buildLevelUpNotification(newLevelInfo);
+          await sendLinePush(userId, [notification], {
+            pushType: 'level_up',
+            description: `會員升級: ${newLevelInfo.level}`
+          });
+        } catch (pushErr) {
+          console.error('[Level Up Push] Error:', pushErr.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      totalSpent: newTotalSpent,
+      leveledUp,
+      ...newLevelInfo,
+    });
+  } catch (e) {
+    console.error('add-spending error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -5281,9 +5369,9 @@ app.post('/api/referral/apply', async (req, res) => {
 
     const code = referralCode.toUpperCase().trim();
 
-    // Find referrer by last 6 chars of LINE user ID
+    // Find referrer by referral_codes table (YPXXXX format)
     const referrerResult = await db.query(
-      `SELECT line_user_id FROM members WHERE UPPER(RIGHT(line_user_id, 6)) = $1`,
+      `SELECT line_user_id FROM referral_codes WHERE code = $1`,
       [code]
     );
     if (referrerResult.rows.length === 0) {
@@ -5299,22 +5387,34 @@ app.post('/api/referral/apply', async (req, res) => {
 
     // Check if user has already been referred
     const existing = await db.query(
-      'SELECT 1 FROM referrals WHERE referred_user_id = $1',
+      'SELECT 1 FROM referral_records WHERE referee_id = $1',
       [userId]
     );
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: '您已使用過推薦碼' });
     }
 
-    const rewardAmount = 30;
+    const rewardAmount = 10;
 
     await client.query('BEGIN');
 
     // Insert referral record
     await client.query(
-      'INSERT INTO referrals (referrer_user_id, referred_user_id, reward_amount) VALUES ($1, $2, $3)',
-      [referrerUserId, userId, rewardAmount]
+      'INSERT INTO referral_records (referrer_id, referee_id, reward_amount, status) VALUES ($1, $2, $3, $4)',
+      [referrerUserId, userId, rewardAmount, 'completed']
     );
+
+    // Also insert into legacy referrals table for compatibility
+    await client.query(
+      'INSERT INTO referrals (referrer_user_id, referred_user_id, reward_amount) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+      [referrerUserId, userId, rewardAmount]
+    ).catch(() => {});
+
+    // Update referral_codes usage count
+    await client.query(
+      'UPDATE referral_codes SET uses = uses + 1 WHERE code = $1',
+      [code]
+    ).catch(() => {});
 
     // Reward referrer: add to all their group wallets
     const referrerWallets = await client.query(
@@ -5354,9 +5454,17 @@ app.post('/api/referral/apply', async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Push notifications to both parties
+    try {
+      await sendLinePush(referrerUserId, [{
+        type: 'text',
+        text: `🎉 恭喜！您的推薦碼 ${code} 被使用了！\n\n已獲得 NT$${rewardAmount} 洗衣金獎勵，感謝您的推薦！`
+      }], { pushType: 'referral_reward', description: `推薦獎勵通知 ${code}` });
+    } catch (pushErr) { console.error('[Referral Push]', pushErr.message); }
+
     res.json({
       success: true,
-      message: `推薦碼使用成功！您和推薦人各獲得 NT$${rewardAmount} 獎勵`,
+      message: `推薦碼使用成功！您和推薦人各獲得 NT$${rewardAmount} 洗衣金`,
       reward: rewardAmount,
     });
   } catch (e) {
@@ -5368,31 +5476,121 @@ app.post('/api/referral/apply', async (req, res) => {
   }
 });
 
+// POST /api/user/apply-referral - Alias for /api/referral/apply
+app.post('/api/user/apply-referral', async (req, res) => {
+  // Forward to the main referral apply handler
+  const client = await db.connect();
+  try {
+    const { userId, referralCode } = req.body;
+    if (!userId || !referralCode) return res.status(400).json({ error: 'userId and referralCode required' });
+
+    const code = referralCode.toUpperCase().trim();
+
+    const referrerResult = await db.query('SELECT line_user_id FROM referral_codes WHERE code = $1', [code]);
+    if (referrerResult.rows.length === 0) return res.status(400).json({ error: '推薦碼無效' });
+
+    const referrerUserId = referrerResult.rows[0].line_user_id;
+    if (referrerUserId === userId) return res.status(400).json({ error: '不能使用自己的推薦碼' });
+
+    const existing = await db.query('SELECT 1 FROM referral_records WHERE referee_id = $1', [userId]);
+    if (existing.rows.length > 0) return res.status(400).json({ error: '您已使用過推薦碼' });
+
+    const rewardAmount = 10;
+    await client.query('BEGIN');
+
+    await client.query(
+      'INSERT INTO referral_records (referrer_id, referee_id, reward_amount, status) VALUES ($1, $2, $3, $4)',
+      [referrerUserId, userId, rewardAmount, 'completed']
+    );
+    await client.query('UPDATE referral_codes SET uses = uses + 1 WHERE code = $1', [code]).catch(() => {});
+
+    // Add rewards to both users' wallets
+    for (const uid of [referrerUserId, userId]) {
+      const wallets = await client.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [uid]);
+      const txType = uid === referrerUserId ? 'referral_reward' : 'referral_bonus';
+      const txDesc = uid === referrerUserId ? `推薦獎勵 (${code})` : `新用戶推薦獎勵 (NT$${rewardAmount})`;
+      for (const w of wallets.rows) {
+        await client.query(
+          `INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+           ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3`,
+          [uid, w.group_id, rewardAmount]
+        );
+        await client.query(
+          `INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`,
+          [uid, w.group_id, txType, rewardAmount, txDesc]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+
+    try {
+      await sendLinePush(referrerUserId, [{
+        type: 'text', text: `🎉 您的推薦碼 ${code} 被使用了！已獲得 NT$${rewardAmount} 洗衣金！`
+      }], { pushType: 'referral_reward', description: `推薦獎勵 ${code}` });
+    } catch (pushErr) { console.error('[Referral Push]', pushErr.message); }
+
+    res.json({ success: true, message: `推薦碼使用成功！雙方各得 NT$${rewardAmount}`, reward: rewardAmount });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('apply-referral error:', e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/user/referral - Get user's referral code and stats
+app.get('/api/user/referral', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const codeData = await getOrCreateReferralCode(userId);
+
+    const countResult = await db.query(
+      'SELECT COUNT(*)::int as cnt, COALESCE(SUM(reward_amount), 0)::int as total_reward FROM referral_records WHERE referrer_id = $1',
+      [userId]
+    );
+    const referralCount = parseInt(countResult.rows[0].cnt) || 0;
+    const totalReward = parseInt(countResult.rows[0].total_reward) || 0;
+
+    res.json({
+      code: codeData.code,
+      referralCount,
+      totalReward,
+    });
+  } catch (e) {
+    console.error('user referral error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/referral/status', async (req, res) => {
   try {
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    // My referral code = last 6 chars of LINE user ID (uppercase)
-    const myCode = userId.slice(-6).toUpperCase();
+    // Get or create YPXXXX referral code
+    const codeData = await getOrCreateReferralCode(userId);
 
     // Has this user been referred?
     const referred = await db.query(
-      'SELECT 1 FROM referrals WHERE referred_user_id = $1',
+      'SELECT 1 FROM referral_records WHERE referee_id = $1',
       [userId]
     );
     const hasBeenReferred = referred.rows.length > 0;
 
     // How many people has this user referred?
     const countResult = await db.query(
-      'SELECT COUNT(*) as cnt, COALESCE(SUM(reward_amount), 0) as total_rewards FROM referrals WHERE referrer_user_id = $1',
+      'SELECT COUNT(*)::int as cnt, COALESCE(SUM(reward_amount), 0)::int as total_rewards FROM referral_records WHERE referrer_id = $1',
       [userId]
     );
     const referralCount = parseInt(countResult.rows[0].cnt) || 0;
     const totalRewards = parseInt(countResult.rows[0].total_rewards) || 0;
 
     res.json({
-      myCode,
+      myCode: codeData.code,
       hasBeenReferred,
       referralCount,
       totalRewards,
@@ -5716,8 +5914,12 @@ async function initDB() {
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
     // Member level system columns
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS total_spent INT DEFAULT 0`).catch(() => {});
-    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS member_level TEXT DEFAULT 'bronze'`).catch(() => {});
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS member_level TEXT DEFAULT 'normal'`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS level_updated_at TIMESTAMPTZ DEFAULT NOW()`).catch(() => {});
+    // Ensure referral_codes has UNIQUE on line_user_id
+    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_codes_user ON referral_codes (line_user_id)`).catch(() => {});
+    // Ensure referral_records has UNIQUE on referee_id
+    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_records_referee ON referral_records (referee_id)`).catch(() => {});
     // machine_current_state: add new IoT telemetry columns
     await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS store_id VARCHAR(20) DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'unknown'`).catch(() => {});
@@ -5848,40 +6050,39 @@ async function initDB() {
     // JKOPay order ID
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS jkopay_order_id VARCHAR(100)`).catch(() => {});
 
-    // Member levels table
+    // Member levels table (reference table, actual level stored in members.member_level)
     await db.query(`
       CREATE TABLE IF NOT EXISTS member_levels (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(50) NOT NULL,
-        min_points INT DEFAULT 0,
-        discount_percent INT DEFAULT 0,
-        benefits TEXT DEFAULT '',
-        icon VARCHAR(10) DEFAULT '',
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        line_user_id TEXT PRIMARY KEY,
+        level TEXT DEFAULT 'normal',
+        total_spent INTEGER DEFAULT 0,
+        total_washes INTEGER DEFAULT 0,
+        level_updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
 
-    // Referral codes table
+    // Referral codes table (YPXXXX format, lazy-created per user)
     await db.query(`
       CREATE TABLE IF NOT EXISTS referral_codes (
         id SERIAL PRIMARY KEY,
-        line_user_id VARCHAR(100) NOT NULL,
+        line_user_id VARCHAR(100) NOT NULL UNIQUE,
         code VARCHAR(20) UNIQUE NOT NULL,
         uses INT DEFAULT 0,
-        reward_points INT DEFAULT 50,
+        reward_points INT DEFAULT 10,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
 
-    // Referral records table
+    // Referral records table (tracks who referred whom)
     await db.query(`
       CREATE TABLE IF NOT EXISTS referral_records (
         id SERIAL PRIMARY KEY,
-        referrer_id VARCHAR(100) NOT NULL,
-        referred_id VARCHAR(100) NOT NULL,
-        code VARCHAR(20) NOT NULL,
-        reward_given BOOLEAN DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        referrer_id TEXT NOT NULL,
+        referee_id TEXT NOT NULL,
+        reward_amount INTEGER DEFAULT 10,
+        status TEXT DEFAULT 'completed',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(referee_id)
       )
     `).catch(() => {});
 
@@ -6066,6 +6267,51 @@ async function initDB() {
         data JSONB DEFAULT '{}',
         started_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Store promotions table (topup_bonus, coupon, discount)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS store_promotions (
+        id SERIAL PRIMARY KEY,
+        store_id TEXT NOT NULL,
+        promo_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        value INTEGER,
+        min_amount INTEGER DEFAULT 0,
+        start_date TIMESTAMPTZ DEFAULT NOW(),
+        end_date TIMESTAMPTZ,
+        is_active BOOLEAN DEFAULT true,
+        created_by TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_store_promotions_store ON store_promotions (store_id)`).catch(() => {});
+
+    // Broadcast templates table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS broadcast_templates (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        message_type TEXT DEFAULT 'flex',
+        content JSONB NOT NULL,
+        target_audience TEXT DEFAULT 'all',
+        created_by TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Broadcast history table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS broadcast_history (
+        id SERIAL PRIMARY KEY,
+        template_id INTEGER,
+        target_audience TEXT,
+        sent_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'sent',
+        broadcast_type TEXT DEFAULT 'manual',
+        sent_at TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(() => {});
 
@@ -7159,6 +7405,194 @@ function buildStoreListCarousel() {
   };
 }
 
+// === Referral Code Generation (YPXXXX format) ===
+async function getOrCreateReferralCode(userId) {
+  try {
+    // Check existing code
+    const existing = await db.query('SELECT code FROM referral_codes WHERE line_user_id = $1', [userId]);
+    if (existing.rows.length > 0) return { code: existing.rows[0].code };
+
+    // Generate unique YP + 4 random uppercase alphanumeric
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let code;
+    let attempts = 0;
+    while (attempts < 20) {
+      let rand = '';
+      for (let i = 0; i < 4; i++) rand += chars[Math.floor(Math.random() * chars.length)];
+      code = 'YP' + rand;
+      const dup = await db.query('SELECT 1 FROM referral_codes WHERE code = $1', [code]);
+      if (dup.rows.length === 0) break;
+      attempts++;
+    }
+
+    await db.query(
+      'INSERT INTO referral_codes (line_user_id, code) VALUES ($1, $2) ON CONFLICT (line_user_id) DO NOTHING',
+      [userId, code]
+    );
+    return { code };
+  } catch (e) {
+    console.error('[Referral Code]', e.message);
+    // Fallback: use last 4 chars of userId
+    return { code: 'YP' + userId.slice(-4).toUpperCase() };
+  }
+}
+
+// === Async Referral Card Builder (for LINE keyword) ===
+async function buildReferralCard(userId) {
+  const codeData = await getOrCreateReferralCode(userId);
+  const countResult = await db.query(
+    'SELECT COUNT(*)::int as cnt, COALESCE(SUM(reward_amount), 0)::int as total_reward FROM referral_records WHERE referrer_id = $1',
+    [userId]
+  );
+  const referralCount = parseInt(countResult.rows[0]?.cnt) || 0;
+  const totalReward = parseInt(countResult.rows[0]?.total_reward) || 0;
+
+  const shareText = encodeURIComponent(`我在用雲管家自助洗衣超方便！輸入我的推薦碼 ${codeData.code} 加入，雙方各得 NT$10 洗衣金！\n${LIFF_URL}`);
+
+  return {
+    type: 'flex', altText: '推薦好友計畫',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '🎁 推薦好友計畫', color: '#E5B94C', weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'box', layout: 'vertical', backgroundColor: '#1A1A1E', cornerRadius: '12px', paddingAll: '16px', contents: [
+            { type: 'text', text: '你的推薦碼', size: 'xs', color: '#999999', align: 'center' },
+            { type: 'text', text: codeData.code, size: 'xxl', weight: 'bold', color: '#E5B94C', align: 'center', margin: 'sm' },
+          ]},
+          { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '已推薦', size: 'xs', color: '#999999', align: 'center' },
+              { type: 'text', text: `${referralCount} 人`, size: 'md', weight: 'bold', color: '#FFFFFF', align: 'center', margin: 'xs' },
+            ]},
+            { type: 'separator', color: '#1A1A1E' },
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '累計獲得', size: 'xs', color: '#999999', align: 'center' },
+              { type: 'text', text: `NT$${totalReward}`, size: 'md', weight: 'bold', color: '#E5B94C', align: 'center', margin: 'xs' },
+            ]},
+          ]},
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'text', text: '分享你的推薦碼給朋友，對方加入後雙方各得 NT$10 洗衣金', size: 'sm', wrap: true, color: '#E0E0E0', margin: 'md' },
+          { type: 'text', text: '💡 朋友只需在聊天中輸入推薦碼即可綁定', size: 'xs', wrap: true, color: '#999999', margin: 'sm' },
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', action: {
+            type: 'uri',
+            label: '分享推薦碼',
+            uri: `https://line.me/R/share?text=${shareText}`
+          }},
+        ]
+      }
+    }
+  };
+}
+
+// === Async Member Level Card Builder (for LINE keyword) ===
+async function buildMemberLevelCardAsync(userId) {
+  // Get total spent from orders
+  const result = await db.query(
+    `SELECT COALESCE(SUM(o.total_amount), 0) as total_spent, COUNT(*)::int as total_washes
+     FROM orders o
+     JOIN members m ON o.member_id = m.id
+     WHERE m.line_user_id = $1 AND o.status = 'completed'`,
+    [userId]
+  );
+  const totalSpent = parseInt(result.rows[0]?.total_spent) || 0;
+  const totalWashes = parseInt(result.rows[0]?.total_washes) || 0;
+  const levelInfo = calculateMemberLevel(totalSpent);
+
+  // Build progress bar using box widths
+  const progressPct = Math.min(100, Math.max(0, levelInfo.progress));
+  const progressWidth = Math.max(5, progressPct); // minimum 5% width for visibility
+
+  // Build level list with current level highlighted
+  const levelRows = MEMBER_LEVELS_ORDER.map(key => {
+    const meta = MEMBER_LEVELS_MAP[key];
+    const isCurrent = key === levelInfo.key;
+    return {
+      type: 'box', layout: 'horizontal', margin: 'sm',
+      contents: [
+        { type: 'text', text: `${meta.icon} ${meta.name}`, size: 'sm', flex: 5, color: isCurrent ? '#E5B94C' : '#FFFFFF', weight: isCurrent ? 'bold' : 'regular' },
+        { type: 'text', text: meta.minSpent > 0 ? `NT$${meta.minSpent} / ${meta.discount}%` : '---', size: 'xs', flex: 4, color: isCurrent ? '#E5B94C' : '#999999', align: 'end' },
+      ]
+    };
+  });
+
+  return {
+    type: 'flex', altText: '我的會員等級',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: `${levelInfo.icon} ${levelInfo.level}`, color: '#E5B94C', weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '累計消費', size: 'xs', color: '#999999' },
+              { type: 'text', text: `NT$${totalSpent.toLocaleString()}`, size: 'md', weight: 'bold', color: '#FFFFFF', margin: 'xs' },
+            ]},
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '洗衣次數', size: 'xs', color: '#999999' },
+              { type: 'text', text: `${totalWashes} 次`, size: 'md', weight: 'bold', color: '#FFFFFF', margin: 'xs' },
+            ]},
+            { type: 'box', layout: 'vertical', flex: 1, contents: [
+              { type: 'text', text: '當前折扣', size: 'xs', color: '#999999' },
+              { type: 'text', text: levelInfo.discount > 0 ? `${levelInfo.discount}%` : '---', size: 'md', weight: 'bold', color: '#E5B94C', margin: 'xs' },
+            ]},
+          ]},
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          ...(levelInfo.nextLevel ? [
+            { type: 'text', text: `距離 ${levelInfo.nextLevel} 還需消費 NT$${levelInfo.amountToNext.toLocaleString()}`, size: 'xs', color: '#999999', margin: 'md', wrap: true },
+            // Progress bar
+            { type: 'box', layout: 'vertical', height: '8px', backgroundColor: '#1A1A1E', cornerRadius: '4px', margin: 'sm', contents: [
+              { type: 'box', layout: 'vertical', height: '8px', backgroundColor: '#E5B94C', cornerRadius: '4px', width: `${progressWidth}%`, contents: [{ type: 'filler' }] },
+            ]},
+            { type: 'text', text: `${progressPct}%`, size: 'xxs', color: '#E5B94C', align: 'end', margin: 'xs' },
+          ] : [
+            { type: 'text', text: '🎉 已達最高等級！', size: 'sm', color: '#E5B94C', margin: 'md', weight: 'bold' },
+          ]),
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'text', text: '全部等級', size: 'sm', weight: 'bold', color: '#FFFFFF', margin: 'md' },
+          ...levelRows,
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'text', text: '💡 每消費 NT$1 = 累計 NT$1，消費自動升等', size: 'xs', color: '#E5B94C', margin: 'md', wrap: true, weight: 'bold' },
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '查看完整會員權益', uri: LIFF_PROFILE } }
+        ]
+      }
+    }
+  };
+}
+
+// Static fallback for KEYWORD_REPLIES (no userId context)
 function buildMemberLevelCard() {
   return {
     type: 'flex', altText: '會員等級說明',
@@ -7178,30 +7612,83 @@ function buildMemberLevelCard() {
       body: {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '消費累積點數，享受更多折扣！', size: 'sm', wrap: true, color: '#E0E0E0' },
+          { type: 'text', text: '消費累積，自動升等享折扣！', size: 'sm', wrap: true, color: '#E0E0E0' },
           { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
           { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
-            { type: 'text', text: '🌱 普通會員', size: 'sm', flex: 5, color: '#FFFFFF' },
-            { type: 'text', text: '0 點起', size: 'xs', flex: 3, color: '#999999', align: 'end' }
+            { type: 'text', text: '⬜ 一般會員', size: 'sm', flex: 5, color: '#FFFFFF' },
+            { type: 'text', text: 'NT$0 起', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
           { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
-            { type: 'text', text: '🥉 銅牌會員', size: 'sm', flex: 5, color: '#FFFFFF' },
-            { type: 'text', text: '500 點 / 折3%', size: 'xs', flex: 3, color: '#999999', align: 'end' }
+            { type: 'text', text: '🥉 銅卡會員', size: 'sm', flex: 5, color: '#FFFFFF' },
+            { type: 'text', text: 'NT$500 / 3%', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
           { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
-            { type: 'text', text: '🥈 銀牌會員', size: 'sm', flex: 5, color: '#FFFFFF' },
-            { type: 'text', text: '2000 點 / 折5%', size: 'xs', flex: 3, color: '#999999', align: 'end' }
+            { type: 'text', text: '🥈 銀卡會員', size: 'sm', flex: 5, color: '#FFFFFF' },
+            { type: 'text', text: 'NT$2,000 / 5%', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
           { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
-            { type: 'text', text: '🥇 金牌會員', size: 'sm', flex: 5, color: '#FFFFFF' },
-            { type: 'text', text: '5000 點 / 折8%', size: 'xs', flex: 3, color: '#999999', align: 'end' }
+            { type: 'text', text: '🥇 金卡會員', size: 'sm', flex: 5, color: '#FFFFFF' },
+            { type: 'text', text: 'NT$5,000 / 8%', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
           { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
             { type: 'text', text: '💎 鑽石會員', size: 'sm', flex: 5, color: '#FFFFFF' },
-            { type: 'text', text: '10000 點 / 折12%', size: 'xs', flex: 3, color: '#999999', align: 'end' }
+            { type: 'text', text: 'NT$10,000 / 12%', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
           { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
-          { type: 'text', text: '💡 每消費 NT$1 = 1 點，點數永久有效', size: 'xs', color: '#E5B94C', margin: 'md', wrap: true, weight: 'bold' }
+          { type: 'text', text: '💡 每消費 NT$1 = 累計 NT$1，消費自動升等', size: 'xs', color: '#E5B94C', margin: 'md', wrap: true, weight: 'bold' }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '查看我的等級', uri: LIFF_PROFILE } }
+        ]
+      }
+    }
+  };
+}
+
+// === Level-Up Notification Flex Card ===
+function buildLevelUpNotification(levelInfo) {
+  const progressContents = levelInfo.nextLevel ? [
+    { type: 'text', text: `距離 ${levelInfo.nextLevel} 還需消費 NT$${levelInfo.amountToNext.toLocaleString()}`, size: 'xs', color: '#999999', margin: 'md', wrap: true },
+    { type: 'box', layout: 'vertical', height: '8px', backgroundColor: '#1A1A1E', cornerRadius: '4px', margin: 'sm', contents: [
+      { type: 'box', layout: 'vertical', height: '8px', backgroundColor: '#E5B94C', cornerRadius: '4px', width: '5%', contents: [{ type: 'filler' }] },
+    ]},
+  ] : [
+    { type: 'text', text: '🎉 已達最高等級！', size: 'sm', color: '#E5B94C', margin: 'md', weight: 'bold' },
+  ];
+
+  return {
+    type: 'flex', altText: '🎉 恭喜升級！',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '🎉 恭喜升級！', color: '#E5B94C', weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: `您已升級為`, size: 'sm', color: '#E0E0E0', align: 'center' },
+          { type: 'text', text: `${levelInfo.icon} ${levelInfo.level}`, size: 'xxl', weight: 'bold', color: levelInfo.color || '#E5B94C', align: 'center', margin: 'md' },
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
+            { type: 'text', text: '專屬折扣', size: 'sm', color: '#999999', flex: 4 },
+            { type: 'text', text: `${levelInfo.discount}% OFF`, size: 'md', weight: 'bold', color: '#E5B94C', flex: 6, align: 'end' },
+          ]},
+          { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
+            { type: 'text', text: '累計消費', size: 'sm', color: '#999999', flex: 4 },
+            { type: 'text', text: `NT$${levelInfo.totalSpent.toLocaleString()}`, size: 'sm', weight: 'bold', color: '#FFFFFF', flex: 6, align: 'end' },
+          ]},
+          ...progressContents,
         ]
       },
       footer: {
@@ -7995,10 +8482,7 @@ const KEYWORD_REPLIES = {
     messages: [buildStoreListCarousel()]
   },
   // '客服' is now handled as special logic in handleTextMessage (customer service forwarding system)
-  '會員': {
-    tags: [],
-    messages: [buildMemberLevelCard()]
-  },
+  // '會員' is now handled as async logic in handleTextMessage (buildMemberLevelCardAsync)
   '洗衣知識': {
     tags: [],
     messages: [buildLaundryTipsCarousel()]
@@ -8055,10 +8539,7 @@ const KEYWORD_REPLIES = {
     tags: [],
     messages: [{ type: 'text', text: '🛏️ 大型衣物洗滌指南：\n\n✅ 可洗：棉被、毛毯、窗簾、大浴巾\n❌ 不建議：羽絨被（建議乾洗）、電毯\n\n💡 洗滌建議：\n1. 選擇「大物洗」模式\n2. 一次只洗一件大型物品\n3. 建議加購洗劑效果更好\n4. 烘乾選中溫 60°C，時間加長\n\n價格：大物洗 NT$90 起\n\n👉 查看空機：' + LIFF_WASH }]
   },
-  '推薦碼': {
-    tags: [],
-    messages: [{ type: 'text', text: '🎁 推薦好友計畫：\n\n分享你的推薦碼，好友首次消費時輸入：\n👉 雙方各得 NT$10 洗衣金！\n\n如何取得推薦碼？\n1. 開啟雲管家 → 我的帳戶\n2. 點選「推薦好友」\n3. 複製推薦碼分享給朋友\n\n📱 立即查看：' + LIFF_PROFILE }]
-  },
+  // '推薦碼' is now handled as async logic in handleTextMessage (buildReferralCard)
   '合約': {
     tags: ['B2B_合約查詢'],
     messages: [{ type: 'text', text: '📄 雲管家合約說明：\n\n📋 月租方案：\n• 最短 3 個月起簽\n• 每月自動續約\n• 提前 30 天通知可終止\n\n📋 年租方案：\n• 一年期合約\n• 年付享 2 個月折扣\n• 含免費系統教學\n\n📋 客製化：\n• 依專案需求議定\n• 含 SLA 服務保障\n\n📞 詳細合約內容請聯繫顧問：\n' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
@@ -8154,8 +8635,8 @@ const FUZZY_MAP = [
   { keywords: ['地址', '在哪', '怎麼去', '門市', '哪裡'], reply: '門市' },
   // Customer - support
   { keywords: ['客服', '真人', '人工', '找人'], reply: '__customer_service__' },
-  // Customer - membership
-  { keywords: ['會員', '等級', '點數', '積分'], reply: '會員' },
+  // Customer - membership (async handled)
+  { keywords: ['會員', '等級', '點數', '積分'], reply: '__member_level__' },
   // Customer - tips
   { keywords: ['洗衣知識', '小常識', '洗衣技巧', '小撇步', '知識'], reply: '洗衣知識' },
   // Legacy
@@ -8165,7 +8646,7 @@ const FUZZY_MAP = [
   { keywords: ['空機', '有沒有位', '還有機器', '有位子'], reply: '空機' },
   { keywords: ['退款', '退費', '退錢', '退回'], reply: '退款' },
   { keywords: ['棉被', '被子', '大型', '窗簾', '毛毯'], reply: '棉被' },
-  { keywords: ['推薦碼', '邀請碼', '推薦好友', '分享碼'], reply: '推薦碼' },
+  { keywords: ['推薦碼', '邀請碼', '推薦好友', '分享碼'], reply: '__referral__' },
   { keywords: ['合約', '簽約', '合同', '契約'], reply: '合約' },
   { keywords: ['安裝', '施工'], reply: '安裝' },
   // About / FAQ / Guarantee
@@ -8985,6 +9466,137 @@ async function handleTextMessage(event, userId, text) {
     await handleCustomerServiceTrigger(event, userId);
     return;
   }
+
+  // Special async handling for '推薦碼' keyword
+  if (text === '推薦碼') {
+    try {
+      const referralCard = await buildReferralCard(userId);
+      await lineReply(event.replyToken, [referralCard]);
+    } catch (e) {
+      console.error('[Referral Card]', e.message);
+      await lineReply(event.replyToken, [{ type: 'text', text: '推薦碼功能暫時無法使用，請稍後再試。' }]);
+    }
+    return;
+  }
+
+  // Special async handling for '會員' keyword
+  if (text === '會員') {
+    try {
+      const memberCard = await buildMemberLevelCardAsync(userId);
+      await lineReply(event.replyToken, [memberCard]);
+    } catch (e) {
+      console.error('[Member Level Card]', e.message);
+      await lineReply(event.replyToken, [buildMemberLevelCard()]);
+    }
+    return;
+  }
+
+  // Detect referral code input (YPXXXX format)
+  const referralCodeMatch = text.trim().toUpperCase().match(/^(YP[A-Z0-9]{4})$/);
+  if (referralCodeMatch) {
+    const inputCode = referralCodeMatch[1];
+    try {
+      // Check if this code exists
+      const codeResult = await db.query('SELECT line_user_id FROM referral_codes WHERE code = $1', [inputCode]);
+      if (codeResult.rows.length > 0) {
+        const referrerUserId = codeResult.rows[0].line_user_id;
+
+        // Cannot use own code
+        if (referrerUserId === userId) {
+          await lineReply(event.replyToken, [{ type: 'text', text: '這是您自己的推薦碼，無法自己使用唷！\n\n請分享給朋友使用。' }]);
+          return;
+        }
+
+        // Check if already referred
+        const existing = await db.query('SELECT 1 FROM referral_records WHERE referee_id = $1', [userId]);
+        if (existing.rows.length > 0) {
+          await lineReply(event.replyToken, [{ type: 'text', text: '您已經使用過推薦碼了，每位用戶只能使用一次推薦碼。' }]);
+          return;
+        }
+
+        // Apply referral
+        const rewardAmount = 10;
+        const client = await db.connect();
+        try {
+          await client.query('BEGIN');
+
+          await client.query(
+            'INSERT INTO referral_records (referrer_id, referee_id, reward_amount, status) VALUES ($1, $2, $3, $4)',
+            [referrerUserId, userId, rewardAmount, 'completed']
+          );
+
+          await client.query('UPDATE referral_codes SET uses = uses + 1 WHERE code = $1', [inputCode]).catch(() => {});
+
+          // Insert into legacy referrals table too
+          await client.query(
+            'INSERT INTO referrals (referrer_user_id, referred_user_id, reward_amount) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+            [referrerUserId, userId, rewardAmount]
+          ).catch(() => {});
+
+          // Reward both users
+          for (const uid of [referrerUserId, userId]) {
+            const wallets = await client.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [uid]);
+            const txType = uid === referrerUserId ? 'referral_reward' : 'referral_bonus';
+            const txDesc = uid === referrerUserId ? `推薦獎勵 (${inputCode})` : `新用戶推薦獎勵 (NT$${rewardAmount})`;
+            for (const w of wallets.rows) {
+              await client.query(
+                `INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+                 ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3`,
+                [uid, w.group_id, rewardAmount]
+              );
+              await client.query(
+                `INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`,
+                [uid, w.group_id, txType, rewardAmount, txDesc]
+              );
+            }
+          }
+
+          await client.query('COMMIT');
+
+          // Notify the user who entered the code
+          await lineReply(event.replyToken, [{
+            type: 'flex', altText: '推薦碼使用成功！',
+            contents: {
+              type: 'bubble', size: 'mega',
+              styles: {
+                header: { backgroundColor: '#0A0A0F' },
+                body: { backgroundColor: '#050508' },
+              },
+              header: { type: 'box', layout: 'vertical', paddingAll: '20px', contents: [
+                { type: 'text', text: '🎉 推薦碼使用成功！', color: '#E5B94C', weight: 'bold', size: 'lg' }
+              ]},
+              body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+                { type: 'text', text: `推薦碼 ${inputCode} 綁定成功`, size: 'sm', color: '#FFFFFF', wrap: true },
+                { type: 'text', text: `您已獲得 NT$${rewardAmount} 洗衣金！`, size: 'md', weight: 'bold', color: '#E5B94C', margin: 'md' },
+                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+                { type: 'text', text: '洗衣金已加入您的錢包，下次洗衣時可直接使用。', size: 'xs', color: '#999999', margin: 'md', wrap: true },
+              ]}
+            }
+          }]);
+
+          // Push notify the referrer
+          try {
+            await sendLinePush(referrerUserId, [{
+              type: 'text', text: `🎉 您的推薦碼 ${inputCode} 被使用了！\n已獲得 NT$${rewardAmount} 洗衣金獎勵！`
+            }], { pushType: 'referral_reward', description: `推薦碼 ${inputCode} 被使用` });
+          } catch (pushErr) { console.error('[Referral Push]', pushErr.message); }
+
+        } catch (txErr) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw txErr;
+        } finally {
+          client.release();
+        }
+        return;
+      }
+      // Code not found -- fall through to normal keyword matching
+    } catch (e) {
+      console.error('[Referral Code Input]', e.message);
+      await lineReply(event.replyToken, [{ type: 'text', text: '推薦碼處理失敗，請稍後再試。' }]);
+      return;
+    }
+  }
+
   const entry = KEYWORD_REPLIES[text];
   if (entry) {
     for (const tag of (entry.tags || [])) await addUserTag(userId, tag);
@@ -8998,6 +9610,28 @@ async function handleTextMessage(event, userId, text) {
       // Special handling for customer service fuzzy match
       if (reply === '__customer_service__') {
         await handleCustomerServiceTrigger(event, userId);
+        return;
+      }
+      // Special async handling for member level fuzzy match
+      if (reply === '__member_level__') {
+        try {
+          const memberCard = await buildMemberLevelCardAsync(userId);
+          await lineReply(event.replyToken, [memberCard]);
+        } catch (e) {
+          console.error('[Member Level Card Fuzzy]', e.message);
+          await lineReply(event.replyToken, [buildMemberLevelCard()]);
+        }
+        return;
+      }
+      // Special async handling for referral fuzzy match
+      if (reply === '__referral__') {
+        try {
+          const referralCard = await buildReferralCard(userId);
+          await lineReply(event.replyToken, [referralCard]);
+        } catch (e) {
+          console.error('[Referral Card Fuzzy]', e.message);
+          await lineReply(event.replyToken, [{ type: 'text', text: '推薦碼功能暫時無法使用，請稍後再試。' }]);
+        }
         return;
       }
       const matched = KEYWORD_REPLIES[reply];
@@ -9989,6 +10623,588 @@ app.put('/api/admin/fault-reports/:id', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ═══════════════════════════════════════
+//  Admin Middleware & Management APIs
+// ═══════════════════════════════════════
+
+// Simple admin auth middleware
+async function requireAdmin(req, res, next) {
+  const userId = req.query.adminId || req.body.adminId;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized: adminId required' });
+  try {
+    const roleInfo = await getUserRole(userId);
+    if (!roleInfo || (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin' && roleInfo.role !== 'store_owner')) {
+      return res.status(403).json({ error: 'Forbidden: admin access required' });
+    }
+    req.adminRole = roleInfo;
+    next();
+  } catch (e) {
+    return res.status(500).json({ error: 'Auth check failed' });
+  }
+}
+
+// ─── Promotions CRUD ───
+
+// GET /api/admin/promotions - List promotions for a store
+app.get('/api/admin/promotions', requireAdmin, async (req, res) => {
+  try {
+    const { storeId } = req.query;
+    let query = 'SELECT * FROM store_promotions';
+    const params = [];
+    if (storeId) {
+      query += ' WHERE store_id = $1';
+      params.push(storeId);
+    }
+    query += ' ORDER BY created_at DESC';
+    const result = await db.query(query, params);
+    res.json({ success: true, promotions: result.rows });
+  } catch (e) {
+    console.error('[Admin] List promotions error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/promotions - Create a new promotion
+app.post('/api/admin/promotions', requireAdmin, async (req, res) => {
+  try {
+    const { storeId, promoType, title, description, value, minAmount, endDate, adminId } = req.body;
+    if (!storeId || !promoType || !title) {
+      return res.status(400).json({ error: 'storeId, promoType, and title are required' });
+    }
+    const result = await db.query(`
+      INSERT INTO store_promotions (store_id, promo_type, title, description, value, min_amount, end_date, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `, [storeId, promoType, title, description || null, value || 0, minAmount || 0, endDate || null, adminId]);
+    console.log(`[Admin] Promotion created: "${title}" for store ${storeId}`);
+    res.json({ success: true, promotion: result.rows[0] });
+  } catch (e) {
+    console.error('[Admin] Create promotion error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/promotions/:id - Update a promotion
+app.put('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, value, minAmount, endDate, isActive } = req.body;
+    const result = await db.query(`
+      UPDATE store_promotions
+      SET title = COALESCE($1, title),
+          description = COALESCE($2, description),
+          value = COALESCE($3, value),
+          min_amount = COALESCE($4, min_amount),
+          end_date = COALESCE($5, end_date),
+          is_active = COALESCE($6, is_active)
+      WHERE id = $7
+      RETURNING *
+    `, [title, description, value, minAmount, endDate, isActive, id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+    console.log(`[Admin] Promotion #${id} updated`);
+    res.json({ success: true, promotion: result.rows[0] });
+  } catch (e) {
+    console.error('[Admin] Update promotion error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/promotions/:id - Deactivate a promotion
+app.delete('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `UPDATE store_promotions SET is_active = false WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+    console.log(`[Admin] Promotion #${id} deactivated`);
+    res.json({ success: true, promotion: result.rows[0] });
+  } catch (e) {
+    console.error('[Admin] Delete promotion error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Broadcast Templates CRUD ───
+
+// GET /api/admin/broadcast-templates - List templates
+app.get('/api/admin/broadcast-templates', requireAdmin, async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM broadcast_templates ORDER BY created_at DESC');
+    res.json({ success: true, templates: result.rows });
+  } catch (e) {
+    console.error('[Admin] List broadcast templates error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/broadcast-templates - Create template
+app.post('/api/admin/broadcast-templates', requireAdmin, async (req, res) => {
+  try {
+    const { title, messageType, content, targetAudience, adminId } = req.body;
+    if (!title || !content) {
+      return res.status(400).json({ error: 'title and content are required' });
+    }
+    const result = await db.query(`
+      INSERT INTO broadcast_templates (title, message_type, content, target_audience, created_by)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+    `, [title, messageType || 'flex', JSON.stringify(content), targetAudience || 'all', adminId]);
+    console.log(`[Admin] Broadcast template created: "${title}"`);
+    res.json({ success: true, template: result.rows[0] });
+  } catch (e) {
+    console.error('[Admin] Create broadcast template error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/broadcast/send - Send a broadcast from template
+app.post('/api/admin/broadcast/send', requireAdmin, async (req, res) => {
+  try {
+    const { templateId, targetAudience, adminId } = req.body;
+    if (!templateId) {
+      return res.status(400).json({ error: 'templateId is required' });
+    }
+
+    // Verify super_admin for broadcast
+    const roleInfo = await getUserRole(adminId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only super_admin can send broadcasts' });
+    }
+
+    // Get template
+    const tmpl = await db.query('SELECT * FROM broadcast_templates WHERE id = $1', [templateId]);
+    if (tmpl.rows.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    const template = tmpl.rows[0];
+    const content = typeof template.content === 'string' ? JSON.parse(template.content) : template.content;
+
+    // Build messages array
+    let messages;
+    if (template.message_type === 'text') {
+      messages = [{ type: 'text', text: typeof content === 'string' ? content : content.text || JSON.stringify(content) }];
+    } else {
+      messages = [{ type: 'flex', altText: template.title, contents: content }];
+    }
+
+    // Determine target store IDs based on audience
+    const audience = targetAudience || template.target_audience || 'all';
+    let targetStoreIds = null;
+    if (audience !== 'all' && audience !== 'b2c' && audience !== 'b2b') {
+      // Treat as store_id
+      targetStoreIds = [audience];
+    }
+
+    // Execute broadcast using existing helper
+    const result = await executeBroadcast(messages, null, null, adminId, targetStoreIds);
+
+    // Record to broadcast_history
+    await db.query(`
+      INSERT INTO broadcast_history (template_id, target_audience, sent_count, status, broadcast_type)
+      VALUES ($1, $2, $3, $4, 'manual')
+    `, [templateId, audience, result.sentCount || 0, result.success ? 'sent' : 'failed']);
+
+    console.log(`[Admin] Broadcast sent from template #${templateId}, audience: ${audience}, count: ${result.sentCount}`);
+    res.json({ success: true, sentCount: result.sentCount, audience });
+  } catch (e) {
+    console.error('[Admin] Send broadcast error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/broadcast-history - View broadcast send history
+app.get('/api/admin/broadcast-history', requireAdmin, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT bh.*, bt.title as template_title
+      FROM broadcast_history bh
+      LEFT JOIN broadcast_templates bt ON bh.template_id = bt.id
+      ORDER BY bh.sent_at DESC
+      LIMIT 100
+    `);
+    res.json({ success: true, history: result.rows });
+  } catch (e) {
+    console.error('[Admin] Broadcast history error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Admin Stats API ───
+
+// GET /api/admin/stats - Dashboard overview stats
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    // Total users
+    const totalUsers = await db.query('SELECT COUNT(*) FROM members');
+
+    // B2C vs B2B counts
+    const b2cCount = await db.query(
+      `SELECT COUNT(DISTINCT line_user_id) FROM user_roles WHERE role = 'consumer'`
+    );
+    const b2bCount = await db.query(
+      `SELECT COUNT(*) FROM b2b_inquiries`
+    );
+
+    // Per-store binding counts
+    const storeBindings = await db.query(`
+      SELECT usb.store_id, s.name as store_name, COUNT(DISTINCT usb.line_user_id) as user_count
+      FROM user_store_bindings usb
+      LEFT JOIN stores s ON usb.store_id = s.id
+      GROUP BY usb.store_id, s.name
+      ORDER BY user_count DESC
+    `);
+
+    // Member level distribution
+    const levelDist = await db.query(`
+      SELECT COALESCE(level, 'normal') as level, COUNT(*) as count
+      FROM member_levels
+      GROUP BY level
+      ORDER BY count DESC
+    `);
+
+    // Active users last 30 days (users who placed an order)
+    const activeUsers = await db.query(`
+      SELECT COUNT(DISTINCT line_user_id) FROM orders
+      WHERE paid_at >= NOW() - INTERVAL '30 days'
+    `);
+
+    // Recent orders count & revenue
+    const recentRevenue = await db.query(`
+      SELECT COUNT(*) as order_count, COALESCE(SUM(amount), 0) as total_revenue
+      FROM orders
+      WHERE paid_at >= NOW() - INTERVAL '30 days' AND status = 'paid'
+    `);
+
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: parseInt(totalUsers.rows[0].count),
+        b2cUsers: parseInt(b2cCount.rows[0].count),
+        b2bInquiries: parseInt(b2bCount.rows[0].count),
+        storeBindings: storeBindings.rows,
+        memberLevelDistribution: levelDist.rows,
+        activeUsersLast30Days: parseInt(activeUsers.rows[0].count),
+        recentOrders: parseInt(recentRevenue.rows[0].order_count),
+        recentRevenue: parseInt(recentRevenue.rows[0].total_revenue)
+      }
+    });
+  } catch (e) {
+    console.error('[Admin] Stats error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  Weekly Auto-Broadcast: Laundry Tips
+// ═══════════════════════════════════════
+
+const LAUNDRY_TIPS = [
+  {
+    title: '衣物标签解密',
+    body: '你知道衣服上的洗涤标签代表什么吗？三角形代表可漂白、圆形代表可乾洗、正方形代表晾干方式。看懂标签，衣物更耐穿！',
+    color: '#E5B94C',
+    icon: 'https://scdn.line-apps.com/n/channel_devcenter/img/fx/01_1_cafe.png'
+  },
+  {
+    title: '自助洗衣杀菌真相',
+    body: '专业自助洗衣机使用60度以上高温洗涤，搭配高速�的烘干，能有效去除99%的尘蟎和细菌。定期使用自助洗衣，守护家人健康！',
+    color: '#4CAF50',
+    icon: 'https://scdn.line-apps.com/n/channel_devcenter/img/fx/01_2_restaurant.png'
+  },
+  {
+    title: '烘衣球的妙用',
+    body: '在烘衣机中放入烘衣球，可以加速烘干、减少静电、让衣物更蓬松柔软。每次可节省约10-15%的烘干时间，既省电又省�的！',
+    color: '#2196F3',
+    icon: 'https://scdn.line-apps.com/n/channel_devcenter/img/fx/01_3_movie.png'
+  },
+  {
+    title: '换季衣物收纳术',
+    body: '换季衣物收纳前，记得先彻底清洗并完全烘干。使用真空压缩袋可节省50%空间，放入干燥剂防止发霉。来自助洗衣做换季大清洗吧！',
+    color: '#FF9800',
+    icon: 'https://scdn.line-apps.com/n/channel_devcenter/img/fx/01_4_shopping.png'
+  },
+  {
+    title: '洗衣机清洁小撇步',
+    body: '专业自助洗衣店的机器每天都会进行清洁维护。在家洗衣机建议每月用洗衣机清洁剂清洗一次，避免霉菌滋生。嫌麻烦？来我们店里洗更安心！',
+    color: '#9C27B0',
+    icon: 'https://scdn.line-apps.com/n/channel_devcenter/img/fx/01_5_travel.png'
+  }
+];
+
+function buildLaundryTipFlex(tip) {
+  return {
+    type: 'flex',
+    altText: `洗衣小知识 - ${tip.title}`,
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0A0A0F',
+        paddingAll: '16px',
+        contents: [
+          {
+            type: 'text',
+            text: '云管家洗衣小知识',
+            color: '#E5B94C',
+            size: 'xs',
+            weight: 'bold'
+          }
+        ]
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#050508',
+        paddingAll: '20px',
+        spacing: 'md',
+        contents: [
+          {
+            type: 'text',
+            text: tip.title,
+            color: tip.color,
+            size: 'xl',
+            weight: 'bold',
+            wrap: true
+          },
+          {
+            type: 'separator',
+            color: '#333333',
+            margin: 'md'
+          },
+          {
+            type: 'text',
+            text: tip.body,
+            color: '#CCCCCC',
+            size: 'sm',
+            wrap: true,
+            lineSpacing: '8px'
+          }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0A0A0F',
+        paddingAll: '12px',
+        contents: [
+          {
+            type: 'text',
+            text: 'YPURE 云管家 | 您的智慧洗衣管家',
+            color: '#666666',
+            size: 'xxs',
+            align: 'center'
+          }
+        ]
+      }
+    }
+  };
+}
+
+// Auto-broadcast scheduler: checks every hour
+// Monday 10:00 (Asia/Taipei) -> send weekly laundry tip
+// 1st of month 10:00 -> send monthly promo reminder
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const twNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+    const dayOfWeek = twNow.getDay(); // 0=Sun, 1=Mon
+    const dayOfMonth = twNow.getDate();
+    const hour = twNow.getHours();
+
+    // Weekly laundry tip: Monday at 10:00
+    if (dayOfWeek === 1 && hour === 10) {
+      // Check if already sent this week
+      const thisWeek = await db.query(`
+        SELECT id FROM broadcast_history
+        WHERE broadcast_type = 'auto_weekly_tip'
+          AND sent_at >= NOW() - INTERVAL '6 days'
+        LIMIT 1
+      `);
+      if (thisWeek.rows.length === 0) {
+        // Determine which tip to send (rotate based on week number)
+        const weekOfYear = Math.ceil((twNow - new Date(twNow.getFullYear(), 0, 1)) / 604800000);
+        const tipIndex = weekOfYear % LAUNDRY_TIPS.length;
+        const tip = LAUNDRY_TIPS[tipIndex];
+        const flexMessage = buildLaundryTipFlex(tip);
+
+        console.log(`[AutoBroadcast] Sending weekly tip #${tipIndex + 1}: "${tip.title}"`);
+
+        // Use LINE broadcast API to send to all followers
+        try {
+          const broadcastRes = await fetch('https://api.line.me/v2/bot/message/broadcast', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+            },
+            body: JSON.stringify({ messages: [flexMessage] }),
+          });
+
+          const status = broadcastRes.ok ? 'sent' : 'failed';
+          if (!broadcastRes.ok) {
+            const errData = await broadcastRes.json().catch(() => ({}));
+            console.error('[AutoBroadcast] LINE API error:', errData);
+          }
+
+          // Record to broadcast_history
+          await db.query(`
+            INSERT INTO broadcast_history (template_id, target_audience, sent_count, status, broadcast_type)
+            VALUES (NULL, 'all', -1, $1, 'auto_weekly_tip')
+          `, [status]);
+
+          // Record to push_logs
+          await db.query(`
+            INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
+            VALUES ('auto_weekly_tip', 0, 1, 'system', $1, $2)
+          `, [`Weekly tip: ${tip.title}`, broadcastRes.ok]);
+
+          console.log(`[AutoBroadcast] Weekly tip "${tip.title}" ${status}`);
+        } catch (sendErr) {
+          console.error('[AutoBroadcast] Send error:', sendErr.message);
+        }
+      }
+    }
+
+    // Monthly promo reminder: 1st of month at 10:00
+    if (dayOfMonth === 1 && hour === 10) {
+      const thisMonth = await db.query(`
+        SELECT id FROM broadcast_history
+        WHERE broadcast_type = 'auto_monthly_promo'
+          AND sent_at >= NOW() - INTERVAL '25 days'
+        LIMIT 1
+      `);
+      if (thisMonth.rows.length === 0) {
+        // Check for active promotions
+        const activePromos = await db.query(`
+          SELECT sp.*, s.name as store_name
+          FROM store_promotions sp
+          LEFT JOIN stores s ON sp.store_id = s.id
+          WHERE sp.is_active = true
+            AND (sp.end_date IS NULL OR sp.end_date >= NOW())
+          ORDER BY sp.created_at DESC
+          LIMIT 3
+        `);
+
+        if (activePromos.rows.length > 0) {
+          const promoList = activePromos.rows.map(p =>
+            `${p.store_name || p.store_id}: ${p.title} (${p.promo_type === 'topup_bonus' ? '储值回馈' : p.promo_type === 'discount' ? '折扣' : '优惠券'})`
+          ).join('\n');
+
+          const monthlyMessage = {
+            type: 'flex',
+            altText: '本月活动推播',
+            contents: {
+              type: 'bubble',
+              size: 'mega',
+              header: {
+                type: 'box',
+                layout: 'vertical',
+                backgroundColor: '#0A0A0F',
+                paddingAll: '16px',
+                contents: [
+                  {
+                    type: 'text',
+                    text: '本月精选活动',
+                    color: '#E5B94C',
+                    size: 'lg',
+                    weight: 'bold',
+                    align: 'center'
+                  }
+                ]
+              },
+              body: {
+                type: 'box',
+                layout: 'vertical',
+                backgroundColor: '#050508',
+                paddingAll: '20px',
+                spacing: 'md',
+                contents: activePromos.rows.map(p => ({
+                  type: 'box',
+                  layout: 'vertical',
+                  spacing: 'sm',
+                  margin: 'md',
+                  contents: [
+                    {
+                      type: 'text',
+                      text: `${p.store_name || p.store_id}`,
+                      color: '#E5B94C',
+                      size: 'sm',
+                      weight: 'bold'
+                    },
+                    {
+                      type: 'text',
+                      text: `${p.title}${p.value ? ` - NT$${p.value}` : ''}`,
+                      color: '#CCCCCC',
+                      size: 'sm',
+                      wrap: true
+                    }
+                  ]
+                }))
+              },
+              footer: {
+                type: 'box',
+                layout: 'vertical',
+                backgroundColor: '#0A0A0F',
+                paddingAll: '12px',
+                contents: [
+                  {
+                    type: 'text',
+                    text: 'YPURE 云管家 | 您的智慧洗衣管家',
+                    color: '#666666',
+                    size: 'xxs',
+                    align: 'center'
+                  }
+                ]
+              }
+            }
+          };
+
+          try {
+            const broadcastRes = await fetch('https://api.line.me/v2/bot/message/broadcast', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+              },
+              body: JSON.stringify({ messages: [monthlyMessage] }),
+            });
+
+            const status = broadcastRes.ok ? 'sent' : 'failed';
+            await db.query(`
+              INSERT INTO broadcast_history (template_id, target_audience, sent_count, status, broadcast_type)
+              VALUES (NULL, 'all', -1, $1, 'auto_monthly_promo')
+            `, [status]);
+
+            await db.query(`
+              INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
+              VALUES ('auto_monthly_promo', 0, 1, 'system', $1, $2)
+            `, [`Monthly promo: ${activePromos.rows.length} active promotions`, broadcastRes.ok]);
+
+            console.log(`[AutoBroadcast] Monthly promo ${status}, ${activePromos.rows.length} promotions`);
+          } catch (sendErr) {
+            console.error('[AutoBroadcast] Monthly promo send error:', sendErr.message);
+          }
+        } else {
+          console.log('[AutoBroadcast] No active promotions for monthly broadcast, skipping');
+        }
+      }
+    }
+  } catch (e) {
+    // Silently ignore auto-broadcast errors
+    console.error('[AutoBroadcast] Scheduler error:', e.message);
+  }
+}, 3600000); // Check every hour (3600000ms)
+
+console.log('[AutoBroadcast] Scheduler started - weekly tips (Mon 10:00) + monthly promos (1st 10:00)');
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
