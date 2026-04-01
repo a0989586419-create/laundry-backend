@@ -701,10 +701,18 @@ app.get('/api/user/profile', async (req, res) => {
       // Consumer must enter via a group link to get associated
     }
 
-    // Get stores for each group
-    for (const g of groups) {
-      const sr = await db.query('SELECT * FROM stores WHERE group_id=$1 ORDER BY name', [g.id]);
-      g.stores = sr.rows;
+    // Get stores for each group (single query)
+    if (groups.length > 0) {
+      const groupIds = groups.map(g => g.id);
+      const sr = await db.query('SELECT * FROM stores WHERE group_id = ANY($1) ORDER BY name', [groupIds]);
+      const storesByGroup = {};
+      for (const s of sr.rows) {
+        if (!storesByGroup[s.group_id]) storesByGroup[s.group_id] = [];
+        storesByGroup[s.group_id].push(s);
+      }
+      for (const g of groups) {
+        g.stores = storesByGroup[g.id] || [];
+      }
     }
 
     // Get wallets
@@ -867,9 +875,17 @@ app.get('/api/store-groups', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'Missing userId parameter' });
   try {
     const gr = await db.query('SELECT * FROM store_groups ORDER BY name');
-    for (const g of gr.rows) {
-      const sr = await db.query('SELECT * FROM stores WHERE group_id=$1 ORDER BY name', [g.id]);
-      g.stores = sr.rows;
+    if (gr.rows.length > 0) {
+      const groupIds = gr.rows.map(g => g.id);
+      const sr = await db.query('SELECT * FROM stores WHERE group_id = ANY($1) ORDER BY name', [groupIds]);
+      const storesByGroup = {};
+      for (const s of sr.rows) {
+        if (!storesByGroup[s.group_id]) storesByGroup[s.group_id] = [];
+        storesByGroup[s.group_id].push(s);
+      }
+      for (const g of gr.rows) {
+        g.stores = storesByGroup[g.id] || [];
+      }
     }
     res.json(gr.rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1489,9 +1505,14 @@ app.get('/api/payment/confirm', async (req, res) => {
 });
 
 app.get('/api/payment/cancel', async (req, res) => {
-  const { orderId } = req.query;
-  if (orderId) await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
-  res.redirect(`https://laundry-frontend-chi.vercel.app/?status=cancel&orderId=${orderId || ''}`);
+  try {
+    const { orderId } = req.query;
+    if (orderId) await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
+    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=cancel&orderId=${orderId || ''}`);
+  } catch (err) {
+    console.error('[payment/cancel] Error:', err.message);
+    res.redirect(`${FRONTEND_URL}/?paymentResult=pay_fail`);
+  }
 });
 
 // ═══════════════════════════════════════
@@ -1674,6 +1695,13 @@ app.post('/api/payment/create', async (req, res) => {
 
 // API: Report machine state from frontend (for cross-user visibility)
 app.post('/api/machines/state', async (req, res) => {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  if (!apiKey || apiKey !== process.env.IOT_API_KEY) {
+    // Allow if IOT_API_KEY is not set (backward compatibility during migration)
+    if (process.env.IOT_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
   try {
     const { machineId, state, remainSec } = req.body;
     if (!machineId) return res.status(400).json({ error: 'machineId required' });
@@ -2419,6 +2447,10 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
 
 // GET /api/tb/diag — ThingsBoard connectivity diagnostic
 app.get('/api/tb/diag', async (req, res) => {
+  const role = await getUserRole(req.query.userId);
+  if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
   const steps = { tb_base: TB_BASE };
   try {
     // Step 1: Login
@@ -2464,6 +2496,10 @@ app.get('/api/tb/diag', async (req, res) => {
 // GET /api/tb/telemetry/:deviceName — 查詢單台機器最新遙測
 app.get('/api/tb/telemetry/:deviceName', async (req, res) => {
   try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
     const { deviceName } = req.params;
     const keys = req.query.keys || 'state,door,remain_sec,temperature,rpm,wash_program,dry_program,current_step,required_coins,current_coins,fault,warning';
     const deviceId = await getTBDeviceId(deviceName);
@@ -2541,6 +2577,10 @@ app.get('/api/tb/telemetry/store/:storeId', async (req, res) => {
 // GET /api/tb/history/:deviceName — 查詢歷史遙測（時間序列）
 app.get('/api/tb/history/:deviceName', async (req, res) => {
   try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
     const { deviceName } = req.params;
     const keys = req.query.keys || 'state,temperature,rpm';
     const startTs = req.query.startTs || (Date.now() - 24 * 3600 * 1000); // default: last 24h
@@ -2569,6 +2609,10 @@ app.get('/api/tb/history/:deviceName', async (req, res) => {
 // GET /api/tb/attributes/:deviceName — 查詢設備屬性（shared + client）
 app.get('/api/tb/attributes/:deviceName', async (req, res) => {
   try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
     const { deviceName } = req.params;
     const deviceId = await getTBDeviceId(deviceName);
     if (!deviceId) return res.status(404).json({ error: `Device ${deviceName} not found` });
@@ -2596,6 +2640,10 @@ app.get('/api/tb/attributes/:deviceName', async (req, res) => {
 // 從 TB shared attributes 讀取，工控機每 5 分鐘自動更新
 app.get('/api/tb/config/:storeId', async (req, res) => {
   try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
     const { storeId } = req.params;
     // Read config from first machine of this store (all machines share same config)
     const deviceName = `${storeId}-m1`;
@@ -2847,36 +2895,44 @@ app.get('/api/monitor/overview', async (req, res) => {
       return res.status(403).json({ error: '無機器監控權限' });
     }
 
-    // Get all stores
-    const storesRes = await db.query('SELECT id, name FROM stores ORDER BY id');
+    // Get all stores and machines in a single query (avoid N+1)
+    const allData = await db.query(
+      `SELECT s.id as store_id, s.name as store_name,
+        m.id as machine_id, m.name as machine_name,
+        COALESCE(cs.state, 'idle') as state,
+        COALESCE(cs.remain_sec, 0) as remain_sec
+      FROM stores s
+      LEFT JOIN machines m ON m.store_id = s.id AND m.active = true
+      LEFT JOIN machine_current_state cs ON m.id = cs.machine_id
+      ORDER BY s.id, m.sort_order, m.name`
+    );
+
+    // Group by store
+    const storeMap = new Map();
+    for (const row of allData.rows) {
+      if (!storeMap.has(row.store_id)) {
+        storeMap.set(row.store_id, { store_id: row.store_id, store_name: row.store_name, machines: [] });
+      }
+      if (row.machine_id) {
+        storeMap.get(row.store_id).machines.push({
+          id: row.machine_id, name: row.machine_name, state: row.state, remain_sec: parseInt(row.remain_sec) || 0
+        });
+      }
+    }
+
     const stores = [];
-
-    for (const store of storesRes.rows) {
-      const machinesRes = await db.query(
-        `SELECT m.id, m.name,
-          COALESCE(cs.state, 'idle') as state,
-          COALESCE(cs.remain_sec, 0) as remain_sec
-        FROM machines m
-        LEFT JOIN machine_current_state cs ON m.id = cs.machine_id
-        WHERE m.store_id=$1 AND m.active=true
-        ORDER BY m.sort_order, m.name`,
-        [store.id]
-      );
-
-      const running = machinesRes.rows.filter(m => m.state === 'running').length;
-      const idle = machinesRes.rows.filter(m => m.state === 'idle' || m.state === 'done' || m.state === 'unknown').length;
-      const fault = machinesRes.rows.filter(m => m.state === 'fault').length;
-
+    for (const entry of storeMap.values()) {
+      const running = entry.machines.filter(m => m.state === 'running').length;
+      const idle = entry.machines.filter(m => m.state === 'idle' || m.state === 'done' || m.state === 'unknown').length;
+      const fault = entry.machines.filter(m => m.state === 'fault').length;
       stores.push({
-        store_id: store.id,
-        store_name: store.name,
-        total: machinesRes.rows.length,
+        store_id: entry.store_id,
+        store_name: entry.store_name,
+        total: entry.machines.length,
         running,
         idle,
         fault,
-        machines: machinesRes.rows.map(m => ({
-          id: m.id, name: m.name, state: m.state, remain_sec: parseInt(m.remain_sec) || 0
-        }))
+        machines: entry.machines
       });
     }
 
@@ -5513,6 +5569,13 @@ app.get('/api/user/member-level', async (req, res) => {
 
 // POST /api/user/add-spending - Add spending and check level upgrade
 app.post('/api/user/add-spending', async (req, res) => {
+  const callerRole = await getUserRole(req.body.callerUserId || req.query.userId);
+  if (!callerRole || !['super_admin', 'store_admin'].includes(callerRole.role)) {
+    // Allow if called internally (no callerUserId means system call)
+    if (req.body.callerUserId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+  }
   try {
     const { userId, amount } = req.body;
     if (!userId || !amount) return res.status(400).json({ error: 'userId and amount required' });
@@ -5995,6 +6058,10 @@ app.post('/api/admin/store-owners', async (req, res) => {
 
 // Super admin: list all store owners
 app.get('/api/admin/store-owners', async (req, res) => {
+  const role = await getUserRole(req.query.userId);
+  if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
   try {
     const r = await db.query('SELECT * FROM store_owners ORDER BY created_at DESC');
     res.json({ owners: r.rows });
@@ -6003,6 +6070,10 @@ app.get('/api/admin/store-owners', async (req, res) => {
 
 // Super admin: revenue report (with optional storeId filter)
 app.get('/api/admin/revenue', async (req, res) => {
+  const role = await getUserRole(req.query.userId);
+  if (!role || !['super_admin', 'store_admin'].includes(role.role)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
   const { period = 'daily', days = 30, storeId } = req.query;
   try {
     const safeDays = parseInt(days) || 30;
@@ -6324,6 +6395,8 @@ async function initDB() {
     // Index for faster queries on push_logs
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_created_at ON push_logs (created_at)`).catch(() => {});
     await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_group_id ON push_logs (group_id)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_push_logs_group_created ON push_logs (group_id, created_at)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_store_push_balance_group ON store_push_balance (group_id)`).catch(() => {});
 
     // Scheduled broadcasts table
     await db.query(`
