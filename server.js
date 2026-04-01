@@ -9805,6 +9805,191 @@ app.get('/api/admin/usage-heatmap', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════
+//  API: Machine Fault Reports (故障回報)
+// ═══════════════════════════════════════
+
+// Flex message builder for fault report admin notification
+function buildFaultReportFlexMessage({ storeName, machineName, description, reportId }) {
+  const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+  return {
+    type: 'bubble', size: 'kilo',
+    styles: {
+      header: { backgroundColor: '#0D1117' },
+      body: { backgroundColor: '#0D1117' },
+    },
+    header: {
+      type: 'box', layout: 'vertical', paddingAll: '15px',
+      contents: [
+        { type: 'text', text: '⚠️ 機器故障回報', weight: 'bold', size: 'lg', color: '#E74C3C' }
+      ]
+    },
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '15px',
+      contents: [
+        { type: 'box', layout: 'horizontal', contents: [
+          { type: 'text', text: '門市', size: 'sm', color: '#999999', flex: 2 },
+          { type: 'text', text: storeName || '未知', size: 'sm', color: '#FFFFFF', flex: 5 }
+        ]},
+        { type: 'box', layout: 'horizontal', contents: [
+          { type: 'text', text: '機台', size: 'sm', color: '#999999', flex: 2 },
+          { type: 'text', text: machineName || '未知', size: 'sm', color: '#FFFFFF', flex: 5 }
+        ]},
+        { type: 'box', layout: 'horizontal', contents: [
+          { type: 'text', text: '問題', size: 'sm', color: '#999999', flex: 2 },
+          { type: 'text', text: description || '未描述', size: 'sm', color: '#F59E0B', flex: 5, wrap: true }
+        ]},
+        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
+          { type: 'text', text: '回報編號', size: 'xs', color: '#777777', flex: 2 },
+          { type: 'text', text: `#${reportId}`, size: 'xs', color: '#999999', flex: 5 }
+        ]},
+        { type: 'box', layout: 'horizontal', contents: [
+          { type: 'text', text: '回報時間', size: 'xs', color: '#777777', flex: 2 },
+          { type: 'text', text: now, size: 'xs', color: '#999999', flex: 5 }
+        ]}
+      ]
+    }
+  };
+}
+
+// POST /api/fault-report - 用戶回報機器故障
+app.post('/api/fault-report', async (req, res) => {
+  try {
+    const { userId, storeId, machineId, machineName, description } = req.body;
+    if (!userId || !storeId || !machineId) {
+      return res.status(400).json({ error: 'userId, storeId, machineId required' });
+    }
+
+    // Insert fault report
+    const result = await db.query(
+      `INSERT INTO fault_reports (user_id, store_id, machine_id, machine_name, description)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [userId, storeId, machineId, machineName || '', description || '']
+    );
+    const reportId = result.rows[0].id;
+
+    // Get store name for notification
+    const storeRow = (await db.query('SELECT name, group_id FROM stores WHERE id=$1', [storeId])).rows[0];
+    const storeName = storeRow?.name || storeId;
+    const groupId = storeRow?.group_id;
+
+    console.log(`[Fault] Report #${reportId} created: store=${storeName}, machine=${machineName}, desc=${description}`);
+
+    // Notify admin(s) via LINE push
+    try {
+      // Try to find store_admin for this group
+      let adminUsers = [];
+      if (groupId) {
+        const adminRes = await db.query(
+          `SELECT line_user_id FROM user_roles WHERE role IN ('store_admin', 'super_admin') AND (group_id=$1 OR group_id IS NULL)`,
+          [groupId]
+        );
+        adminUsers = adminRes.rows.map(r => r.line_user_id);
+      }
+      // Fallback to super admin
+      if (adminUsers.length === 0) {
+        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+        adminUsers = [SUPER_ADMIN_ID];
+      }
+      // Send notification to each admin
+      const flexContent = buildFaultReportFlexMessage({ storeName, machineName: machineName || machineId, description: description || '用戶未描述問題', reportId });
+      for (const adminId of adminUsers) {
+        sendLineFlexMessage(adminId, '⚠️ 機器故障回報', flexContent, {
+          pushType: 'fault_report', storeId, groupId,
+          description: `故障回報 #${reportId} ${storeName} ${machineName || machineId}`
+        }).catch(e => console.error('[Fault] Admin notify error:', e.message));
+      }
+      console.log(`[Fault] Notified ${adminUsers.length} admin(s) for report #${reportId}`);
+    } catch (notifyErr) {
+      console.error('[Fault] Admin notification error:', notifyErr.message);
+    }
+
+    res.json({ success: true, reportId });
+  } catch (e) {
+    console.error('[Fault] Create report error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/fault-reports - 管理員查看故障列表
+app.get('/api/fault-reports', async (req, res) => {
+  try {
+    const { storeId, status, groupId, limit } = req.query;
+    let query = `
+      SELECT fr.*, s.name as store_name
+      FROM fault_reports fr
+      LEFT JOIN stores s ON fr.store_id = s.id
+      WHERE 1=1
+    `;
+    const params = [];
+    let paramIdx = 0;
+
+    if (storeId) {
+      paramIdx++;
+      query += ` AND fr.store_id = $${paramIdx}`;
+      params.push(storeId);
+    }
+    if (groupId) {
+      paramIdx++;
+      query += ` AND s.group_id = $${paramIdx}`;
+      params.push(groupId);
+    }
+    if (status) {
+      paramIdx++;
+      query += ` AND fr.status = $${paramIdx}`;
+      params.push(status);
+    }
+    query += ` ORDER BY fr.created_at DESC`;
+    if (limit) {
+      paramIdx++;
+      query += ` LIMIT $${paramIdx}`;
+      params.push(parseInt(limit) || 50);
+    } else {
+      query += ` LIMIT 100`;
+    }
+
+    const result = await db.query(query, params);
+    res.json({ success: true, reports: result.rows });
+  } catch (e) {
+    console.error('[Fault] List reports error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/fault-reports/:id - 管理員標記故障已解決
+app.put('/api/admin/fault-reports/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, userId } = req.body;
+
+    // Verify admin role
+    if (userId) {
+      const roleInfo = await getUserRole(userId);
+      if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+        return res.status(403).json({ error: 'forbidden' });
+      }
+    }
+
+    const newStatus = status || 'resolved';
+    const resolvedAt = newStatus === 'resolved' ? 'NOW()' : 'NULL';
+    const result = await db.query(
+      `UPDATE fault_reports SET status = $1, resolved_at = ${resolvedAt} WHERE id = $2 RETURNING *`,
+      [newStatus, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    console.log(`[Fault] Report #${id} updated to status: ${newStatus}`);
+    res.json({ success: true, report: result.rows[0] });
+  } catch (e) {
+    console.error('[Fault] Update report error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   await initDB();
