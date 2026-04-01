@@ -303,7 +303,7 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
         { type: 'text', text: '✅ 付款成功', color: '#4ADE80', size: 'sm', weight: 'bold' },
         { type: 'text', text: `${storeName || '雲管家'}`, size: 'lg', weight: 'bold', color: '#E5B94C' },
         { type: 'text', text: machineName || '', color: '#999999', size: 'sm' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
           { type: 'text', text: modeName || '洗衣+烘乾(標準)', flex: 5, size: 'md', weight: 'bold', color: '#E0E0E0' },
           { type: 'text', text: `$ ${amount || 0}`, flex: 3, size: 'md', align: 'end', color: '#E0E0E0' },
@@ -312,12 +312,12 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
           { type: 'text', text: '使用店家點數折抵', flex: 5, size: 'sm', color: '#4ADE80' },
           { type: 'text', text: `-${discount || 0}`, flex: 3, size: 'sm', align: 'end', color: '#4ADE80' },
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
           { type: 'text', text: '付款金額', flex: 5, size: 'md', weight: 'bold', color: '#FFFFFF' },
           { type: 'text', text: `NT $ ${finalAmount || amount || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#E5B94C' },
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
             { type: 'text', text: '訂單編號', size: 'xs', color: '#777777', flex: 3 },
@@ -332,7 +332,7 @@ function buildPaymentFlexMessage({ storeName, machineName, modeName, amount, dis
             { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#999999', flex: 5, align: 'end' },
           ]},
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '10px', backgroundColor: '#0A0A0F', cornerRadius: '8px', contents: [
           { type: 'text', text: `⏱ 預計 ${minutes || 65} 分鐘完成`, size: 'sm', color: '#F87171', weight: 'bold' },
         ]},
@@ -364,9 +364,9 @@ function buildCompleteFlexMessage(storeName, machineName, supportUrl, supportPho
           { type: 'text', text: '🎉', size: 'xxl' },
           { type: 'text', text: '洗衣完成', size: 'lg', weight: 'bold', color: '#E5B94C', gravity: 'center' },
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '您的衣服已經洗乾淨，可以過來領取囉！', size: 'md', wrap: true, margin: 'lg', color: '#E0E0E0' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
             { type: 'text', text: '門市', size: 'sm', color: '#777777', flex: 2 },
@@ -402,12 +402,12 @@ function buildTopupFlexMessage({ groupName, amount, balance, supportUrl, support
       contents: [
         { type: 'text', text: '💰 儲值成功', color: '#4ADE80', size: 'sm', weight: 'bold' },
         { type: 'text', text: groupName || '雲管家', size: 'lg', weight: 'bold', color: '#E5B94C' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
           { type: 'text', text: '儲值金額', flex: 3, size: 'md', color: '#E0E0E0' },
           { type: 'text', text: `+NT$ ${amount}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#4ADE80' },
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'md', contents: [
           { type: 'text', text: '目前餘額', flex: 3, size: 'md', weight: 'bold', color: '#FFFFFF' },
           { type: 'text', text: `NT$ ${balance || 0}`, flex: 3, size: 'lg', align: 'end', weight: 'bold', color: '#E5B94C' },
@@ -442,7 +442,7 @@ function buildAlmostDoneFlexMessage(storeName, machineName, remainMin, supportUr
           { type: 'text', text: '⏰', size: 'xxl' },
           { type: 'text', text: '即將完成提醒', size: 'lg', weight: 'bold', color: '#E5B94C', gravity: 'center' },
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'text', text: '您的洗衣即將完成，可以準備前往取衣了！', size: 'md', wrap: true, margin: 'md', color: '#E0E0E0' },
         { type: 'box', layout: 'vertical', margin: 'md', spacing: 'sm', contents: [
           { type: 'box', layout: 'horizontal', contents: [
@@ -484,7 +484,7 @@ function buildPromoFlexMessage(message, options = {}) {
       type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
       contents: [
         { type: 'text', text: title || '雲管家通知', size: 'lg', weight: 'bold', color: '#E5B94C' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: message, wrap: true, size: 'md', color: '#E0E0E0', margin: 'md' },
       ]
     },
@@ -6881,7 +6881,7 @@ function buildCustomerWelcomeReply() {
               ]}
             ]
           },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 儲值享加碼回饋，優惠金額依門市活動而定', size: 'sm', wrap: true, color: BRAND_GOLD, margin: 'md', weight: 'bold' }
         ]
       }
@@ -6984,7 +6984,7 @@ function buildBusinessWelcomeReply() {
               ]}
             ]
           },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💰 月租方案 NT$5,000 起｜最快 7 天上線', size: 'sm', align: 'center', color: BRAND_GOLD, weight: 'bold', margin: 'md', wrap: true }
         ]
       },
@@ -7052,12 +7052,12 @@ function buildPaymentSuccessNotification({ storeName, machineName, mode, amount,
             { type: 'text', text: '洗衣模式', size: 'sm', color: '#999999', flex: 3 },
             { type: 'text', text: mode || '---', size: 'sm', color: '#FFFFFF', flex: 5, align: 'end' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', margin: 'md', contents: [
             { type: 'text', text: '付款金額', size: 'md', color: '#FFFFFF', flex: 3, weight: 'bold' },
             { type: 'text', text: `NT$ ${amount || 0}`, size: 'lg', color: '#E5B94C', flex: 5, align: 'end', weight: 'bold' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', contents: [
             { type: 'text', text: '付款方式', size: 'xs', color: '#999999', flex: 3 },
             { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#999999', flex: 5, align: 'end' }
@@ -7108,7 +7108,7 @@ function buildAlmostDoneNotification({ storeName, machineName, remainingMinutes 
             { type: 'text', text: '\u23F1 剩餘時間', size: 'sm', color: '#E5B94C', flex: 2, weight: 'bold' },
             { type: 'text', text: `${remainingMinutes || 5} 分鐘`, size: 'lg', color: '#F59E0B', flex: 3, align: 'end', weight: 'bold' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'text', text: '請準備前往取衣，避免佔用機器', size: 'xs', color: '#999999', margin: 'md', wrap: true }
         ]
       },
@@ -7148,7 +7148,7 @@ function buildWashCompleteNotification({ storeName, machineName, totalTime }) {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: `您在 ${storeName || '門市'} 的 ${machineName || '機器'} 已完成洗衣！`, size: 'md', wrap: true, color: '#FFFFFF', weight: 'bold' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', margin: 'md', contents: [
             { type: 'text', text: '門市', size: 'sm', color: '#999999', flex: 2 },
             { type: 'text', text: storeName || '---', size: 'sm', color: '#FFFFFF', flex: 3, align: 'end', weight: 'bold' }
@@ -7161,7 +7161,7 @@ function buildWashCompleteNotification({ storeName, machineName, totalTime }) {
             { type: 'text', text: '總耗時', size: 'sm', color: '#999999', flex: 2 },
             { type: 'text', text: `${totalTime} 分鐘`, size: 'sm', color: '#FFFFFF', flex: 3, align: 'end' }
           ]}] : []),
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '12px', backgroundColor: '#0A0A0F', cornerRadius: '8px', contents: [
             { type: 'text', text: '請盡快取衣，超過 30 分鐘將自動佔機計費', size: 'xs', color: '#F59E0B', wrap: true, weight: 'bold' }
           ]}
@@ -7195,12 +7195,12 @@ function buildTopupSuccessNotification({ amount, bonus, newBalance }) {
     );
   }
   bodyContents.push(
-    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+    { type: 'separator', color: '#1A1A1E', margin: 'md' },
     { type: 'box', layout: 'horizontal', margin: 'md', contents: [
       { type: 'text', text: '目前餘額', size: 'md', color: '#FFFFFF', flex: 3, weight: 'bold' },
       { type: 'text', text: `NT$ ${newBalance || 0}`, size: 'lg', color: '#E5B94C', flex: 5, align: 'end', weight: 'bold' }
     ]},
-    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+    { type: 'separator', color: '#1A1A1E', margin: 'md' },
     { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
       { type: 'text', text: '儲值時間', size: 'xs', color: '#999999', flex: 3 },
       { type: 'text', text: now, size: 'xs', color: '#999999', flex: 5, align: 'end' }
@@ -7264,7 +7264,7 @@ function buildPriceGuideCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '各模式參考價格', size: 'md', weight: 'bold', color: '#FFFFFF' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
             { type: 'text', text: '🧺 單洗', size: 'sm', flex: 4, color: '#E0E0E0' },
             { type: 'text', text: 'NT$40 起', size: 'sm', weight: 'bold', flex: 4, align: 'end', color: BRAND_GOLD }
@@ -7281,7 +7281,7 @@ function buildPriceGuideCard() {
             { type: 'text', text: '🔥 烘衣', size: 'sm', flex: 4, color: '#E0E0E0' },
             { type: 'text', text: 'NT$30 起', size: 'sm', weight: 'bold', flex: 4, align: 'end', color: BRAND_GOLD }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '* 價格依機型大小而異，大型機器價格略高', size: 'xxs', color: '#999999', margin: 'md', wrap: true },
           { type: 'text', text: '💡 儲值享加碼回饋，優惠依門市活動而定', size: 'xs', color: BRAND_GOLD, margin: 'md', weight: 'bold', wrap: true }
         ]
@@ -7316,7 +7316,7 @@ function buildTopupBenefitsCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '儲值三大好處', size: 'md', weight: 'bold', color: '#FFFFFF' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           {
             type: 'box', layout: 'horizontal', margin: 'lg', contents: [
               { type: 'box', layout: 'vertical', backgroundColor: '#151518', cornerRadius: '8px', width: '36px', height: '36px', justifyContent: 'center', alignItems: 'center', flex: 0, contents: [
@@ -7434,7 +7434,7 @@ function buildDryerGuideCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '溫度選擇建議', size: 'md', weight: 'bold', color: '#FFFFFF' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
             { type: 'text', text: '低溫 40°C', size: 'sm', flex: 4, color: '#FFFFFF' },
             { type: 'text', text: '內衣褲、絲質衣物', size: 'sm', flex: 6, wrap: true, color: '#E0E0E0' }
@@ -7447,7 +7447,7 @@ function buildDryerGuideCard() {
             { type: 'text', text: '高溫 80°C', size: 'sm', flex: 4, color: '#FFFFFF' },
             { type: 'text', text: '毛巾、床單、厚棉衣', size: 'sm', flex: 6, wrap: true, color: '#E0E0E0' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 小技巧', size: 'sm', weight: 'bold', margin: 'md', color: '#E5B94C' },
           { type: 'text', text: '1. 衣物不要塞太滿，七分滿最佳\n2. 加烘衣球可減少20%烘乾時間\n3. 牛仔褲建議反面烘乾避免褪色', size: 'xs', wrap: true, margin: 'sm', color: '#E0E0E0' }
         ]
@@ -7476,7 +7476,7 @@ function buildFirstWashGuideCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '只要 4 步驟，超簡單！', size: 'md', weight: 'bold', color: '#FFFFFF' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           {
             type: 'box', layout: 'horizontal', margin: 'lg', contents: [
               {
@@ -7682,7 +7682,7 @@ async function buildReferralCard(userId) {
               { type: 'text', text: `NT$${totalReward}`, size: 'md', weight: 'bold', color: '#E5B94C', align: 'center', margin: 'xs' },
             ]},
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '分享你的推薦碼給朋友，對方加入後雙方各得 NT$10 洗衣金', size: 'sm', wrap: true, color: '#E0E0E0', margin: 'md' },
           { type: 'text', text: '💡 朋友只需在聊天中輸入推薦碼即可綁定', size: 'xs', wrap: true, color: '#999999', margin: 'sm' },
         ]
@@ -7764,7 +7764,7 @@ async function buildMemberLevelCardAsync(userId) {
               { type: 'text', text: levelInfo.discount > 0 ? `${levelInfo.discount}%` : '---', size: 'md', weight: 'bold', color: '#E5B94C', margin: 'xs' },
             ]},
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           ...(levelInfo.nextLevel ? [
             { type: 'text', text: `距離 ${levelInfo.nextLevel} 還需消費 NT$${levelInfo.amountToNext.toLocaleString()}`, size: 'xs', color: '#999999', margin: 'md', wrap: true },
             // Progress bar
@@ -7775,10 +7775,10 @@ async function buildMemberLevelCardAsync(userId) {
           ] : [
             { type: 'text', text: '🎉 已達最高等級！', size: 'sm', color: '#E5B94C', margin: 'md', weight: 'bold' },
           ]),
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'text', text: '全部等級', size: 'sm', weight: 'bold', color: '#FFFFFF', margin: 'md' },
           ...levelRows,
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 每消費 NT$1 = 累計 NT$1，消費自動升等', size: 'xs', color: '#E5B94C', margin: 'md', wrap: true, weight: 'bold' },
         ]
       },
@@ -7813,7 +7813,7 @@ function buildMemberLevelCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '消費累積，自動升等享折扣！', size: 'sm', wrap: true, color: '#E0E0E0' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
             { type: 'text', text: '⬜ 一般會員', size: 'sm', flex: 5, color: '#FFFFFF' },
             { type: 'text', text: 'NT$0 起', size: 'xs', flex: 4, color: '#999999', align: 'end' }
@@ -7834,7 +7834,7 @@ function buildMemberLevelCard() {
             { type: 'text', text: '💎 鑽石會員', size: 'sm', flex: 5, color: '#FFFFFF' },
             { type: 'text', text: 'NT$10,000 / 12%', size: 'xs', flex: 4, color: '#999999', align: 'end' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 每消費 NT$1 = 累計 NT$1，消費自動升等', size: 'xs', color: '#E5B94C', margin: 'md', wrap: true, weight: 'bold' }
         ]
       },
@@ -7879,7 +7879,7 @@ function buildLevelUpNotification(levelInfo) {
         contents: [
           { type: 'text', text: `您已升級為`, size: 'sm', color: '#E0E0E0', align: 'center' },
           { type: 'text', text: `${levelInfo.icon} ${levelInfo.level}`, size: 'xxl', weight: 'bold', color: levelInfo.color || '#E5B94C', align: 'center', margin: 'md' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
             { type: 'text', text: '專屬折扣', size: 'sm', color: '#999999', flex: 4 },
             { type: 'text', text: `${levelInfo.discount}% OFF`, size: 'md', weight: 'bold', color: '#E5B94C', flex: 6, align: 'end' },
@@ -8034,7 +8034,7 @@ function buildSuccessCasesCarousel() {
       type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
       contents: [
         { type: 'text', text: `"${c.quote}"`, size: 'sm', wrap: true, style: 'italic', color: '#E0E0E0' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         ...c.stats.map(s => ({
           type: 'box', layout: 'horizontal', margin: 'sm',
           contents: [
@@ -8084,7 +8084,7 @@ function buildAboutUsCard() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '雲管家是台灣領先的自助洗衣 IoT 智慧系統，整合 LINE Pay 行動支付、遠端監控、會員管理與智慧推播通知，讓店主輕鬆管理、顧客方便使用。', size: 'sm', wrap: true, color: '#E0E0E0' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           {
             type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'lg',
             contents: [
@@ -8256,7 +8256,7 @@ function buildROICard() {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '20px',
         contents: [
           { type: 'text', text: '以 10 台機器門市為例', size: 'xs', color: '#999999', margin: 'none' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           ...rows.map(r => ({
             type: 'box', layout: 'horizontal', margin: 'sm',
             contents: [
@@ -8264,7 +8264,7 @@ function buildROICard() {
               { type: 'text', text: r.value, size: 'sm', weight: 'bold', flex: 4, align: 'end', color: BRAND_GOLD }
             ]
           })),
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'box', layout: 'horizontal', margin: 'md', backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '12px',
             contents: [
               { type: 'text', text: '月淨利估算', size: 'sm', color: '#999999', flex: 5 },
@@ -8326,7 +8326,7 @@ function buildInstallGuideCard() {
               }
             ]
           })),
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'separator', color: '#1A1A1E', margin: 'md' },
           { type: 'box', layout: 'horizontal', backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '12px', margin: 'sm',
             contents: [
               { type: 'text', text: '全程免費安裝 / 不需更換現有機器', size: 'xs', color: BRAND_GOLD, wrap: true, align: 'center', flex: 1 }
@@ -8370,7 +8370,7 @@ function buildTraditionalVsSmartCard() {
             { type: 'text', text: '傳統投幣', size: 'xs', weight: 'bold', flex: 3, align: 'center', color: '#999999' },
             { type: 'text', text: '雲管家', size: 'xs', weight: 'bold', flex: 3, align: 'center', color: '#E5B94C' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'sm' },
+          { type: 'separator', color: '#1A1A1E', margin: 'sm' },
           // Rows
           { type: 'box', layout: 'horizontal', margin: 'md', contents: [
             { type: 'text', text: '付款方式', size: 'xs', flex: 3, color: '#FFFFFF' },
@@ -8407,7 +8407,7 @@ function buildTraditionalVsSmartCard() {
             { type: 'text', text: '~30%', size: 'xs', flex: 3, align: 'center', color: '#999999' },
             { type: 'text', text: '~65%', size: 'xs', flex: 3, align: 'center', color: '#4CAF50', weight: 'bold' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 雲管家智慧系統平均提升營收 25-40%', size: 'xs', color: '#E5B94C', weight: 'bold', margin: 'md', wrap: true }
         ]
       },
@@ -8441,15 +8441,15 @@ function buildPlansCard() {
       type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
       contents: [
         { type: 'text', text: 'NT$ 5,000 /月', size: 'xl', weight: 'bold', color: BRAND_GOLD },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '適合：剛起步、想先試水溫', size: 'xs', color: '#999999', margin: 'sm', wrap: true },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '✅ LINE Pay 支付', size: 'sm', margin: 'lg', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 會員儲值系統', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 營收報表', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 機台狀態監控', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 洗好推播通知', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '✅ 7天快速上線', size: 'sm', color: '#4CAF50', weight: 'bold', margin: 'md', wrap: true }
       ]
     },
@@ -8485,7 +8485,7 @@ function buildPlansCard() {
         { type: 'text', text: 'NT$ 50,000 /年', size: 'xl', weight: 'bold', color: BRAND_GOLD },
         { type: 'text', text: '等於月付 $4,167，省下兩個月！', size: 'sm', weight: 'bold', color: '#FF6B6B', margin: 'sm', wrap: true },
         { type: 'text', text: '適合：確定長期經營的店主', size: 'xs', color: '#999999', margin: 'sm', wrap: true },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '✅ 月租全部功能', size: 'sm', margin: 'lg', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 優惠券系統', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 多店管理', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
@@ -8520,9 +8520,9 @@ function buildPlansCard() {
       type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
       contents: [
         { type: 'text', text: '依需求報價', size: 'xl', weight: 'bold', color: '#E5B94C' },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '適合：多店連鎖、特殊整合需求', size: 'xs', color: '#999999', margin: 'sm', wrap: true },
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+        { type: 'separator', color: '#1A1A1E', margin: 'lg' },
         { type: 'text', text: '✅ 年租全部功能', size: 'sm', margin: 'lg', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ API 客製整合', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
         { type: 'text', text: '✅ 專屬品牌介面', size: 'sm', margin: 'sm', wrap: true, color: '#E0E0E0' },
@@ -8576,7 +8576,7 @@ const KEYWORD_REPLIES = {
           { type: 'text', text: '3️⃣ 金流結構 — 行動支付客單價比投幣高18%', size: 'sm', wrap: true, color: '#E0E0E0' },
           { type: 'text', text: '4️⃣ 遠端管理 — 每天只需15分鐘管整間店', size: 'sm', wrap: true, color: '#E0E0E0' },
           { type: 'text', text: '5️⃣ 會員經營 — 有會員系統的店終身價值高2.3倍', size: 'sm', wrap: true, color: '#E0E0E0' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '想進一步了解？回覆「獲利分析」領取投報率試算表', size: 'xs', wrap: true, color: '#999999', margin: 'md' }
         ]},
         footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
@@ -8613,7 +8613,7 @@ const KEYWORD_REPLIES = {
             { type: 'text', text: '預估回收期', size: 'sm', color: '#999999', flex: 4 },
             { type: 'text', text: '14-20 個月', size: 'sm', weight: 'bold', flex: 6, align: 'end', color: '#FFFFFF' }
           ]},
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '雲管家加盟優勢：\n📊 數據分析精準投放\n🎯 會員系統拉高回購\n🔧 遠端管理省人力', size: 'sm', wrap: true, margin: 'md', color: '#E0E0E0' },
           { type: 'text', text: '想要客製化評估？回覆「區域評估」', size: 'xs', wrap: true, color: '#999999', margin: 'md' }
         ]},
@@ -8769,10 +8769,10 @@ const KEYWORD_REPLIES = {
         ]},
         body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
           { type: 'text', text: '遇到機器問題了嗎？請提供以下資訊，我們會盡快處理：', size: 'sm', wrap: true, color: '#FFFFFF' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '請回覆以下格式：', size: 'sm', weight: 'bold', margin: 'lg', wrap: true, color: '#E5B94C' },
           { type: 'text', text: '1️⃣ 哪家門市？（例如：悠洗自助洗衣）\n2️⃣ 哪台機器？（例如：洗衣機2號）\n3️⃣ 什麼問題？（例如：無法啟動）\n4️⃣ 是否有投幣/付款？', size: 'sm', wrap: true, margin: 'sm', color: '#E0E0E0' },
-          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '💡 常見快速排除：', size: 'sm', weight: 'bold', margin: 'md', wrap: true, color: '#E5B94C' },
           { type: 'text', text: '• 門沒關好 → 確認機門完全關閉再按啟動\n• 投幣沒反應 → 試試用 LINE Pay 付款\n• 洗到一半停了 → 可能斷電，等2分鐘會自動恢復', size: 'xs', wrap: true, color: '#999999', margin: 'sm' }
         ]},
@@ -9135,10 +9135,10 @@ async function handlePostback(event, userId) {
             type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
             contents: [
               { type: 'text', text: '📋 雲管家諮詢表', color: '#E5B94C', weight: 'bold', size: 'lg' },
-              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+              { type: 'separator', color: '#1A1A1E', margin: 'md' },
               { type: 'text', text: '我們需要了解您的基本資訊，以便提供最適合的方案。', color: '#E0E0E0', size: 'sm', wrap: true, margin: 'md' },
               { type: 'text', text: '📝 共 8-10 個問題，約 2 分鐘完成', color: '#999999', size: 'xs', margin: 'sm' },
-              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+              { type: 'separator', color: '#1A1A1E', margin: 'md' },
               { type: 'text', text: '👤 請輸入您的姓名：', color: '#FFFFFF', weight: 'bold', size: 'md', margin: 'md' }
             ]
           }
@@ -9301,10 +9301,10 @@ async function handleCustomerServiceTrigger(event, userId) {
           type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
           contents: [
             { type: 'text', text: '💬 門市客服', color: '#E5B94C', weight: 'bold', size: 'lg' },
-            { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+            { type: 'separator', color: '#1A1A1E', margin: 'md' },
             { type: 'text', text: `已連線至 ${storeInfo.name} 客服`, color: '#FFFFFF', size: 'md', margin: 'md', wrap: true },
             { type: 'text', text: '請直接輸入您的問題，我們會盡快為您回覆。', color: '#999999', size: 'sm', margin: 'sm', wrap: true },
-            { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+            { type: 'separator', color: '#1A1A1E', margin: 'md' },
             { type: 'text', text: '⏱ 客服對話 30 分鐘內有效', color: '#666666', size: 'xxs', margin: 'sm' },
             { type: 'text', text: '💡 輸入「結束客服」可結束對話', color: '#666666', size: 'xxs' }
           ]
@@ -9359,10 +9359,10 @@ async function handleTextMessage(event, userId, text) {
               type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
               contents: [
                 { type: 'text', text: `💬 ${session.store_name} 客服`, color: '#E5B94C', weight: 'bold', size: 'sm' },
-                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'sm' },
+                { type: 'separator', color: '#1A1A1E', margin: 'sm' },
                 { type: 'text', text: `來自：${customerName}`, color: '#999999', size: 'xs', margin: 'sm' },
                 { type: 'text', text: text, color: '#FFFFFF', size: 'md', wrap: true, margin: 'md' },
-                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+                { type: 'separator', color: '#1A1A1E', margin: 'md' },
                 { type: 'text', text: `回覆方式：@回覆 ${customerName} 您的回覆內容`, color: '#666666', size: 'xxs', wrap: true, margin: 'sm' }
               ]
             }
@@ -9406,7 +9406,7 @@ async function handleTextMessage(event, userId, text) {
                   type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
                   contents: [
                     { type: 'text', text: `💬 ${sess.store_name} 客服回覆`, color: '#4CAF50', weight: 'bold', size: 'sm' },
-                    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'sm' },
+                    { type: 'separator', color: '#1A1A1E', margin: 'sm' },
                     { type: 'text', text: replyContent, color: '#FFFFFF', size: 'md', wrap: true, margin: 'md' }
                   ]
                 }
@@ -9548,7 +9548,7 @@ async function handleTextMessage(event, userId, text) {
               type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
               contents: [
                 { type: 'text', text: '✅ 諮詢表已送出', color: '#4CAF50', weight: 'bold', size: 'lg' },
-                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+                { type: 'separator', color: '#1A1A1E', margin: 'md' },
                 { type: 'text', text: '感謝您的填寫！我們的顧問會在 1-2 個工作天內與您聯繫。', color: '#E0E0E0', size: 'sm', wrap: true, margin: 'md' },
                 { type: 'text', text: '如有急需，可直接聯繫：\n📞 0800-018-888\n📧 contact@cloudmonster.com.tw', color: '#999999', size: 'xs', wrap: true, margin: 'md' }
               ]
@@ -9820,7 +9820,7 @@ async function handleTextMessage(event, userId, text) {
               body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
                 { type: 'text', text: `推薦碼 ${inputCode} 綁定成功`, size: 'sm', color: '#FFFFFF', wrap: true },
                 { type: 'text', text: `您已獲得 NT$${rewardAmount} 洗衣金！`, size: 'md', weight: 'bold', color: '#E5B94C', margin: 'md' },
-                { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+                { type: 'separator', color: '#1A1A1E', margin: 'lg' },
                 { type: 'text', text: '洗衣金已加入您的錢包，下次洗衣時可直接使用。', size: 'xs', color: '#999999', margin: 'md', wrap: true },
               ]}
             }
@@ -10092,7 +10092,7 @@ app.post('/api/user/bind-store', async (req, res) => {
             type: 'box', layout: 'vertical', paddingAll: '24px', spacing: 'md',
             contents: [
               { type: 'text', text: '✅ 門市綁定成功', color: '#4CAF50', weight: 'bold', size: 'lg' },
-              { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+              { type: 'separator', color: '#1A1A1E', margin: 'lg' },
               { type: 'box', layout: 'horizontal', margin: 'lg', contents: [
                 { type: 'text', text: '綁定門市', size: 'sm', color: '#999999', flex: 3 },
                 { type: 'text', text: storeName, size: 'sm', color: '#FFFFFF', flex: 5, align: 'end', weight: 'bold' }
@@ -11057,7 +11057,7 @@ function buildFaultReportFlexMessage({ storeName, machineName, description, repo
           { type: 'text', text: '問題', size: 'sm', color: '#999999', flex: 2 },
           { type: 'text', text: description || '未描述', size: 'sm', color: '#F59E0B', flex: 5, wrap: true }
         ]},
-        { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+        { type: 'separator', color: '#1A1A1E', margin: 'md' },
         { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
           { type: 'text', text: '回報編號', size: 'xs', color: '#777777', flex: 2 },
           { type: 'text', text: `#${reportId}`, size: 'xs', color: '#999999', flex: 5 }
