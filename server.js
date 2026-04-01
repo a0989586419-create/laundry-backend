@@ -236,6 +236,36 @@ async function sendLineFlexMessage(userId, altText, contents, options = {}) {
   return sendLinePush(userId, [{ type: 'flex', altText, contents }], options);
 }
 
+// ===== Bonus Points Calculation =====
+function calculateBonusPoints(amount) {
+  if (amount >= 1000) return Math.floor(amount * 0.12); // 12% 回饋
+  if (amount >= 500) return Math.floor(amount * 0.10);  // 10% 回饋
+  if (amount >= 300) return Math.floor(amount * 0.05);  // 5% 回饋
+  return 0;
+}
+
+async function applyTopupBonus(userId, groupId, amount) {
+  const bonus = calculateBonusPoints(amount);
+  if (bonus <= 0) return { bonus: 0 };
+  try {
+    // Add bonus to wallet
+    await db.query(`
+      INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+      ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
+    `, [userId, groupId, bonus]);
+    // Record bonus transaction
+    await db.query(`
+      INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+      VALUES ($1, $2, 'topup_bonus', $3, $4, NOW())
+    `, [userId, groupId, bonus, `儲值 ${amount} 贈送 ${bonus} 點 (${amount >= 1000 ? '12%' : amount >= 500 ? '10%' : '5%'} 回饋)`]);
+    console.log(`[Bonus] User ${userId} topup ${amount}, bonus ${bonus} (group: ${groupId})`);
+    return { bonus };
+  } catch (e) {
+    console.error('[Bonus] Apply bonus error:', e.message);
+    return { bonus: 0 };
+  }
+}
+
 // ===== Flex Message Template Builders (ODay-inspired clean style) =====
 const LIFF_URL = 'https://liff.line.me/2009552592-xkDKSJ1Y';
 const LIFF_WASH = LIFF_URL + '?tab=wash';
@@ -885,8 +915,11 @@ app.post('/api/wallet/topup', async (req, res) => {
     `, [userId, groupId, amount, `Topup +${amount}`]);
     await client.query('COMMIT');
 
+    // [Bonus] Apply topup bonus (outside transaction since it's additive)
+    const { bonus } = await applyTopupBonus(userId, groupId, amount);
+
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
-    res.json({ success: true, balance: r.rows[0].balance });
+    res.json({ success: true, balance: r.rows[0].balance, bonus });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: e.message });
@@ -1622,11 +1655,47 @@ app.post('/api/machines/state', async (req, res) => {
   try {
     const { machineId, state, remainSec } = req.body;
     if (!machineId) return res.status(400).json({ error: 'machineId required' });
+
+    // Check previous state before update (for wash-complete notification)
+    const prevStateRow = (await db.query('SELECT state FROM machine_current_state WHERE machine_id=$1', [machineId])).rows[0];
+    const prevState = prevStateRow?.state;
+    const newState = state || 'running';
+
     await db.query(`
       INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
       VALUES ($1, $2, $3, 0, NOW())
       ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
-    `, [machineId, state || 'running', remainSec || 0]);
+    `, [machineId, newState, remainSec || 0]);
+
+    // [Notify] Send wash-complete notification when state transitions from running to done/idle/completed
+    if (prevState === 'running' && (newState === 'done' || newState === 'idle' || newState === 'completed')) {
+      try {
+        const runningOrders = await db.query(
+          `SELECT o.id, o.store_id, mb.line_user_id, s.name as store_name, m.name as machine_name, s.group_id
+           FROM orders o
+           JOIN members mb ON o.member_id = mb.id
+           JOIN stores s ON o.store_id = s.id
+           JOIN machines m ON o.machine_id = m.id
+           WHERE o.machine_id = $1 AND o.status = 'running'`, [machineId]
+        );
+        // Update orders to done
+        await db.query(`UPDATE orders SET status='done', completed_at=NOW() WHERE machine_id=$1 AND status='running'`, [machineId]);
+        // Lookup support info
+        let supportUrl = '', supportPhone = '';
+        if (runningOrders.rows.length > 0 && runningOrders.rows[0].group_id) {
+          const sgRes = await db.query('SELECT support_url, support_phone FROM store_groups WHERE id=$1', [runningOrders.rows[0].group_id]);
+          supportUrl = sgRes.rows[0]?.support_url || '';
+          supportPhone = sgRes.rows[0]?.support_phone || '';
+        }
+        for (const ord of runningOrders.rows) {
+          console.log(`[Notify] Wash complete: ${ord.store_name} ${ord.machine_name} -> user ${ord.line_user_id}`);
+          sendLineFlexMessage(ord.line_user_id, '洗衣完成通知', buildCompleteFlexMessage(ord.store_name, ord.machine_name, supportUrl, supportPhone, ord.group_id, ord.store_id), { pushType: 'auto_complete', storeId: ord.store_id, description: `洗衣完成 ${ord.store_name} ${ord.machine_name}` }).catch(e => console.error('[Notify] Push error:', e.message));
+        }
+      } catch (notifyErr) {
+        console.error('[Notify] State change notification error:', notifyErr.message);
+      }
+    }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1698,14 +1767,20 @@ app.get('/api/topup/confirm', async (req, res) => {
         INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
         VALUES ($1, $2, 'topup', $3, $4, NOW())
       `, [userId, groupId, amountInt, `LINE Pay 儲值 +${amountInt}`]);
-      // LINE Push: topup success
+      // [Bonus] Apply topup bonus
+      const { bonus } = await applyTopupBonus(userId, groupId, amountInt);
+      // LINE Push: topup success (with bonus info)
       const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
       const grRow = (await db.query('SELECT name, support_url, support_phone FROM store_groups WHERE id=$1', [groupId])).rows[0];
       const grName = grRow?.name || '';
       const linePayTopupSupportUrl = grRow?.support_url || '';
       const linePayTopupSupportPhone = grRow?.support_phone || '';
-      sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt, supportUrl: linePayTopupSupportUrl, supportPhone: linePayTopupSupportPhone }), { pushType: 'auto_topup', groupId: groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
-      res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}`);
+      if (bonus > 0) {
+        sendLinePush(userId, [buildTopupSuccessNotification({ amount: amountInt, bonus, newBalance: walletRow?.balance || amountInt })], { pushType: 'auto_topup', groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt} 贈${bonus}點` }).catch(() => {});
+      } else {
+        sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({ groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt, supportUrl: linePayTopupSupportUrl, supportPhone: linePayTopupSupportPhone }), { pushType: 'auto_topup', groupId: groupId, description: `LINE Pay儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
+      }
+      res.redirect(`${FRONTEND_URL}/?status=topup_success&amount=${amountInt}&bonus=${bonus}`);
     } else {
       res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
     }
@@ -2124,18 +2199,25 @@ app.post('/api/topup/jkopay/result', async (req, res) => {
         VALUES ($1, $2, 'topup', $3, $4, NOW())
       `, [userId, groupId, amountInt, `街口支付儲值 +${amountInt}`]);
 
-      // LINE Push: topup success
+      // [Bonus] Apply topup bonus
+      const { bonus } = await applyTopupBonus(userId, groupId, amountInt);
+
+      // LINE Push: topup success (with bonus info)
       const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
       const grRow = (await db.query('SELECT name, support_url, support_phone FROM store_groups WHERE id=$1', [groupId])).rows[0];
       const grName = grRow?.name || '';
       const topupSupportUrl = grRow?.support_url || '';
       const topupSupportPhone = grRow?.support_phone || '';
-      sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({
-        groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt,
-        supportUrl: topupSupportUrl, supportPhone: topupSupportPhone
-      }), { pushType: 'auto_topup', groupId, description: `街口支付儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
+      if (bonus > 0) {
+        sendLinePush(userId, [buildTopupSuccessNotification({ amount: amountInt, bonus, newBalance: walletRow?.balance || amountInt })], { pushType: 'auto_topup', groupId, description: `街口支付儲值成功 ${grName} NT$${amountInt} 贈${bonus}點` }).catch(() => {});
+      } else {
+        sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({
+          groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt,
+          supportUrl: topupSupportUrl, supportPhone: topupSupportPhone
+        }), { pushType: 'auto_topup', groupId, description: `街口支付儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
+      }
 
-      console.log(`[JKOPay] Topup success: orderId=${platform_order_id}, amount=${amountInt}`);
+      console.log(`[JKOPay] Topup success: orderId=${platform_order_id}, amount=${amountInt}, bonus=${bonus}`);
     } else {
       await db.query(`UPDATE orders SET status='failed', jkopay_order_id=$2 WHERE id=$1`, [platform_order_id, order_id]);
       console.log(`[JKOPay] Topup failed: orderId=${platform_order_id}`);
@@ -6084,6 +6166,21 @@ async function initDB() {
     `).catch(() => {});
   }
 
+  // Fault reports table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS fault_reports (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      store_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      machine_name TEXT,
+      description TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      resolved_at TIMESTAMPTZ
+    )
+  `).catch(() => {});
+
   console.log('DB initialized with multi-tenant tables');
 }
 
@@ -6298,7 +6395,7 @@ function buildCustomerWelcomeReply() {
         type: 'box', layout: 'vertical', paddingAll: '20px',
         contents: [
           { type: 'text', text: '🧺 歡迎使用雲管家！', color: '#FFFFFF', weight: 'bold', size: 'lg' },
-          { type: 'text', text: '全台 5 間門市為您服務', color: BRAND_GOLD, size: 'xs', margin: 'sm' }
+          { type: 'text', text: '全台 5 間門市 ∙ 30+ 台設備 ∙ 24H 為您服務', color: BRAND_GOLD, size: 'xs', margin: 'sm' }
         ]
       },
       body: {
@@ -6396,6 +6493,7 @@ function buildBusinessWelcomeReply() {
         type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
         contents: [
           { type: 'text', text: '雲管家是專為自助洗衣店打造的 IoT 管理系統', size: 'sm', wrap: true, color: '#E0E0E0', weight: 'bold' },
+          { type: 'text', text: '🏪 全台 5 間合作門市 ∙ 30+ 台設備管理 ∙ 7 天快速導入', size: 'xs', color: BRAND_GOLD, margin: 'sm', wrap: true },
           {
             type: 'box', layout: 'horizontal', margin: 'lg', contents: [
               { type: 'box', layout: 'vertical', backgroundColor: '#151518', cornerRadius: '8px', width: '36px', height: '36px', justifyContent: 'center', alignItems: 'center', flex: 0, contents: [
@@ -6466,6 +6564,236 @@ function buildBusinessWelcomeReply() {
 // Keep backward compatibility alias
 function buildFranchiseWelcomeReply() {
   return buildBusinessWelcomeReply();
+}
+
+// ---- Push Notification Flex Builders ----
+
+function buildPaymentSuccessNotification({ storeName, machineName, mode, amount, paymentMethod }) {
+  const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+  return {
+    type: 'flex', altText: '付款成功通知',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'horizontal', paddingAll: '20px', spacing: 'md',
+        contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#151518', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '\u2705', size: 'lg', align: 'center' }
+          ]},
+          { type: 'box', layout: 'vertical', justifyContent: 'center', contents: [
+            { type: 'text', text: '\u2705 付款成功', color: '#4ADE80', weight: 'bold', size: 'lg' },
+            { type: 'text', text: '交易已完成', color: '#999999', size: 'xs' }
+          ]}
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '門市名稱', size: 'sm', color: '#999999', flex: 3 },
+            { type: 'text', text: storeName || '---', size: 'sm', color: '#FFFFFF', flex: 5, align: 'end', weight: 'bold' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '機器編號', size: 'sm', color: '#999999', flex: 3 },
+            { type: 'text', text: machineName || '---', size: 'sm', color: '#FFFFFF', flex: 5, align: 'end' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '洗衣模式', size: 'sm', color: '#999999', flex: 3 },
+            { type: 'text', text: mode || '---', size: 'sm', color: '#FFFFFF', flex: 5, align: 'end' }
+          ]},
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+            { type: 'text', text: '付款金額', size: 'md', color: '#FFFFFF', flex: 3, weight: 'bold' },
+            { type: 'text', text: `NT$ ${amount || 0}`, size: 'lg', color: '#E5B94C', flex: 5, align: 'end', weight: 'bold' }
+          ]},
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '付款方式', size: 'xs', color: '#999999', flex: 3 },
+            { type: 'text', text: paymentMethod || '錢包付款', size: 'xs', color: '#999999', flex: 5, align: 'end' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '付款時間', size: 'xs', color: '#999999', flex: 3 },
+            { type: 'text', text: now, size: 'xs', color: '#999999', flex: 5, align: 'end' }
+          ]}
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看機器狀態', uri: LIFF_WASH } }
+        ]
+      }
+    }
+  };
+}
+
+function buildAlmostDoneNotification({ storeName, machineName, remainingMinutes }) {
+  return {
+    type: 'flex', altText: `${machineName || '機器'} 還有 ${remainingMinutes || 5} 分鐘完成`,
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'horizontal', paddingAll: '20px', spacing: 'md',
+        contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#151518', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '\u23F0', size: 'lg', align: 'center' }
+          ]},
+          { type: 'box', layout: 'vertical', justifyContent: 'center', contents: [
+            { type: 'text', text: '\u23F0 即將完成', color: '#F59E0B', weight: 'bold', size: 'lg' },
+            { type: 'text', text: '請準備前往取衣', color: '#999999', size: 'xs' }
+          ]}
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: `您在 ${storeName || '門市'} 的 ${machineName || '機器'} 還有 ${remainingMinutes || 5} 分鐘即可完成`, size: 'md', wrap: true, color: '#FFFFFF' },
+          { type: 'box', layout: 'horizontal', margin: 'lg', paddingAll: '12px', backgroundColor: '#0A0A0F', cornerRadius: '8px', contents: [
+            { type: 'text', text: '\u23F1 剩餘時間', size: 'sm', color: '#E5B94C', flex: 2, weight: 'bold' },
+            { type: 'text', text: `${remainingMinutes || 5} 分鐘`, size: 'lg', color: '#F59E0B', flex: 3, align: 'end', weight: 'bold' }
+          ]},
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'text', text: '請準備前往取衣，避免佔用機器', size: 'xs', color: '#999999', margin: 'md', wrap: true }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '導航前往', uri: LIFF_WASH } }
+        ]
+      }
+    }
+  };
+}
+
+function buildWashCompleteNotification({ storeName, machineName, totalTime }) {
+  return {
+    type: 'flex', altText: `${machineName || '機器'} 洗衣完成！`,
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'horizontal', paddingAll: '20px', spacing: 'md',
+        contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#151518', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '\uD83C\uDF89', size: 'lg', align: 'center' }
+          ]},
+          { type: 'box', layout: 'vertical', justifyContent: 'center', contents: [
+            { type: 'text', text: '\uD83C\uDF89 洗衣完成', color: '#4ADE80', weight: 'bold', size: 'lg' },
+            { type: 'text', text: '請盡快前往取衣', color: '#999999', size: 'xs' }
+          ]}
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: `您在 ${storeName || '門市'} 的 ${machineName || '機器'} 已完成洗衣！`, size: 'md', wrap: true, color: '#FFFFFF', weight: 'bold' },
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+            { type: 'text', text: '門市', size: 'sm', color: '#999999', flex: 2 },
+            { type: 'text', text: storeName || '---', size: 'sm', color: '#FFFFFF', flex: 3, align: 'end', weight: 'bold' }
+          ]},
+          { type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '機器', size: 'sm', color: '#999999', flex: 2 },
+            { type: 'text', text: machineName || '---', size: 'sm', color: '#FFFFFF', flex: 3, align: 'end' }
+          ]},
+          ...(totalTime ? [{ type: 'box', layout: 'horizontal', contents: [
+            { type: 'text', text: '總耗時', size: 'sm', color: '#999999', flex: 2 },
+            { type: 'text', text: `${totalTime} 分鐘`, size: 'sm', color: '#FFFFFF', flex: 3, align: 'end' }
+          ]}] : []),
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'box', layout: 'horizontal', margin: 'md', paddingAll: '12px', backgroundColor: '#0A0A0F', cornerRadius: '8px', contents: [
+            { type: 'text', text: '請盡快取衣，超過 30 分鐘將自動佔機計費', size: 'xs', color: '#F59E0B', wrap: true, weight: 'bold' }
+          ]}
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '導航前往', uri: LIFF_WASH } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看機器狀態', uri: LIFF_WASH } }
+        ]
+      }
+    }
+  };
+}
+
+function buildTopupSuccessNotification({ amount, bonus, newBalance }) {
+  const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+  const bodyContents = [
+    { type: 'box', layout: 'horizontal', contents: [
+      { type: 'text', text: '儲值金額', size: 'md', color: '#FFFFFF', flex: 3 },
+      { type: 'text', text: `+NT$ ${amount || 0}`, size: 'lg', color: '#4ADE80', flex: 5, align: 'end', weight: 'bold' }
+    ]}
+  ];
+  if (bonus) {
+    bodyContents.push(
+      { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
+        { type: 'text', text: '加碼回饋', size: 'sm', color: '#F59E0B', flex: 3 },
+        { type: 'text', text: `+NT$ ${bonus}`, size: 'sm', color: '#F59E0B', flex: 5, align: 'end', weight: 'bold' }
+      ]}
+    );
+  }
+  bodyContents.push(
+    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+    { type: 'box', layout: 'horizontal', margin: 'md', contents: [
+      { type: 'text', text: '目前餘額', size: 'md', color: '#FFFFFF', flex: 3, weight: 'bold' },
+      { type: 'text', text: `NT$ ${newBalance || 0}`, size: 'lg', color: '#E5B94C', flex: 5, align: 'end', weight: 'bold' }
+    ]},
+    { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+    { type: 'box', layout: 'horizontal', margin: 'sm', contents: [
+      { type: 'text', text: '儲值時間', size: 'xs', color: '#999999', flex: 3 },
+      { type: 'text', text: now, size: 'xs', color: '#999999', flex: 5, align: 'end' }
+    ]}
+  );
+
+  return {
+    type: 'flex', altText: `儲值成功 NT$ ${amount || 0}`,
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'horizontal', paddingAll: '20px', spacing: 'md',
+        contents: [
+          { type: 'box', layout: 'vertical', width: '40px', height: '40px', backgroundColor: '#151518', cornerRadius: '20px', justifyContent: 'center', alignItems: 'center', contents: [
+            { type: 'text', text: '\uD83D\uDCB0', size: 'lg', align: 'center' }
+          ]},
+          { type: 'box', layout: 'vertical', justifyContent: 'center', contents: [
+            { type: 'text', text: '\uD83D\uDCB0 儲值成功', color: '#4ADE80', weight: 'bold', size: 'lg' },
+            { type: 'text', text: '餘額已更新', color: '#999999', size: 'xs' }
+          ]}
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: bodyContents
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看餘額', uri: LIFF_PROFILE } }
+        ]
+      }
+    }
+  };
 }
 
 // ---- Customer Keyword Flex Builders ----
