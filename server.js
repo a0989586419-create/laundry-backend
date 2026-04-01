@@ -542,6 +542,43 @@ function linePayRequest(method, path, body) {
   });
 }
 
+// ===== JKOPay (街口支付) =====
+const JKOPAY_STORE_ID = process.env.JKOPAY_STORE_ID;
+const JKOPAY_API_KEY = process.env.JKOPAY_API_KEY;
+const JKOPAY_SECRET_KEY = process.env.JKOPAY_SECRET_KEY;
+const JKOPAY_ENV = process.env.JKOPAY_ENV || 'uat';
+const JKOPAY_API_HOST = JKOPAY_ENV === 'production'
+  ? 'https://onlinepay.jkopay.app'
+  : 'https://uat-onlinepay.jkopay.app';
+
+function jkopayDigest(bodyObj) {
+  const bodyStr = JSON.stringify(bodyObj);
+  return crypto.createHmac('sha256', JKOPAY_SECRET_KEY).update(bodyStr).digest('hex');
+}
+
+async function jkopayRequest(path, bodyWithoutDigest) {
+  const digest = jkopayDigest(bodyWithoutDigest);
+  const body = { ...bodyWithoutDigest, digest };
+  const url = `${JKOPAY_API_HOST}${path}`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'API-KEY': JKOPAY_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  return data;
+}
+
+function verifyJkopayDigest(body) {
+  const { digest, ...rest } = body;
+  if (!digest) return false;
+  const expected = jkopayDigest(rest);
+  return crypto.timingSafeEqual(Buffer.from(digest, 'hex'), Buffer.from(expected, 'hex'));
+}
+
 // ===== Helper: get or create member =====
 async function getOrCreateMember(lineUserId) {
   let row = (await db.query('SELECT * FROM members WHERE line_user_id=$1', [lineUserId])).rows[0];
@@ -1663,6 +1700,432 @@ app.get('/api/topup/confirm', async (req, res) => {
     }
   } catch (e) {
     res.redirect(`https://laundry-frontend-chi.vercel.app/?status=topup_fail`);
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: JKOPay (街口支付) Payment
+// ═══════════════════════════════════════
+
+// POST /api/jkopay/entry - 建立街口支付訂單
+app.post('/api/jkopay/entry', async (req, res) => {
+  try {
+    const { userId, storeId, machineId, machineNum, mode, amount, minutes, dryTemp, couponId } = req.body;
+    if (!userId || !storeId || !machineId || !amount) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+    if (!JKOPAY_API_KEY || !JKOPAY_SECRET_KEY || !JKOPAY_STORE_ID) {
+      return res.status(503).json({ success: false, error: '街口支付尚未設定' });
+    }
+
+    // Create member if not exists
+    let member = (await db.query('SELECT id FROM members WHERE line_user_id=$1', [userId])).rows[0];
+    if (!member) {
+      const id = uuid();
+      await db.query('INSERT INTO members (id,line_user_id,created_at) VALUES ($1,$2,NOW())', [id, userId]);
+      member = { id };
+    }
+
+    // Coupon validation (same logic as LINE Pay)
+    let discountAmount = 0;
+    let validatedCouponId = null;
+    let finalAmount = amount;
+
+    if (couponId) {
+      try {
+        console.log(`[JKOPay][Coupon] Validating coupon userCouponId=${couponId} for userId=${userId}`);
+        const ucRes = await db.query(
+          `SELECT uc.*, c.discount, c.type as coupon_type, c.min_spend, c.name as coupon_name
+           FROM user_coupons uc
+           JOIN admin_coupons c ON uc.coupon_id = c.id
+           WHERE uc.id = $1 AND uc.line_user_id = $2 AND uc.status = 'active' AND uc.uses_remaining > 0`,
+          [couponId, userId]
+        );
+        if (ucRes.rows.length === 0) {
+          return res.status(400).json({ success: false, error: '優惠券無效、已使用完畢或不屬於此帳號' });
+        }
+        const uc = ucRes.rows[0];
+        if (uc.expiry_date && new Date(uc.expiry_date) < new Date()) {
+          return res.status(400).json({ success: false, error: '優惠券已過期' });
+        }
+        if (uc.min_spend && amount < uc.min_spend) {
+          return res.status(400).json({ success: false, error: `未達最低消費 NT$${uc.min_spend}` });
+        }
+        if (uc.coupon_type === 'percent') {
+          discountAmount = Math.floor(amount * uc.discount / 100);
+        } else if (uc.coupon_type === 'free') {
+          discountAmount = amount;
+        } else {
+          discountAmount = Math.min(uc.discount, amount);
+        }
+        finalAmount = Math.max(amount - discountAmount, 0);
+        validatedCouponId = couponId;
+        console.log(`[JKOPay][Coupon] Applied "${uc.coupon_name}": original=${amount}, discount=${discountAmount}, final=${finalAmount}`);
+      } catch (couponErr) {
+        console.error('[JKOPay][Coupon] Validation error:', couponErr.message);
+        return res.status(500).json({ success: false, error: '優惠券驗證失敗' });
+      }
+    }
+
+    // Create order
+    const orderId = 'JKO' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const pulses = Math.ceil(amount / 10);
+    const modeDur = { standard: 65, small: 50, washonly: 35, soft: 65, strong: 75, dryonly: 40, dryextend: 0 };
+    const baseDur = modeDur[mode] || 0;
+    const durationSec = (baseDur + (minutes || 0)) * 60;
+
+    const txClient = await db.connect();
+    try {
+      await txClient.query('BEGIN');
+      await txClient.query(
+        `INSERT INTO orders (id,member_id,store_id,machine_id,mode,addons,extend_min,temp,total_amount,pulses,duration_sec,status,payment_method,coupon_id,discount_amount,created_at)
+         VALUES ($1,$2,$3,$4,$5,'[]',$6,$7,$8,$9,$10,'pending','jkopay',$11,$12,NOW())`,
+        [orderId, member.id, storeId, machineId, mode, minutes || 0, dryTemp || 'high', finalAmount, pulses, durationSec, validatedCouponId, discountAmount]
+      );
+      if (validatedCouponId) {
+        const couponDeduct = await txClient.query(
+          `UPDATE user_coupons SET uses_remaining = uses_remaining - 1, status = CASE WHEN uses_remaining - 1 <= 0 THEN 'used' ELSE status END WHERE id = $1 AND uses_remaining > 0 RETURNING id`,
+          [validatedCouponId]
+        );
+        if (couponDeduct.rows.length === 0) {
+          throw new Error('優惠券已用完');
+        }
+      }
+      await txClient.query('COMMIT');
+    } catch (txErr) {
+      await txClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      txClient.release();
+    }
+
+    // Call JKOPay Entry API
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const storeName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || '洗衣服務';
+    const machineName = machineId.includes('-d') ? `烘乾${machineNum}號` : `洗脫烘${machineNum}號(${mode})`;
+
+    const entryBody = {
+      platform_order_id: orderId,
+      store_id: JKOPAY_STORE_ID,
+      currency: 'TWD',
+      total_price: finalAmount,
+      final_price: finalAmount,
+      result_url: `${SERVER_URL}/api/jkopay/result`,
+      result_display_url: `${FRONTEND_URL}/?status=jkopay_pending&orderId=${orderId}`,
+    };
+
+    const jkoResult = await jkopayRequest('/platform/entry', entryBody);
+    if (jkoResult.result === '000') {
+      await db.query(`UPDATE orders SET status='waiting_payment' WHERE id=$1`, [orderId]);
+      console.log(`[JKOPay] Entry success: orderId=${orderId}, payment_url=${jkoResult.payment_url}`);
+      return res.json({
+        success: true,
+        paymentUrl: jkoResult.payment_url,
+        orderId,
+        discountAmount,
+        finalAmount,
+      });
+    } else {
+      console.error(`[JKOPay] Entry failed: ${jkoResult.result} - ${jkoResult.result_message}`);
+      await db.query(`UPDATE orders SET status='failed' WHERE id=$1`, [orderId]);
+      return res.status(400).json({ success: false, error: `街口支付建立失敗: ${jkoResult.result_message || jkoResult.result}` });
+    }
+  } catch (e) {
+    console.error('[JKOPay] entry error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/jkopay/result - 街口付款結果回呼
+app.post('/api/jkopay/result', async (req, res) => {
+  try {
+    const { platform_order_id, order_id, status, final_price, store_id } = req.body;
+    console.log(`[JKOPay] Result callback: orderId=${platform_order_id}, status=${status}, jkoOrderId=${order_id}`);
+
+    // Verify digest
+    if (!verifyJkopayDigest(req.body)) {
+      console.error('[JKOPay] Digest verification failed');
+      return res.status(403).json({ result: '001', result_message: 'Invalid digest' });
+    }
+
+    // Fetch order
+    const orderRow = (await db.query('SELECT * FROM orders WHERE id=$1', [platform_order_id])).rows[0];
+    if (!orderRow) {
+      console.error(`[JKOPay] Order not found: ${platform_order_id}`);
+      return res.json({ result: '000' }); // Still return 000 to acknowledge
+    }
+
+    // Prevent double processing
+    if (orderRow.status === 'paid' || orderRow.status === 'completed') {
+      console.log(`[JKOPay] Order already processed: ${platform_order_id}`);
+      return res.json({ result: '000' });
+    }
+
+    if (status === 'SUCCESS') {
+      // Update order
+      await db.query(
+        `UPDATE orders SET status='paid', paid_at=NOW(), payment_method='jkopay', jkopay_order_id=$2 WHERE id=$1`,
+        [platform_order_id, order_id]
+      );
+
+      // Update machine state
+      await db.query(`
+        INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+        VALUES ($1, 'running', $2, 0, NOW())
+        ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
+      `, [orderRow.machine_id, orderRow.duration_sec || 3600]);
+
+      // Record transaction
+      const storeRow = (await db.query('SELECT name, group_id FROM stores WHERE id=$1', [orderRow.store_id])).rows[0];
+      if (storeRow?.group_id) {
+        await db.query(`
+          INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+          VALUES ($1, $2, 'payment', $3, $4, NOW())
+        `, [orderRow.member_id, storeRow.group_id, -orderRow.total_amount,
+            `${orderRow.store_id} - ${orderRow.mode} (街口支付)${orderRow.discount_amount > 0 ? ` (折扣 NT$${orderRow.discount_amount})` : ''}`]);
+      }
+
+      // MQTT start command
+      try {
+        await publishStartCommand({
+          id: platform_order_id,
+          store_id: orderRow.store_id,
+          machine_id: orderRow.machine_id,
+          mode: orderRow.mode,
+          temp: orderRow.temp || 'high',
+          total_amount: orderRow.total_amount,
+        });
+      } catch (mqttErr) {
+        console.error('[JKOPay] MQTT start error:', mqttErr.message);
+      }
+
+      // LINE Push notification
+      const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [orderRow.member_id])).rows[0];
+      if (memberRow) {
+        try {
+          await db.query(
+            `INSERT INTO user_store_bindings (line_user_id, store_id, bound_at) VALUES ($1, $2, NOW()) ON CONFLICT (line_user_id, store_id) DO UPDATE SET bound_at = NOW()`,
+            [memberRow.line_user_id, orderRow.store_id]
+          );
+        } catch (e) {}
+        const sName = storeRow?.name || orderRow.store_id;
+        let supportUrl = '';
+        let supportPhone = '';
+        if (storeRow?.group_id) {
+          const sgr = (await db.query('SELECT support_url, support_phone FROM store_groups WHERE id=$1', [storeRow.group_id])).rows[0];
+          supportUrl = sgr?.support_url || '';
+          supportPhone = sgr?.support_phone || '';
+        }
+        const mName = orderRow.machine_id.includes('-d') ? '烘乾機' : '洗脫烘';
+        const mins = Math.ceil((orderRow.duration_sec || 3600) / 60);
+        const modeLabels = { standard: '標準洗衣', small: '少量快洗', washonly: '單洗程', soft: '柔洗', strong: '強力洗', dryonly: '單烘乾', dryextend: '加烘' };
+        sendLineFlexMessage(memberRow.line_user_id, '付款成功', buildPaymentFlexMessage({
+          storeName: sName, machineName: mName, modeName: modeLabels[orderRow.mode] || orderRow.mode || '標準洗衣',
+          amount: orderRow.total_amount, discount: orderRow.discount_amount || 0, finalAmount: orderRow.total_amount,
+          orderId: platform_order_id, paymentMethod: '街口支付', minutes: mins, supportUrl, supportPhone, groupId: storeRow?.group_id, storeId: orderRow.store_id
+        }), { pushType: 'auto_payment', storeId: orderRow.store_id, description: `街口支付付款成功 ${sName} ${mName}` }).catch(() => {});
+      }
+
+      console.log(`[JKOPay] Payment success: orderId=${platform_order_id}`);
+    } else {
+      // Payment failed
+      await db.query(`UPDATE orders SET status='failed', jkopay_order_id=$2 WHERE id=$1`, [platform_order_id, order_id]);
+      console.log(`[JKOPay] Payment failed: orderId=${platform_order_id}, status=${status}`);
+    }
+
+    res.json({ result: '000' });
+  } catch (e) {
+    console.error('[JKOPay] result callback error:', e);
+    res.json({ result: '000' }); // Always acknowledge to prevent retries
+  }
+});
+
+// POST /api/jkopay/inquiry - 查詢街口訂單狀態
+app.post('/api/jkopay/inquiry', async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    if (!JKOPAY_API_KEY || !JKOPAY_SECRET_KEY || !JKOPAY_STORE_ID) {
+      return res.status(503).json({ success: false, error: '街口支付尚未設定' });
+    }
+
+    const inquiryBody = {
+      platform_order_id: orderId,
+      store_id: JKOPAY_STORE_ID,
+    };
+    const result = await jkopayRequest('/platform/inquiry', inquiryBody);
+    console.log(`[JKOPay] Inquiry: orderId=${orderId}, result=${JSON.stringify(result)}`);
+    res.json({ success: true, data: result });
+  } catch (e) {
+    console.error('[JKOPay] inquiry error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/jkopay/refund - 街口退款（管理員用）
+app.post('/api/jkopay/refund', async (req, res) => {
+  try {
+    const { userId, orderId, refundAmount } = req.body;
+    if (!userId || !orderId) return res.status(400).json({ success: false, error: 'Missing required fields' });
+    if (!JKOPAY_API_KEY || !JKOPAY_SECRET_KEY || !JKOPAY_STORE_ID) {
+      return res.status(503).json({ success: false, error: '街口支付尚未設定' });
+    }
+
+    // Check admin permission
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ success: false, error: '權限不足' });
+    }
+
+    // Fetch order
+    const orderRow = (await db.query('SELECT * FROM orders WHERE id=$1 AND payment_method=$2', [orderId, 'jkopay'])).rows[0];
+    if (!orderRow) return res.status(404).json({ success: false, error: '訂單不存在或非街口支付' });
+    if (orderRow.status !== 'paid' && orderRow.status !== 'completed') {
+      return res.status(400).json({ success: false, error: '此訂單無法退款' });
+    }
+
+    const amount = refundAmount || orderRow.total_amount;
+    const refundBody = {
+      platform_order_id: orderId,
+      store_id: JKOPAY_STORE_ID,
+      refund_amount: amount,
+    };
+    const result = await jkopayRequest('/platform/refund', refundBody);
+    if (result.result === '000') {
+      await db.query(`UPDATE orders SET status='refunded' WHERE id=$1`, [orderId]);
+      console.log(`[JKOPay] Refund success: orderId=${orderId}, amount=${amount}`);
+      res.json({ success: true, data: result });
+    } else {
+      console.error(`[JKOPay] Refund failed: ${result.result} - ${result.result_message}`);
+      res.status(400).json({ success: false, error: `退款失敗: ${result.result_message || result.result}` });
+    }
+  } catch (e) {
+    console.error('[JKOPay] refund error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: JKOPay Topup (街口儲值)
+// ═══════════════════════════════════════
+
+// POST /api/topup/jkopay - 街口儲值
+app.post('/api/topup/jkopay', async (req, res) => {
+  try {
+    const { userId, groupId, amount } = req.body;
+    if (!userId || !groupId || !amount || amount <= 0) return res.status(400).json({ error: 'missing params' });
+    if (!JKOPAY_API_KEY || !JKOPAY_SECRET_KEY || !JKOPAY_STORE_ID) {
+      return res.status(503).json({ success: false, error: '街口支付尚未設定' });
+    }
+
+    const orderId = 'JKTOP' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
+    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+
+    const gr = await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId]);
+    const groupName = gr.rows[0]?.name || '洗衣服務';
+
+    // Store topup order in DB
+    await db.query(
+      `INSERT INTO orders (id, store_id, member_id, machine_id, mode, total_amount, status, payment_method, created_at) VALUES ($1, 'topup', $2, $3, 'topup', $4, 'pending', 'jkopay', NOW()) ON CONFLICT DO NOTHING`,
+      [orderId, userId, groupId, amount]
+    );
+
+    const entryBody = {
+      platform_order_id: orderId,
+      store_id: JKOPAY_STORE_ID,
+      currency: 'TWD',
+      total_price: amount,
+      final_price: amount,
+      result_url: `${SERVER_URL}/api/topup/jkopay/result`,
+      result_display_url: `${FRONTEND_URL}/?status=topup_pending&orderId=${orderId}`,
+    };
+
+    const jkoResult = await jkopayRequest('/platform/entry', entryBody);
+    if (jkoResult.result === '000') {
+      console.log(`[JKOPay] Topup entry success: orderId=${orderId}`);
+      return res.json({ success: true, paymentUrl: jkoResult.payment_url, orderId });
+    } else {
+      console.error(`[JKOPay] Topup entry failed: ${jkoResult.result} - ${jkoResult.result_message}`);
+      return res.status(400).json({ success: false, error: `街口支付建立失敗: ${jkoResult.result_message || jkoResult.result}` });
+    }
+  } catch (e) {
+    console.error('[JKOPay] topup entry error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/topup/jkopay/result - 街口儲值回呼
+app.post('/api/topup/jkopay/result', async (req, res) => {
+  try {
+    const { platform_order_id, order_id, status } = req.body;
+    console.log(`[JKOPay] Topup result: orderId=${platform_order_id}, status=${status}`);
+
+    // Verify digest
+    if (!verifyJkopayDigest(req.body)) {
+      console.error('[JKOPay] Topup digest verification failed');
+      return res.status(403).json({ result: '001', result_message: 'Invalid digest' });
+    }
+
+    // Fetch order
+    const orderRow = (await db.query(
+      `SELECT * FROM orders WHERE id=$1 AND mode='topup'`, [platform_order_id]
+    )).rows[0];
+    if (!orderRow) {
+      console.error(`[JKOPay] Topup order not found: ${platform_order_id}`);
+      return res.json({ result: '000' });
+    }
+
+    // Prevent double processing
+    if (orderRow.status === 'paid' || orderRow.status === 'completed') {
+      return res.json({ result: '000' });
+    }
+
+    if (status === 'SUCCESS') {
+      const userId = orderRow.member_id;
+      const groupId = orderRow.machine_id; // groupId stored in machine_id for topup
+      const amountInt = orderRow.total_amount;
+
+      // Update order
+      await db.query(
+        `UPDATE orders SET status='paid', paid_at=NOW(), jkopay_order_id=$2 WHERE id=$1`,
+        [platform_order_id, order_id]
+      );
+
+      // Add points to wallet
+      await db.query(`
+        INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
+        ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
+      `, [userId, groupId, amountInt]);
+
+      // Record transaction
+      await db.query(`
+        INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
+        VALUES ($1, $2, 'topup', $3, $4, NOW())
+      `, [userId, groupId, amountInt, `街口支付儲值 +${amountInt}`]);
+
+      // LINE Push: topup success
+      const walletRow = (await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId])).rows[0];
+      const grRow = (await db.query('SELECT name, support_url, support_phone FROM store_groups WHERE id=$1', [groupId])).rows[0];
+      const grName = grRow?.name || '';
+      const topupSupportUrl = grRow?.support_url || '';
+      const topupSupportPhone = grRow?.support_phone || '';
+      sendLineFlexMessage(userId, '儲值成功', buildTopupFlexMessage({
+        groupName: grName, amount: amountInt, balance: walletRow?.balance || amountInt,
+        supportUrl: topupSupportUrl, supportPhone: topupSupportPhone
+      }), { pushType: 'auto_topup', groupId, description: `街口支付儲值成功 ${grName} NT$${amountInt}` }).catch(() => {});
+
+      console.log(`[JKOPay] Topup success: orderId=${platform_order_id}, amount=${amountInt}`);
+    } else {
+      await db.query(`UPDATE orders SET status='failed', jkopay_order_id=$2 WHERE id=$1`, [platform_order_id, order_id]);
+      console.log(`[JKOPay] Topup failed: orderId=${platform_order_id}`);
+    }
+
+    res.json({ result: '000' });
+  } catch (e) {
+    console.error('[JKOPay] topup result error:', e);
+    res.json({ result: '000' });
   }
 });
 
@@ -5161,6 +5624,8 @@ async function initDB() {
     // Add coupon columns to orders for coupon system
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_id INT DEFAULT NULL`).catch(() => {});
     await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount INT DEFAULT 0`).catch(() => {});
+    // JKOPay order ID
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS jkopay_order_id VARCHAR(100)`).catch(() => {});
 
     // Member levels table
     await db.query(`
@@ -6437,6 +6902,274 @@ function buildSuccessCasesCarousel() {
   };
 }
 
+function buildAboutUsCard() {
+  return {
+    type: 'flex', altText: '關於 YPURE 雲管家',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'box', layout: 'vertical', backgroundColor: '#111115', cornerRadius: '12px', paddingAll: '16px',
+            contents: [
+              { type: 'text', text: 'YPURE 雲管家', color: BRAND_GOLD, weight: 'bold', size: 'lg', align: 'center' },
+              { type: 'text', text: 'IoT 智慧洗衣解決方案', color: '#999999', size: 'sm', align: 'center', margin: 'sm' }
+            ]
+          }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '雲管家是台灣領先的自助洗衣 IoT 智慧系統，整合 LINE Pay 行動支付、遠端監控、會員管理與智慧推播通知，讓店主輕鬆管理、顧客方便使用。', size: 'sm', wrap: true, color: '#E0E0E0' },
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          {
+            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'lg',
+            contents: [
+              { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '10px', alignItems: 'center',
+                contents: [
+                  { type: 'text', text: '5+', size: 'lg', weight: 'bold', color: BRAND_GOLD, align: 'center' },
+                  { type: 'text', text: '合作門市', size: 'xxs', color: '#999999', align: 'center', margin: 'xs' }
+                ]
+              },
+              { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '10px', alignItems: 'center',
+                contents: [
+                  { type: 'text', text: '30+', size: 'lg', weight: 'bold', color: BRAND_GOLD, align: 'center' },
+                  { type: 'text', text: '智慧機台', size: 'xxs', color: '#999999', align: 'center', margin: 'xs' }
+                ]
+              },
+              { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '10px', alignItems: 'center',
+                contents: [
+                  { type: 'text', text: '98%', size: 'lg', weight: 'bold', color: BRAND_GOLD, align: 'center' },
+                  { type: 'text', text: '系統穩定度', size: 'xxs', color: '#999999', align: 'center', margin: 'xs' }
+                ]
+              },
+              { type: 'box', layout: 'vertical', flex: 1, backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '10px', alignItems: 'center',
+                contents: [
+                  { type: 'text', text: '24H', size: 'lg', weight: 'bold', color: BRAND_GOLD, align: 'center' },
+                  { type: 'text', text: '全天候服務', size: 'xxs', color: '#999999', align: 'center', margin: 'xs' }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', flex: 1, action: { type: 'uri', label: '瀏覽官網', uri: OFFICIAL_WEBSITE } },
+          { type: 'button', style: 'primary', color: '#555555', height: 'sm', flex: 1, action: { type: 'uri', label: '聯繫我們', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+}
+
+function buildFAQCarousel() {
+  const faqs = [
+    { q: '如何使用雲管家洗衣？', a: '1. 加入LINE官方帳號\n2. 選擇門市與機器\n3. 選擇洗衣模式\n4. LINE Pay或錢包付款\n5. 洗好自動通知' },
+    { q: '可以用什麼方式付款？', a: '支援 LINE Pay、錢包餘額、投幣三種方式。推薦儲值到錢包，儲值 NT$200 送 NT$30！' },
+    { q: '洗衣機故障怎麼辦？', a: '請輸入「客服」聯繫門市客服，或輸入「故障報修」填寫報修表。雲管家支援遠端診斷，多數問題可即時排除。' },
+    { q: '儲值的錢可以退嗎？', a: '可以！請聯繫客服處理退款，1-3 個工作天內退回。機器故障未啟動則全額退回錢包。' },
+    { q: '營業時間是？', a: '全台所有門市 24 小時營業、全年無休！出門前可先查看空機狀態。' }
+  ];
+
+  const bubbles = faqs.map(f => ({
+    type: 'bubble', size: 'kilo',
+    styles: {
+      header: { backgroundColor: '#0A0A0F' },
+      body: { backgroundColor: '#050508' }
+    },
+    header: {
+      type: 'box', layout: 'vertical', paddingAll: '16px',
+      contents: [
+        { type: 'text', text: f.q, color: '#FFFFFF', weight: 'bold', size: 'sm', wrap: true }
+      ]
+    },
+    body: {
+      type: 'box', layout: 'vertical', paddingAll: '16px',
+      contents: [
+        { type: 'text', text: f.a, size: 'sm', wrap: true, color: '#E0E0E0' }
+      ]
+    }
+  }));
+
+  return {
+    type: 'flex', altText: '常見問題 FAQ',
+    contents: { type: 'carousel', contents: bubbles }
+  };
+}
+
+function buildServiceGuaranteeCard() {
+  const guarantees = [
+    '系統穩定度 98% 以上',
+    '24 小時遠端監控',
+    '故障 30 分鐘內回應',
+    '免費安裝 + 教育訓練',
+    '不滿意隨時解約'
+  ];
+
+  return {
+    type: 'flex', altText: '雲管家服務保障',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '雲管家服務保障', color: BRAND_GOLD, weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: guarantees.map(g => ({
+          type: 'box', layout: 'horizontal', spacing: 'md',
+          contents: [
+            { type: 'box', layout: 'vertical', width: '28px', height: '28px', backgroundColor: '#151518', cornerRadius: '8px', alignItems: 'center', justifyContent: 'center',
+              contents: [
+                { type: 'text', text: '\u2713', size: 'sm', color: BRAND_GOLD, align: 'center' }
+              ]
+            },
+            { type: 'text', text: g, size: 'sm', color: '#E0E0E0', gravity: 'center', flex: 1, wrap: true }
+          ]
+        }))
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'postback', label: '了解方案', data: 'action=show_plans', displayText: '了解方案' } }
+        ]
+      }
+    }
+  };
+}
+
+function buildROICard() {
+  const rows = [
+    { label: '機台數量', value: '10 台' },
+    { label: '每日平均使用', value: '6 次/台' },
+    { label: '平均客單價', value: 'NT$55' },
+    { label: '月營收估算', value: 'NT$99,000' },
+    { label: '系統月費', value: 'NT$5,000' },
+    { label: '行動支付提升客單價', value: '+15~25%' },
+    { label: '預估投資回收期', value: '12-18 個月' }
+  ];
+
+  return {
+    type: 'flex', altText: '雲管家獲利分析',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '獲利分析', color: BRAND_GOLD, weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '以 10 台機器門市為例', size: 'xs', color: '#999999', margin: 'none' },
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          ...rows.map(r => ({
+            type: 'box', layout: 'horizontal', margin: 'sm',
+            contents: [
+              { type: 'text', text: r.label, size: 'sm', color: '#999999', flex: 5, wrap: true },
+              { type: 'text', text: r.value, size: 'sm', weight: 'bold', flex: 4, align: 'end', color: BRAND_GOLD }
+            ]
+          })),
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
+          { type: 'box', layout: 'horizontal', margin: 'md', backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '12px',
+            contents: [
+              { type: 'text', text: '月淨利估算', size: 'sm', color: '#999999', flex: 5 },
+              { type: 'text', text: 'NT$94,000+', size: 'md', weight: 'bold', flex: 4, align: 'end', color: BRAND_GOLD }
+            ]
+          }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約專人分析', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+}
+
+function buildInstallGuideCard() {
+  const steps = [
+    { num: '1', title: '簽約 + 場勘', time: 'Day 1-2' },
+    { num: '2', title: '設備安裝', time: 'Day 3-5' },
+    { num: '3', title: '系統串接測試', time: 'Day 5-7' },
+    { num: '4', title: '試營運 + 教育訓練', time: 'Day 7-14' }
+  ];
+
+  return {
+    type: 'flex', altText: '雲管家導入流程',
+    contents: {
+      type: 'bubble', size: 'mega',
+      styles: {
+        header: { backgroundColor: '#0A0A0F' },
+        body: { backgroundColor: '#050508' },
+        footer: { backgroundColor: '#050508', separator: false }
+      },
+      header: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '導入流程', color: BRAND_GOLD, weight: 'bold', size: 'lg' }
+        ]
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'lg', paddingAll: '20px',
+        contents: [
+          ...steps.map(s => ({
+            type: 'box', layout: 'horizontal', spacing: 'md',
+            contents: [
+              { type: 'box', layout: 'vertical', width: '32px', height: '32px', backgroundColor: BRAND_GOLD, cornerRadius: '16px', alignItems: 'center', justifyContent: 'center',
+                contents: [
+                  { type: 'text', text: s.num, size: 'sm', weight: 'bold', color: '#000000', align: 'center' }
+                ]
+              },
+              { type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: s.title, size: 'sm', weight: 'bold', color: '#FFFFFF' },
+                  { type: 'text', text: s.time, size: 'xs', color: '#999999', margin: 'xs' }
+                ]
+              }
+            ]
+          })),
+          { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'md' },
+          { type: 'box', layout: 'horizontal', backgroundColor: '#151518', cornerRadius: '8px', paddingAll: '12px', margin: 'sm',
+            contents: [
+              { type: 'text', text: '全程免費安裝 / 不需更換現有機器', size: 'xs', color: BRAND_GOLD, wrap: true, align: 'center', flex: 1 }
+            ]
+          }
+        ]
+      },
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
+        contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約場勘', uri: LINE_OA_CHAT_URL } }
+        ]
+      }
+    }
+  };
+}
+
 function buildTraditionalVsSmartCard() {
   return {
     type: 'flex', altText: '傳統投幣 vs 雲管家智慧系統比較',
@@ -6843,6 +7576,26 @@ const KEYWORD_REPLIES = {
     tags: ['B2B_安裝查詢'],
     messages: [{ type: 'text', text: '🔧 安裝與導入流程：\n\n📅 標準時程：7-14 個工作天\n\n1️⃣ 簽約後 Day 1-2\n   → 現場場勘 + 網路環境確認\n\n2️⃣ Day 3-5\n   → 工控機安裝 + 通訊線路佈建\n\n3️⃣ Day 5-7\n   → 系統設定 + 機台串接測試\n\n4️⃣ Day 7-14\n   → 試營運 + 店主教育訓練\n\n✅ 全程免費安裝\n✅ 不需更換現有機器\n✅ 遠端支援 + 到場服務\n\n📞 預約場勘：' + CONTACT_PHONE }]
   },
+  '關於雲管家': {
+    tags: [],
+    messages: [buildAboutUsCard()]
+  },
+  '常見問題': {
+    tags: [],
+    messages: [buildFAQCarousel()]
+  },
+  '服務保障': {
+    tags: ['B2B_服務查詢'],
+    messages: [buildServiceGuaranteeCard()]
+  },
+  '獲利分析': {
+    tags: ['B2B_獲利分析'],
+    messages: [buildROICard()]
+  },
+  '導入流程': {
+    tags: ['B2B_安裝查詢'],
+    messages: [buildInstallGuideCard()]
+  },
 };
 
 // ---- Franchise secondary segmentation ----
@@ -6885,7 +7638,6 @@ function verifyLineSignature(rawBody, signature) {
 const FUZZY_MAP = [
   // Franchise / B2B entry
   { keywords: ['創業', '開店', '加盟', '店主', '業主'], reply: '我要創業' },
-  { keywords: ['獲利', '賺錢', '投報率', 'ROI', '回收'], reply: '獲利分析' },
   { keywords: ['區域', '地點', '選址'], reply: '區域評估' },
   { keywords: ['成功案例', '案例'], reply: '成功案例' },
   { keywords: ['傳統', '比較', '差別'], reply: '傳統比較' },
@@ -6924,7 +7676,13 @@ const FUZZY_MAP = [
   { keywords: ['棉被', '被子', '大型', '窗簾', '毛毯'], reply: '棉被' },
   { keywords: ['推薦碼', '邀請碼', '推薦好友', '分享碼'], reply: '推薦碼' },
   { keywords: ['合約', '簽約', '合同', '契約'], reply: '合約' },
-  { keywords: ['安裝', '施工', '工期', '場勘', '導入'], reply: '安裝' },
+  { keywords: ['安裝', '施工'], reply: '安裝' },
+  // About / FAQ / Guarantee
+  { keywords: ['關於', '簡介', '公司', '介紹', '雲管家是什麼'], reply: '關於雲管家' },
+  { keywords: ['常見問題', 'FAQ', 'faq', '問答', 'QA', 'qa'], reply: '常見問題' },
+  { keywords: ['保障', '保固', '保證', 'SLA'], reply: '服務保障' },
+  { keywords: ['獲利', '賺錢', '投報率', 'ROI', '回收'], reply: '獲利分析' },
+  { keywords: ['導入', '安裝流程', '工期', '場勘'], reply: '導入流程' },
 ];
 
 // ===== Static Assets for LINE Imagemap =====
