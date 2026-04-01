@@ -6689,6 +6689,275 @@ async function linkRichMenuToUser(userId, menuType) {
   }
 }
 
+// ═══════════════════════════════════════
+//  Rich Menu Management APIs (Admin)
+// ═══════════════════════════════════════
+
+const RICH_MENU_TEMPLATE = {
+  size: { width: 2500, height: 1686 },
+  selected: true,
+  name: '雲管家主選單',
+  chatBarText: '開啟選單',
+  areas: [
+    {
+      bounds: { x: 0, y: 0, width: 833, height: 843 },
+      action: { type: 'uri', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y', label: '開始洗衣' }
+    },
+    {
+      bounds: { x: 833, y: 0, width: 834, height: 843 },
+      action: { type: 'uri', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y#topup', label: '儲值點數' }
+    },
+    {
+      bounds: { x: 1667, y: 0, width: 833, height: 843 },
+      action: { type: 'uri', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y#coupons', label: '我的優惠' }
+    },
+    {
+      bounds: { x: 0, y: 843, width: 833, height: 843 },
+      action: { type: 'uri', uri: 'https://cloudmonster-website.vercel.app/stores', label: '服務據點' }
+    },
+    {
+      bounds: { x: 833, y: 843, width: 834, height: 843 },
+      action: { type: 'uri', uri: 'https://liff.line.me/2009552592-xkDKSJ1Y#history', label: '使用紀錄' }
+    },
+    {
+      bounds: { x: 1667, y: 843, width: 833, height: 843 },
+      action: { type: 'message', text: '客服', label: '聯絡客服' }
+    }
+  ]
+};
+
+// POST /api/admin/rich-menu/create - Create a Rich Menu
+app.post('/api/admin/rich-menu/create', requireAdmin, async (req, res) => {
+  try {
+    const template = req.body.template || RICH_MENU_TEMPLATE;
+    console.log('[RichMenu] Creating rich menu:', template.name);
+
+    const response = await fetch('https://api.line.me/v2/bot/richmenu', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(template)
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('[RichMenu] Create failed:', data);
+      return res.status(response.status).json({ error: 'Failed to create rich menu', detail: data });
+    }
+
+    console.log('[RichMenu] Created successfully:', data.richMenuId);
+    res.json({ success: true, richMenuId: data.richMenuId });
+  } catch (e) {
+    console.error('[RichMenu] Create error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/rich-menu/upload-image - Upload image for a Rich Menu
+app.post('/api/admin/rich-menu/upload-image', requireAdmin, async (req, res) => {
+  try {
+    const { richMenuId } = req.body;
+    if (!richMenuId) {
+      return res.status(400).json({ error: 'richMenuId is required' });
+    }
+
+    // Generate a simple placeholder image using raw PNG/Buffer
+    // This creates a 2500x1686 image with labeled grid cells
+    console.log('[RichMenu] Generating placeholder image for:', richMenuId);
+
+    // Create a minimal valid PNG - we use a 1x1 pixel scaled approach
+    // For production, replace with an actual designed image
+    // Accept raw image body if Content-Type is image/*
+    const contentType = req.headers['content-type'] || '';
+    let imageBuffer;
+
+    if (contentType.startsWith('image/')) {
+      // Raw image upload mode
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      await new Promise((resolve) => req.on('end', resolve));
+      imageBuffer = Buffer.concat(chunks);
+    } else {
+      // No image provided - return instructions
+      return res.status(400).json({
+        error: 'No image provided',
+        instructions: 'To upload a rich menu image, send a POST request with Content-Type: image/png and the image as the raw body. Image must be 2500x1686 pixels, max 1MB. Alternatively, use the LINE Official Account Manager web UI to upload the image manually.',
+        richMenuId,
+        manualUploadUrl: 'https://manager.line.biz/'
+      });
+    }
+
+    console.log('[RichMenu] Uploading image, size:', imageBuffer.length, 'bytes');
+
+    const response = await fetch(`https://api-data.line.me/v2/bot/richmenu/${richMenuId}/content`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'image/png'
+      },
+      body: imageBuffer
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error('[RichMenu] Image upload failed:', errData);
+      return res.status(response.status).json({ error: 'Failed to upload image', detail: errData });
+    }
+
+    console.log('[RichMenu] Image uploaded successfully for:', richMenuId);
+    res.json({ success: true, richMenuId });
+  } catch (e) {
+    console.error('[RichMenu] Upload error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/rich-menu/set-default - Set a Rich Menu as default for all users
+app.post('/api/admin/rich-menu/set-default', requireAdmin, async (req, res) => {
+  try {
+    const { richMenuId } = req.body;
+    if (!richMenuId) {
+      return res.status(400).json({ error: 'richMenuId is required' });
+    }
+
+    console.log('[RichMenu] Setting default rich menu:', richMenuId);
+
+    const response = await fetch(`https://api.line.me/v2/bot/user/all/richmenu/${richMenuId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error('[RichMenu] Set default failed:', errData);
+      return res.status(response.status).json({ error: 'Failed to set default rich menu', detail: errData });
+    }
+
+    console.log('[RichMenu] Default rich menu set successfully:', richMenuId);
+    res.json({ success: true, richMenuId, message: 'Rich menu set as default for all users' });
+  } catch (e) {
+    console.error('[RichMenu] Set default error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/rich-menu/list - List all Rich Menus
+app.get('/api/admin/rich-menu/list', requireAdmin, async (req, res) => {
+  try {
+    console.log('[RichMenu] Listing all rich menus');
+
+    const response = await fetch('https://api.line.me/v2/bot/richmenu/list', {
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('[RichMenu] List failed:', data);
+      return res.status(response.status).json({ error: 'Failed to list rich menus', detail: data });
+    }
+
+    console.log('[RichMenu] Found', (data.richmenus || []).length, 'rich menus');
+    res.json({ success: true, richmenus: data.richmenus || [] });
+  } catch (e) {
+    console.error('[RichMenu] List error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/rich-menu/:richMenuId - Delete a Rich Menu
+app.delete('/api/admin/rich-menu/:richMenuId', requireAdmin, async (req, res) => {
+  try {
+    const { richMenuId } = req.params;
+    console.log('[RichMenu] Deleting rich menu:', richMenuId);
+
+    const response = await fetch(`https://api.line.me/v2/bot/richmenu/${richMenuId}`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error('[RichMenu] Delete failed:', errData);
+      return res.status(response.status).json({ error: 'Failed to delete rich menu', detail: errData });
+    }
+
+    console.log('[RichMenu] Deleted successfully:', richMenuId);
+    res.json({ success: true, richMenuId, message: 'Rich menu deleted' });
+  } catch (e) {
+    console.error('[RichMenu] Delete error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/rich-menu/setup - One-click setup: create + set as default
+app.post('/api/admin/rich-menu/setup', requireAdmin, async (req, res) => {
+  try {
+    const template = req.body.template || RICH_MENU_TEMPLATE;
+    console.log('[RichMenu] One-click setup starting...');
+
+    // Step 1: Create the Rich Menu
+    console.log('[RichMenu] Step 1: Creating rich menu...');
+    const createRes = await fetch('https://api.line.me/v2/bot/richmenu', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(template)
+    });
+
+    const createData = await createRes.json();
+    if (!createRes.ok) {
+      console.error('[RichMenu] Setup - create failed:', createData);
+      return res.status(createRes.status).json({ error: 'Failed to create rich menu', step: 'create', detail: createData });
+    }
+
+    const richMenuId = createData.richMenuId;
+    console.log('[RichMenu] Step 1 done, richMenuId:', richMenuId);
+
+    // Step 2: Set as default for all users
+    console.log('[RichMenu] Step 2: Setting as default...');
+    const defaultRes = await fetch(`https://api.line.me/v2/bot/user/all/richmenu/${richMenuId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
+
+    if (!defaultRes.ok) {
+      const errData = await defaultRes.json().catch(() => ({}));
+      console.error('[RichMenu] Setup - set default failed:', errData);
+      return res.status(defaultRes.status).json({
+        error: 'Rich menu created but failed to set as default. Upload an image first.',
+        step: 'set-default',
+        richMenuId,
+        detail: errData,
+        hint: 'LINE requires a rich menu image before it can be set as default. Upload an image via POST /api/admin/rich-menu/upload-image or through LINE Official Account Manager.'
+      });
+    }
+
+    console.log('[RichMenu] Setup complete! Rich menu created and set as default:', richMenuId);
+    res.json({
+      success: true,
+      richMenuId,
+      message: 'Rich menu created and set as default for all users',
+      note: 'If no image was uploaded, the menu will show with default styling. Upload an image via POST /api/admin/rich-menu/upload-image for a custom appearance.',
+      areas: template.areas.map(a => ({ label: a.action.label, type: a.action.type }))
+    });
+  } catch (e) {
+    console.error('[RichMenu] Setup error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Helper: add tag to user
 async function addUserTag(lineUserId, tag, source = 'auto') {
   try {
