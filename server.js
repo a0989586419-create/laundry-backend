@@ -37,6 +37,16 @@ const db = new Pool({
 });
 db.on('error', (err) => console.error('DB pool error:', err));
 
+// ===== Audit Logging Helper =====
+async function logAudit(userId, action, targetType, targetId, details = {}, ip = null) {
+  try {
+    await db.query(
+      'INSERT INTO audit_logs (user_id, action, target_type, target_id, details, ip_address) VALUES ($1, $2, $3, $4, $5, $6)',
+      [userId, action, targetType, targetId, JSON.stringify(details), ip]
+    );
+  } catch (e) { console.error('[Audit] Error:', e.message); }
+}
+
 // ===== MQTT =====
 const mqttClient = process.env.MQTT_URL ? mqtt.connect(process.env.MQTT_URL, {
   username: process.env.MQTT_USER,
@@ -950,6 +960,7 @@ app.post('/api/wallet/topup', async (req, res) => {
     const { bonus } = await applyTopupBonus(userId, groupId, amount);
 
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [userId, groupId]);
+    logAudit(userId, 'wallet_topup', 'user', userId, { amount, groupId }, req.ip);
     res.json({ success: true, balance: r.rows[0].balance, bonus });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -1180,6 +1191,7 @@ app.post('/api/admin/users', async (req, res) => {
       ON CONFLICT (line_user_id, role, COALESCE(group_id, '__NULL__')) DO UPDATE
       SET display_name=COALESCE($4, user_roles.display_name), phone=COALESCE($5, user_roles.phone), notes=COALESCE($6, user_roles.notes), permissions=COALESCE($7, user_roles.permissions)
     `, [targetUserId, role, gid, displayName || null, phone || null, notes || null, JSON.stringify(permissions || {})]);
+    logAudit(userId, 'role_add', 'user', targetUserId, { role, groupId: gid }, req.ip);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -3052,7 +3064,9 @@ app.post('/api/admin/machines', async (req, res) => {
       machineId = `${storeId}-m${n}`;
     }
 
-    res.json(await createMachine(machineId, storeId, name, size, machineType, protocol, modbusSlave, tbDevice, description, n));
+    const created = await createMachine(machineId, storeId, name, size, machineType, protocol, modbusSlave, tbDevice, description, n);
+    logAudit(userId, 'machine_create', 'machine', created.id, { storeId, name, machineType: machineType || 'combo' }, req.ip);
+    res.json(created);
   } catch (e) {
     console.error('[Machine Create]', e.message);
     res.status(500).json({ error: e.message });
@@ -3116,6 +3130,7 @@ app.delete('/api/admin/machines/:machineId', async (req, res) => {
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'Machine not found' });
+    logAudit(userId, 'machine_delete', 'machine', machineId, {}, req.ip);
     res.json({ success: true, message: `已停用 ${result.rows[0].name}`, machine: result.rows[0] });
   } catch (e) {
     console.error('[Machine Delete]', e.message);
@@ -5003,6 +5018,7 @@ app.post('/api/admin/store-push', async (req, res) => {
       if (ok) successCount++; else failCount++;
     }
 
+    logAudit(userId, 'push_send', 'group', targetGroupId, { targets: targets.length, successCount }, req.ip);
     res.json({
       success: true,
       totalTargets: targets.length,
@@ -5093,6 +5109,7 @@ app.post('/api/admin/store-push/topup', async (req, res) => {
       [groupId, numAmount]
     );
 
+    logAudit(userId, 'push_topup', 'group', groupId, { amount: numAmount }, req.ip);
     res.json({
       success: true,
       groupId,
@@ -5441,6 +5458,7 @@ app.post('/api/admin/push-plans/select', async (req, res) => {
     );
     const row = updateRes.rows[0];
 
+    logAudit(userId, 'push_plan_change', 'group', groupId, { plan: planKey }, req.ip);
     res.json({ success: true, plan: plan, groupId, balance: parseFloat(row.balance), perPushRate: parseFloat(row.per_push_rate), monthlyManualLimit: parseInt(row.monthly_manual_limit) });
   } catch (e) {
     console.error('[Push Plan Select]', e.message);
@@ -6607,6 +6625,27 @@ async function initDB() {
       )
     `).catch(() => {});
 
+    // CMS articles table (blog/news)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS cms_articles (
+        id SERIAL PRIMARY KEY,
+        slug TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT,
+        content TEXT,
+        cover_image TEXT,
+        category TEXT DEFAULT 'blog',
+        tags TEXT[],
+        author TEXT,
+        published BOOLEAN DEFAULT false,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_cms_articles_slug ON cms_articles(slug)`).catch(() => {});
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_cms_articles_published ON cms_articles(published, sort_order)`).catch(() => {});
+
   } catch (e) { /* column might already exist */ }
 
   // Seed store groups
@@ -6734,6 +6773,22 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `).catch(() => {});
+
+  // Audit logs table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id TEXT,
+      details JSONB,
+      ip_address TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `).catch(() => {});
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)`).catch(() => {});
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)`).catch(() => {});
 
   console.log('DB initialized with multi-tenant tables');
 }
@@ -11863,6 +11918,98 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════
+//  CMS Blog/News API
+// ═══════════════════════════════════════
+
+// GET /api/cms/articles — list articles (public: only published; admin: all)
+app.get('/api/cms/articles', async (req, res) => {
+  try {
+    const isAdmin = req.query.admin === 'true';
+    if (isAdmin) {
+      const role = await getUserRole(req.query.userId);
+      if (!role || role.role !== 'super_admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+      }
+    }
+    const query = isAdmin
+      ? 'SELECT * FROM cms_articles ORDER BY sort_order DESC, created_at DESC'
+      : "SELECT * FROM cms_articles WHERE published = true ORDER BY sort_order DESC, created_at DESC";
+    const result = await db.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[cms] List error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch articles' });
+  }
+});
+
+// GET /api/cms/articles/:slug — get single article
+app.get('/api/cms/articles/:slug', async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM cms_articles WHERE slug = $1', [req.params.slug]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Article not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch article' });
+  }
+});
+
+// POST /api/cms/articles — create article (admin only)
+app.post('/api/cms/articles', async (req, res) => {
+  try {
+    const role = await getUserRole(req.body.userId);
+    if (!role || role.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    const { slug, title, summary, content, cover_image, category, tags, author, published, sort_order } = req.body;
+    if (!slug || !title) return res.status(400).json({ error: 'slug and title required' });
+    const result = await db.query(
+      `INSERT INTO cms_articles (slug, title, summary, content, cover_image, category, tags, author, published, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [slug, title, summary || '', content || '', cover_image || '', category || 'blog', tags || [], author || '', published || false, sort_order || 0]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[cms] Create error:', err.message);
+    res.status(500).json({ error: 'Failed to create article' });
+  }
+});
+
+// PUT /api/cms/articles/:id — update article (admin only)
+app.put('/api/cms/articles/:id', async (req, res) => {
+  try {
+    const role = await getUserRole(req.body.userId);
+    if (!role || role.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    const { slug, title, summary, content, cover_image, category, tags, author, published, sort_order } = req.body;
+    const result = await db.query(
+      `UPDATE cms_articles SET slug=$1, title=$2, summary=$3, content=$4, cover_image=$5, category=$6, tags=$7, author=$8, published=$9, sort_order=$10, updated_at=NOW()
+       WHERE id=$11 RETURNING *`,
+      [slug, title, summary || '', content || '', cover_image || '', category || 'blog', tags || [], author || '', published || false, sort_order || 0, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Article not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[cms] Update error:', err.message);
+    res.status(500).json({ error: 'Failed to update article' });
+  }
+});
+
+// DELETE /api/cms/articles/:id — delete article (admin only)
+app.delete('/api/cms/articles/:id', async (req, res) => {
+  try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || role.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    await db.query('DELETE FROM cms_articles WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete article' });
+  }
+});
+
+// ═══════════════════════════════════════
 //  Weekly Auto-Broadcast: Laundry Tips
 // ═══════════════════════════════════════
 
@@ -12217,6 +12364,27 @@ app.get('/health', async (req, res) => {
     dbStatus = 'connected';
   } catch { dbStatus = 'disconnected'; }
   res.json({ status: 'ok', uptime: `${h}h ${m}m`, db: dbStatus, timestamp: new Date().toISOString() });
+});
+
+// ===== Audit Logs Endpoint =====
+app.get('/api/admin/audit-logs', async (req, res) => {
+  try {
+    const role = await getUserRole(req.query.userId);
+    if (!role || role.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+    const result = await db.query(
+      'SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    const countResult = await db.query('SELECT COUNT(*) as total FROM audit_logs');
+    res.json({ logs: result.rows, total: parseInt(countResult.rows[0].total) });
+  } catch (err) {
+    console.error('[audit-logs] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
