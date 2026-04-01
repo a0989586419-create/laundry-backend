@@ -1389,15 +1389,20 @@ app.post('/api/orders/create', async (req, res) => {
 });
 
 app.get('/api/orders/:lineUserId', async (req, res) => {
-  const r = await db.query(`
-    SELECT o.*,s.name as store_name,m.name as machine_name,
-    cs.remain_sec,cs.progress FROM orders o
-    JOIN members mb ON o.member_id=mb.id
-    JOIN stores s ON o.store_id=s.id JOIN machines m ON o.machine_id=m.id
-    LEFT JOIN machine_current_state cs ON o.machine_id=cs.machine_id
-    WHERE mb.line_user_id=$1 ORDER BY o.created_at DESC LIMIT 20
-  `, [req.params.lineUserId]);
-  res.json(r.rows);
+  try {
+    const r = await db.query(`
+      SELECT o.*,s.name as store_name,m.name as machine_name,
+      cs.remain_sec,cs.progress FROM orders o
+      JOIN members mb ON o.member_id=mb.id
+      JOIN stores s ON o.store_id=s.id JOIN machines m ON o.machine_id=m.id
+      LEFT JOIN machine_current_state cs ON o.machine_id=cs.machine_id
+      WHERE mb.line_user_id=$1 ORDER BY o.created_at DESC LIMIT 20
+    `, [req.params.lineUserId]);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('[Orders] Error fetching orders:', e.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ═══════════════════════════════════════
@@ -1755,22 +1760,31 @@ app.post('/api/topup/linepay', async (req, res) => {
 
 app.get('/api/topup/confirm', async (req, res) => {
   try {
-    const { transactionId, orderId, userId: legacyUserId, groupId: legacyGroupId, amount: legacyAmount } = req.query;
+    const { transactionId, orderId } = req.query;
     const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-chi.vercel.app';
 
-    // Retrieve order from DB (tamper-proof) or fallback to legacy URL params
-    let userId, groupId, amountInt;
-    if (orderId) {
-      const orderRow = (await db.query('SELECT member_id, machine_id, total_amount FROM orders WHERE id=$1 AND status NOT IN ($2, $3)', [orderId, 'paid', 'completed'])).rows[0];
-      if (!orderRow) return res.redirect(`${FRONTEND_URL}/?status=topup_success&already_confirmed=1`);
-      userId = orderRow.member_id;
-      groupId = orderRow.machine_id; // stored groupId in machine_id field for topup orders
-      amountInt = orderRow.total_amount;
-      await db.query('UPDATE orders SET status=$1 WHERE id=$2', ['confirming', orderId]);
-    } else {
-      // Legacy fallback for old URLs
-      userId = legacyUserId; groupId = legacyGroupId; amountInt = parseInt(legacyAmount);
+    // Retrieve order from DB (tamper-proof)
+    if (!orderId) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
     }
+
+    const orderRow = (await db.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0];
+    if (!orderRow) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+    // Atomic status transition to prevent TOCTOU
+    const lockResult = await db.query(
+      "UPDATE orders SET status = 'confirming' WHERE id = $1 AND status IN ('pending', 'waiting_payment') RETURNING *",
+      [orderRow.id]
+    );
+    if (lockResult.rows.length === 0) {
+      return res.json({ success: false, error: 'Order already processed' });
+    }
+
+    const userId = orderRow.member_id;
+    const groupId = orderRow.machine_id; // stored groupId in machine_id field for topup orders
+    const amountInt = orderRow.total_amount;
 
     const body = { amount: amountInt, currency: 'TWD' };
     const result = await linePayRequest('POST', `/v3/payments/${transactionId}/confirm`, body);
@@ -1952,25 +1966,17 @@ app.post('/api/jkopay/result', async (req, res) => {
       return res.status(403).json({ result: '001', result_message: 'Invalid digest' });
     }
 
-    // Fetch order
-    const orderRow = (await db.query('SELECT * FROM orders WHERE id=$1', [platform_order_id])).rows[0];
-    if (!orderRow) {
-      console.error(`[JKOPay] Order not found: ${platform_order_id}`);
-      return res.json({ result: '000' }); // Still return 000 to acknowledge
-    }
-
-    // Prevent double processing
-    if (orderRow.status === 'paid' || orderRow.status === 'completed') {
-      console.log(`[JKOPay] Order already processed: ${platform_order_id}`);
-      return res.json({ result: '000' });
-    }
-
     if (status === 'SUCCESS') {
-      // Update order
-      await db.query(
-        `UPDATE orders SET status='paid', paid_at=NOW(), payment_method='jkopay', jkopay_order_id=$2 WHERE id=$1`,
+      // Atomic status transition to prevent double-credit
+      const updateResult = await db.query(
+        "UPDATE orders SET status = 'paid', paid_at=NOW(), payment_method='jkopay', jkopay_order_id=$2 WHERE id = $1 AND status = 'waiting_payment' RETURNING *",
         [platform_order_id, order_id]
       );
+      if (updateResult.rows.length === 0) {
+        // Already processed or invalid state
+        return res.json({ result: '000' });
+      }
+      const orderRow = updateResult.rows[0];
 
       // Update machine state
       await db.query(`
@@ -2179,30 +2185,20 @@ app.post('/api/topup/jkopay/result', async (req, res) => {
       return res.status(403).json({ result: '001', result_message: 'Invalid digest' });
     }
 
-    // Fetch order
-    const orderRow = (await db.query(
-      `SELECT * FROM orders WHERE id=$1 AND mode='topup'`, [platform_order_id]
-    )).rows[0];
-    if (!orderRow) {
-      console.error(`[JKOPay] Topup order not found: ${platform_order_id}`);
-      return res.json({ result: '000' });
-    }
-
-    // Prevent double processing
-    if (orderRow.status === 'paid' || orderRow.status === 'completed') {
-      return res.json({ result: '000' });
-    }
-
     if (status === 'SUCCESS') {
+      // Atomic status transition to prevent double-topup
+      const updateResult = await db.query(
+        "UPDATE orders SET status = 'paid', paid_at=NOW(), jkopay_order_id=$2 WHERE id = $1 AND mode='topup' AND status = 'waiting_payment' RETURNING *",
+        [platform_order_id, order_id]
+      );
+      if (updateResult.rows.length === 0) {
+        // Already processed or invalid state
+        return res.json({ result: '000' });
+      }
+      const orderRow = updateResult.rows[0];
       const userId = orderRow.member_id;
       const groupId = orderRow.machine_id; // groupId stored in machine_id for topup
       const amountInt = orderRow.total_amount;
-
-      // Update order
-      await db.query(
-        `UPDATE orders SET status='paid', paid_at=NOW(), jkopay_order_id=$2 WHERE id=$1`,
-        [platform_order_id, order_id]
-      );
 
       // Add points to wallet
       await db.query(`
@@ -4300,13 +4296,15 @@ app.get('/api/referral/stats', async (req, res) => {
 });
 
 app.post('/api/member/referral/use', async (req, res) => {
+  const client = await db.connect();
   try {
     const { userId, code } = req.body;
-    if (!userId || !code) return res.status(400).json({ error: 'userId and code required' });
+    if (!userId || !code) { client.release(); return res.status(400).json({ error: 'userId and code required' }); }
 
     // Find the referral code
-    const codeResult = await db.query('SELECT * FROM referral_codes WHERE code = $1', [code.toUpperCase()]);
+    const codeResult = await client.query('SELECT * FROM referral_codes WHERE code = $1', [code.toUpperCase()]);
     if (codeResult.rows.length === 0) {
+      client.release();
       return res.status(404).json({ error: '推薦碼不存在' });
     }
 
@@ -4314,15 +4312,20 @@ app.post('/api/member/referral/use', async (req, res) => {
 
     // Cannot refer yourself
     if (referralCode.line_user_id === userId) {
+      client.release();
       return res.status(400).json({ error: '不能使用自己的推薦碼' });
     }
 
-    // Check if already used by this user
-    const existing = await db.query(
-      'SELECT id FROM referral_records WHERE referred_id = $1',
+    await client.query('BEGIN');
+
+    // Check if already used by this user (inside transaction with FOR UPDATE)
+    const existing = await client.query(
+      'SELECT id FROM referral_records WHERE referred_id = $1 FOR UPDATE',
       [userId]
     );
     if (existing.rows.length > 0) {
+      await client.query('ROLLBACK');
+      client.release();
       return res.status(400).json({ error: '您已經使用過推薦碼了' });
     }
 
@@ -4330,21 +4333,21 @@ app.post('/api/member/referral/use', async (req, res) => {
     const referrerId = referralCode.line_user_id;
 
     // Record the referral
-    await db.query(
+    await client.query(
       'INSERT INTO referral_records (referrer_id, referred_id, code, reward_given) VALUES ($1, $2, $3, true)',
       [referrerId, userId, code.toUpperCase()]
     );
 
     // Increment uses
-    await db.query('UPDATE referral_codes SET uses = uses + 1 WHERE code = $1', [code.toUpperCase()]);
+    await client.query('UPDATE referral_codes SET uses = uses + 1 WHERE code = $1', [code.toUpperCase()]);
 
     // Reward both users: add to all their wallets
     // Get all group wallets for referrer
-    const referrerWallets = await db.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [referrerId]);
+    const referrerWallets = await client.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [referrerId]);
     for (const w of referrerWallets.rows) {
-      await db.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
+      await client.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
         [rewardPoints, referrerId, w.group_id]);
-      await db.query(
+      await client.query(
         `INSERT INTO transactions (line_user_id, group_id, type, amount, description)
          VALUES ($1, $2, 'referral_reward', $3, $4)`,
         [referrerId, w.group_id, rewardPoints, `推薦獎勵 (被推薦人使用推薦碼 ${code.toUpperCase()})`]
@@ -4352,16 +4355,18 @@ app.post('/api/member/referral/use', async (req, res) => {
     }
 
     // Get all group wallets for referred user
-    const referredWallets = await db.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [userId]);
+    const referredWallets = await client.query('SELECT group_id FROM wallets WHERE line_user_id = $1', [userId]);
     for (const w of referredWallets.rows) {
-      await db.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
+      await client.query('UPDATE wallets SET balance = balance + $1 WHERE line_user_id = $2 AND group_id = $3',
         [rewardPoints, userId, w.group_id]);
-      await db.query(
+      await client.query(
         `INSERT INTO transactions (line_user_id, group_id, type, amount, description)
          VALUES ($1, $2, 'referral_bonus', $3, $4)`,
         [userId, w.group_id, rewardPoints, `新用戶推薦碼獎勵 (NT$${rewardPoints})`]
       );
     }
+
+    await client.query('COMMIT');
 
     res.json({
       success: true,
@@ -4369,8 +4374,11 @@ app.post('/api/member/referral/use', async (req, res) => {
       reward: rewardPoints,
     });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('referral use error:', e);
     res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -4891,9 +4899,9 @@ app.post('/api/admin/store-push', async (req, res) => {
       return res.status(429).json({ error: '已超過本月推播上限', monthlyUsed, monthlyLimit });
     }
 
-    // Check balance
-    if (currentBalance < totalCost) {
-      return res.status(402).json({ error: '推播餘額不足', balance: currentBalance, cost: totalCost });
+    // Check balance (skip for free plan users with zero balance)
+    if (currentBalance < totalCost && parseFloat(balanceRow.balance) > 0) {
+      return res.status(400).json({ success: false, error: '推播餘額不足' });
     }
 
     // Deduct balance atomically
@@ -5356,6 +5364,12 @@ app.post('/api/admin/push-plans/select', async (req, res) => {
     const { userId, groupId, planKey } = req.body;
     if (!userId || !groupId || !planKey) return res.status(400).json({ error: 'userId, groupId, planKey required' });
 
+    // Auth check
+    const role = await getUserRole(req.query.userId || req.body.userId);
+    if (!role || (role.role !== 'super_admin' && role.role !== 'store_admin')) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
     // Verify plan exists
     const planRes = await db.query('SELECT * FROM push_plans WHERE plan_key=$1 AND is_active=true', [planKey]);
     if (planRes.rows.length === 0) return res.status(404).json({ error: 'Plan not found' });
@@ -5589,18 +5603,19 @@ app.post('/api/referral/apply', async (req, res) => {
       return res.status(400).json({ error: '不能使用自己的推薦碼' });
     }
 
-    // Check if user has already been referred
-    const existing = await db.query(
-      'SELECT 1 FROM referral_records WHERE referee_id = $1',
-      [userId]
-    );
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: '您已使用過推薦碼' });
-    }
-
     const rewardAmount = 10;
 
     await client.query('BEGIN');
+
+    // Check if user has already been referred (inside transaction with FOR UPDATE)
+    const existing = await client.query(
+      'SELECT 1 FROM referral_records WHERE referee_id = $1 FOR UPDATE',
+      [userId]
+    );
+    if (existing.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: '您已使用過推薦碼' });
+    }
 
     // Insert referral record
     await client.query(
