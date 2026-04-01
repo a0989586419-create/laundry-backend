@@ -4929,7 +4929,7 @@ app.post('/api/admin/store-push', async (req, res) => {
       // Update push_logs cost for this push
       try {
         await db.query(
-          `UPDATE push_logs SET cost = $1 WHERE target_user_id = $2 AND push_type = 'store_manual' AND group_id = $3 ORDER BY created_at DESC LIMIT 1`,
+          `UPDATE push_logs SET cost = $1 WHERE id = (SELECT id FROM push_logs WHERE target_user_id = $2 AND push_type = 'store_manual' AND group_id = $3 ORDER BY created_at DESC LIMIT 1)`,
           [costPerRecipient, uid, targetGroupId]
         );
       } catch (costErr) {
