@@ -96,7 +96,7 @@ mqttClient.on('message', async (topic, payload) => {
 } // end if (mqttClient)
 
 // ===== IoT API Key middleware for device endpoints =====
-const IOT_API_KEY = process.env.IOT_API_KEY || (() => { console.warn('[SECURITY] IOT_API_KEY using fallback - set env var!'); return 'ypure-iot-2026-default-key'; })();
+const IOT_API_KEY = process.env.IOT_API_KEY || '';
 function requireIotApiKey(req, res, next) {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== IOT_API_KEY) return res.status(401).json({ error: 'Invalid or missing API key' });
@@ -113,8 +113,8 @@ async function getTBToken() {
   if (tbToken && Date.now() < tbTokenExpiry) return tbToken;
   try {
     const { data } = await axios.post(`${TB_BASE}/api/auth/login`, {
-      username: process.env.TB_USERNAME || (() => { console.warn('[SECURITY] TB_USERNAME using fallback - set env var!'); return 'sl6963693171@gmail.com'; })(),
-      password: process.env.TB_PASSWORD || (() => { console.warn('[SECURITY] TB_PASSWORD using fallback - set env var!'); return 's85010805'; })(),
+      username: process.env.TB_USERNAME || '',
+      password: process.env.TB_PASSWORD || '',
     }, { timeout: 10000 });
     tbToken = data.token;
     tbTokenExpiry = Date.now() + 3600000;
@@ -649,7 +649,7 @@ app.get('/api/user/profile', async (req, res) => {
         [displayName, pictureUrl || '', lineUserId]).catch(() => {});
     }
     // Auto-assign super_admin if this is the admin user
-    const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+    const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || '';
     if (lineUserId === SUPER_ADMIN_ID) {
       const chk = await db.query('SELECT id FROM user_roles WHERE line_user_id=$1 AND role=$2 AND group_id IS NULL', [lineUserId, 'super_admin']);
       if (chk.rows.length === 0) {
@@ -2333,7 +2333,7 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
 // ═══════════════════════════════════════
 //  API: ThingsBoard Webhook (machine_done notification)
 // ═══════════════════════════════════════
-const TB_WEBHOOK_TOKEN = process.env.TB_WEBHOOK_TOKEN || (() => { console.warn('[SECURITY] TB_WEBHOOK_TOKEN using fallback - set env var!'); return 'e002afa25100c2fa5033db4d839e777d400d701c932d138598a372cf5d492819'; })();
+const TB_WEBHOOK_TOKEN = process.env.TB_WEBHOOK_TOKEN || '';
 
 app.post('/api/thingsboard/webhook', async (req, res) => {
   const token = req.headers['x-tb-webhook-token'];
@@ -2410,8 +2410,8 @@ app.get('/api/tb/diag', async (req, res) => {
   try {
     // Step 1: Login
     const loginRes = await axios.post(`${TB_BASE}/api/auth/login`, {
-      username: process.env.TB_USERNAME || (() => { console.warn('[SECURITY] TB_USERNAME using fallback - set env var!'); return 'sl6963693171@gmail.com'; })(),
-      password: process.env.TB_PASSWORD || (() => { console.warn('[SECURITY] TB_PASSWORD using fallback - set env var!'); return 's85010805'; })(),
+      username: process.env.TB_USERNAME || '',
+      password: process.env.TB_PASSWORD || '',
     }, { timeout: 10000 });
     steps.login = { status: loginRes.status, hasToken: !!loginRes.data?.token };
     const token = loginRes.data.token;
@@ -3126,7 +3126,7 @@ app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
     let targetUsers = recentUsers.rows;
     let fallbackUsed = false;
     if (targetUsers.length === 0) {
-      const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+      const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || '';
       targetUsers = [{ line_user_id: SUPER_ADMIN_ID }];
       fallbackUsed = true;
       console.log(`[NOTIFY] No recent users found, fallback to super_admin: ${SUPER_ADMIN_ID}`);
@@ -5841,10 +5841,10 @@ app.get('/api/mqtt/config', (req, res) => {
     return res.status(401).json({ error: 'Valid userId required' });
   }
   res.json({
-    host: process.env.MQTT_HOST || 'f29e89cd32414b9c826381e76ef8baaf.s1.eu.hivemq.cloud',
+    host: process.env.MQTT_HOST || '',
     port: 8884,
     protocol: 'wss',
-    username: process.env.MQTT_USER || 'ypure-iot',
+    username: process.env.MQTT_USER || '',
     // Do not expose raw password; client should use read-only topics only
   });
 });
@@ -6393,7 +6393,7 @@ async function initDB() {
   `).catch(() => {});
 
   // Seed super admin
-  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+  const SUPER_ADMIN_LINE_ID = process.env.SUPER_ADMIN_LINE_ID || '';
   const existing = await db.query('SELECT id FROM user_roles WHERE line_user_id=$1 AND role=$2 AND group_id IS NULL', [SUPER_ADMIN_LINE_ID, 'super_admin']);
   if (existing.rows.length === 0) {
     await db.query('INSERT INTO user_roles (line_user_id, role, group_id) VALUES ($1, $2, NULL)', [SUPER_ADMIN_LINE_ID, 'super_admin']);
@@ -9259,7 +9259,7 @@ async function handleTextMessage(event, userId, text) {
         await db.query('DELETE FROM survey_progress WHERE line_user_id = $1', [userId]);
 
         // Notify super admin
-        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || '';
         await sendLinePush(SUPER_ADMIN_ID, [{
           type: 'flex', altText: '📋 新買家諮詢表',
           contents: {
@@ -10523,7 +10523,7 @@ app.post('/api/fault-report', async (req, res) => {
       }
       // Fallback to super admin
       if (adminUsers.length === 0) {
-        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || 'Ubdcdd269e115bf9ac492288adbc0115e';
+        const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || '';
         adminUsers = [SUPER_ADMIN_ID];
       }
       // Send notification to each admin
@@ -11205,6 +11205,44 @@ setInterval(async () => {
 }, 3600000); // Check every hour (3600000ms)
 
 console.log('[AutoBroadcast] Scheduler started - weekly tips (Mon 10:00) + monthly promos (1st 10:00)');
+
+// ═══════════════════════════════════════
+//  Startup: Environment Variable Check
+// ═══════════════════════════════════════
+function checkRequiredEnvVars() {
+  const required = [
+    'DATABASE_URL',
+    'LINE_CHANNEL_ACCESS_TOKEN',
+    'LINE_CHANNEL_SECRET',
+    'LINEPAY_CHANNEL_ID',
+    'LINEPAY_CHANNEL_SECRET'
+  ];
+  const warned = [
+    'TB_USERNAME',
+    'TB_PASSWORD',
+    'TB_WEBHOOK_TOKEN',
+    'IOT_API_KEY',
+    'MQTT_URL',
+    'MQTT_HOST',
+    'MQTT_USER',
+    'MQTT_PASS',
+    'JKOPAY_API_KEY',
+    'JKOPAY_SECRET_KEY',
+    'SUPER_ADMIN_LINE_ID'
+  ];
+
+  const missing = required.filter(k => !process.env[k]);
+  if (missing.length > 0) {
+    console.error('[STARTUP] Missing REQUIRED env vars:', missing.join(', '));
+  }
+
+  const missingWarned = warned.filter(k => !process.env[k]);
+  if (missingWarned.length > 0) {
+    console.warn('[STARTUP] Missing optional env vars:', missingWarned.join(', '));
+  }
+}
+
+checkRequiredEnvVars();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
