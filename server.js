@@ -6234,7 +6234,8 @@ function buildCustomerWelcomeReply() {
         contents: [
           { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即查空機', uri: LIFF_WASH } },
           { type: 'button', style: 'primary', color: '#4CAF50', action: { type: 'postback', label: '首次儲值送 $20', data: 'action=topup_intro', displayText: '我想儲值' } },
-          { type: 'button', style: 'link', color: BRAND_GOLD, action: { type: 'postback', label: '查看附近門市', data: 'action=show_stores', displayText: '門市在哪裡？' } }
+          { type: 'button', style: 'link', color: BRAND_GOLD, action: { type: 'postback', label: '查看附近門市', data: 'action=show_stores', displayText: '門市在哪裡？' } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '瀏覽門市資訊', uri: OFFICIAL_WEBSITE + '/stores' } }
         ]
       }
     }
@@ -6316,7 +6317,8 @@ function buildBusinessWelcomeReply() {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
           { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📋 查看方案與報價', data: 'action=show_plans', displayText: '查看方案與報價' } },
-          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約免費 Demo', uri: LINE_OA_CHAT_URL } }
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約免費 Demo', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '瀏覽官網', uri: OFFICIAL_WEBSITE } }
         ]
       }
     }
@@ -6899,7 +6901,8 @@ function buildSuccessCasesCarousel() {
     footer: {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '10px',
       contents: [
-        { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '我也想導入雲管家', uri: LINE_OA_CHAT_URL } }
+        { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '我也想導入雲管家', uri: LINE_OA_CHAT_URL } },
+        { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看更多案例', uri: OFFICIAL_WEBSITE + '/cases' } }
       ]
     }
   }));
@@ -6968,10 +6971,16 @@ function buildAboutUsCard() {
         ]
       },
       footer: {
-        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '15px',
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', flex: 1, action: { type: 'uri', label: '瀏覽官網', uri: OFFICIAL_WEBSITE } },
-          { type: 'button', style: 'primary', color: '#555555', height: 'sm', flex: 1, action: { type: 'uri', label: '聯繫我們', uri: LINE_OA_CHAT_URL } }
+          { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
+            { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', flex: 1, action: { type: 'uri', label: '瀏覽官網', uri: OFFICIAL_WEBSITE } },
+            { type: 'button', style: 'primary', color: '#555555', height: 'sm', flex: 1, action: { type: 'uri', label: '聯繫我們', uri: LINE_OA_CHAT_URL } }
+          ]},
+          { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
+            { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', flex: 1, action: { type: 'uri', label: '技術架構', uri: OFFICIAL_WEBSITE + '/technology' } },
+            { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', flex: 1, action: { type: 'uri', label: '關於我們', uri: OFFICIAL_WEBSITE + '/about' } }
+          ]}
         ]
       }
     }
@@ -6987,11 +6996,12 @@ function buildFAQCarousel() {
     { q: '營業時間是？', a: '全台所有門市 24 小時營業、全年無休！出門前可先查看空機狀態。' }
   ];
 
-  const bubbles = faqs.map(f => ({
+  const bubbles = faqs.map((f, idx) => ({
     type: 'bubble', size: 'kilo',
     styles: {
       header: { backgroundColor: '#0A0A0F' },
-      body: { backgroundColor: '#050508' }
+      body: { backgroundColor: '#050508' },
+      ...(idx === faqs.length - 1 ? { footer: { backgroundColor: '#050508', separator: false } } : {})
     },
     header: {
       type: 'box', layout: 'vertical', paddingAll: '16px',
@@ -7004,7 +7014,15 @@ function buildFAQCarousel() {
       contents: [
         { type: 'text', text: f.a, size: 'sm', wrap: true, color: '#E0E0E0' }
       ]
-    }
+    },
+    ...(idx === faqs.length - 1 ? {
+      footer: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '10px',
+        contents: [
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看更多問答', uri: OFFICIAL_WEBSITE + '/faq' } }
+        ]
+      }
+    } : {})
   }));
 
   return {
@@ -7054,7 +7072,8 @@ function buildServiceGuaranteeCard() {
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'postback', label: '了解方案', data: 'action=show_plans', displayText: '了解方案' } }
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'postback', label: '了解方案', data: 'action=show_plans', displayText: '了解方案' } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看服務保障詳情', uri: OFFICIAL_WEBSITE + '/about' } }
         ]
       }
     }
@@ -7111,7 +7130,8 @@ function buildROICard() {
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約專人分析', uri: LINE_OA_CHAT_URL } }
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約專人分析', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看成功案例', uri: OFFICIAL_WEBSITE + '/cases' } }
         ]
       }
     }
@@ -7171,7 +7191,8 @@ function buildInstallGuideCard() {
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約場勘', uri: LINE_OA_CHAT_URL } }
+          { type: 'button', style: 'primary', color: BRAND_GOLD, height: 'sm', action: { type: 'uri', label: '預約場勘', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看技術架構', uri: OFFICIAL_WEBSITE + '/technology' } }
         ]
       }
     }
@@ -7290,7 +7311,8 @@ function buildPlansCard() {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
         { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } },
-        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } },
+        { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看完整方案', uri: OFFICIAL_WEBSITE + '/pricing' } }
       ]
     }
   };
@@ -7329,7 +7351,8 @@ function buildPlansCard() {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
         { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '立即諮詢', uri: LINE_OA_CHAT_URL } },
-        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } },
+        { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看完整方案', uri: OFFICIAL_WEBSITE + '/pricing' } }
       ]
     }
   };
@@ -7365,7 +7388,8 @@ function buildPlansCard() {
       type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
       contents: [
         { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '預約評估', uri: LINE_OA_CHAT_URL } },
-        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } }
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '📋 填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } },
+        { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '查看完整方案', uri: OFFICIAL_WEBSITE + '/pricing' } }
       ]
     }
   };
