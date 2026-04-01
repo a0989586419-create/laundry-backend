@@ -37,7 +37,7 @@ const MENUS = {
     name: 'YPURE Default Menu (Identity Selection)',
     chatBarText: '選擇身份',
     size: { width: 2500, height: 843 },
-    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-default.png'),
+    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-default.jpg'),
     areas: [
       { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: 'postback', label: '我是店主', data: 'action=welcome_business', displayText: '我是店主' } },
       { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: 'postback', label: '我是顧客', data: 'action=welcome_customer', displayText: '我是顧客' } },
@@ -48,7 +48,7 @@ const MENUS = {
     name: 'YPURE B2C Consumer Menu',
     chatBarText: '開啟選單',
     size: { width: 2500, height: 1686 },
-    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-b2c.png'),
+    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-b2c.jpg'),
     areas: [
       { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: 'uri', label: '開始洗衣', uri: `${LIFF_BASE}?tab=wash` } },
       { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: 'uri', label: '我的帳戶', uri: `${LIFF_BASE}?tab=profile` } },
@@ -62,7 +62,7 @@ const MENUS = {
     name: 'YPURE B2B Business Menu',
     chatBarText: '開啟選單',
     size: { width: 2500, height: 1686 },
-    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-b2b.png'),
+    image: path.join(__dirname, '..', '..', 'line-oa-assets', 'richmenu-b2b.jpg'),
     areas: [
       { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: 'message', label: '方案報價', text: '方案' } },
       { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: 'uri', label: '免費體驗', uri: `${LIFF_BASE}` } },
@@ -125,7 +125,8 @@ async function setupMenu(type) {
   console.log(`   Image size: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
 
   const uploadUrl = `https://api-data.line.me/v2/bot/richmenu/${richMenuId}/content`;
-  await lineApi('POST', uploadUrl, imageBuffer, 'image/png');
+  const contentType = menu.image.endsWith('.jpg') || menu.image.endsWith('.jpeg') ? 'image/jpeg' : 'image/png';
+  await lineApi('POST', uploadUrl, imageBuffer, contentType);
   console.log('   Image uploaded.');
 
   // 3. Set as default if it's the 'default' type

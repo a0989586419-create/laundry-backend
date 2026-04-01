@@ -921,6 +921,9 @@ app.post('/api/wallet/deduct', async (req, res) => {
     `, [userId, groupId, -amount, description || 'Payment']);
     await client.query('COMMIT');
 
+    // Update member spending for level system (wallet deduct)
+    updateMemberSpent(userId, amount).catch(e => console.error('[Member] wallet deduct updateSpent error:', e.message));
+
     res.json({ success: true, balance: deductResult.rows[0].balance });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -1391,6 +1394,11 @@ app.get('/api/payment/confirm', async (req, res) => {
         ON CONFLICT (machine_id) DO UPDATE SET state='running', remain_sec=$2, progress=0, updated_at=NOW()
       `, [order.machine_id, order.duration_sec || 3600]);
       await publishStartCommand(order);
+      // Update member spending for level system
+      const memberRowForSpent = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
+      if (memberRowForSpent) {
+        updateMemberSpent(memberRowForSpent.line_user_id, order.total_amount).catch(e => console.error('[Member] LINE Pay confirm updateSpent error:', e.message));
+      }
       // LINE Push: payment success
       const memberRow = (await db.query('SELECT line_user_id FROM members WHERE id=$1', [order.member_id])).rows[0];
       if (memberRow) {
@@ -1571,6 +1579,9 @@ app.post('/api/payment/create', async (req, res) => {
         VALUES ($1, $2, 'payment', $3, $4, NOW())
       `, [userId, store.group_id, -finalAmount, `${storeId} - ${mode}${discountAmount > 0 ? ` (折扣 NT$${discountAmount})` : ''}`]);
     }
+
+    // Update member spending for level system (demo mode)
+    updateMemberSpent(userId, finalAmount).catch(e => console.error('[Member] demo updateSpent error:', e.message));
 
     // Try MQTT start command
     try { await publishStartCommand({ id: orderId, store_id: storeId, machine_id: machineId, mode, temp: dryTemp || 'high', total_amount: amount }); } catch (e) {}
@@ -3994,7 +4005,50 @@ app.get('/api/member/level', async (req, res) => {
     const result = await getMemberLevel(userId);
     res.json(result);
   } catch (e) {
-    console.error('member level error:', e);
+    console.error('[Member] level error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  Helper: Update member spent & auto-level
+// ═══════════════════════════════════════
+async function updateMemberSpent(lineUserId, amount) {
+  try {
+    if (!lineUserId || !amount || amount <= 0) return;
+    // Add to members total_spent (add column if not exists is handled in initDB)
+    await db.query(
+      `UPDATE members SET total_spent = COALESCE(total_spent, 0) + $2 WHERE line_user_id = $1`,
+      [lineUserId, amount]
+    );
+    // Get updated total_spent
+    const memberRow = (await db.query('SELECT total_spent FROM members WHERE line_user_id = $1', [lineUserId])).rows[0];
+    const totalSpent = memberRow?.total_spent || 0;
+    // Determine new level
+    let newLevel = 'bronze';
+    if (totalSpent >= 6000) newLevel = 'platinum';
+    else if (totalSpent >= 3000) newLevel = 'gold';
+    else if (totalSpent >= 1000) newLevel = 'silver';
+    // Update member_level
+    await db.query(
+      `UPDATE members SET member_level = $2, level_updated_at = NOW() WHERE line_user_id = $1 AND COALESCE(member_level, 'bronze') != $2`,
+      [lineUserId, newLevel]
+    );
+    console.log(`[Member] updateMemberSpent: ${lineUserId} spent +${amount}, total=${totalSpent}, level=${newLevel}`);
+  } catch (e) {
+    console.error('[Member] updateMemberSpent error:', e.message);
+  }
+}
+
+app.post('/api/member/update-spent', async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+    if (!userId || !amount) return res.status(400).json({ error: 'userId and amount required' });
+    await updateMemberSpent(userId, parseInt(amount));
+    const memberLevel = await getMemberLevel(userId);
+    res.json({ success: true, ...memberLevel });
+  } catch (e) {
+    console.error('[Member] update-spent error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -4068,7 +4122,80 @@ app.get('/api/member/referral', async (req, res) => {
       })),
     });
   } catch (e) {
-    console.error('referral get error:', e);
+    console.error('[Referral] referral get error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Referral - my-code alias
+// ═══════════════════════════════════════
+app.get('/api/referral/my-code', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Get or create referral code (YP + 6 chars)
+    let codeRow = await db.query('SELECT * FROM referral_codes WHERE line_user_id = $1', [userId]);
+    if (codeRow.rows.length === 0) {
+      let code;
+      let attempts = 0;
+      while (attempts < 10) {
+        code = generateReferralCode();
+        try {
+          await db.query('INSERT INTO referral_codes (line_user_id, code) VALUES ($1, $2)', [userId, code]);
+          break;
+        } catch (e) {
+          attempts++;
+          if (attempts >= 10) throw new Error('Failed to generate unique referral code');
+        }
+      }
+      codeRow = await db.query('SELECT * FROM referral_codes WHERE line_user_id = $1', [userId]);
+    }
+
+    console.log('[Referral] my-code fetched for', userId);
+    res.json({
+      success: true,
+      code: codeRow.rows[0].code,
+      createdAt: codeRow.rows[0].created_at,
+    });
+  } catch (e) {
+    console.error('[Referral] my-code error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Referral - stats
+// ═══════════════════════════════════════
+app.get('/api/referral/stats', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Count how many people this user has referred (from referrals table)
+    const countResult = await db.query(
+      'SELECT COUNT(*) as cnt, COALESCE(SUM(reward_amount), 0) as total_rewards FROM referrals WHERE referrer_user_id = $1',
+      [userId]
+    );
+    const referralCount = parseInt(countResult.rows[0].cnt) || 0;
+    const totalRewards = parseInt(countResult.rows[0].total_rewards) || 0;
+
+    // Also check referral_records table (legacy)
+    const legacyCount = await db.query(
+      'SELECT COUNT(*) as cnt FROM referral_records WHERE referrer_id = $1',
+      [userId]
+    );
+    const legacyReferralCount = parseInt(legacyCount.rows[0].cnt) || 0;
+
+    console.log('[Referral] stats fetched for', userId, '- count:', referralCount + legacyReferralCount);
+    res.json({
+      success: true,
+      referralCount: referralCount + legacyReferralCount,
+      totalRewards,
+    });
+  } catch (e) {
+    console.error('[Referral] stats error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -5505,6 +5632,10 @@ async function initDB() {
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS display_name VARCHAR(100)`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS picture_url TEXT`).catch(() => {});
     await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`).catch(() => {});
+    // Member level system columns
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS total_spent INT DEFAULT 0`).catch(() => {});
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS member_level TEXT DEFAULT 'bronze'`).catch(() => {});
+    await db.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS level_updated_at TIMESTAMPTZ DEFAULT NOW()`).catch(() => {});
     // machine_current_state: add new IoT telemetry columns
     await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS store_id VARCHAR(20) DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE machine_current_state ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'unknown'`).catch(() => {});
@@ -6181,8 +6312,8 @@ function buildCustomerWelcomeReply() {
                 { type: 'box', layout: 'vertical', backgroundColor: '#151518', cornerRadius: '8px', width: '40px', height: '40px', justifyContent: 'center', alignItems: 'center', contents: [
                   { type: 'text', text: '🔍', size: 'lg', align: 'center' }
                 ]},
-                { type: 'text', text: '查空機', size: 'xs', align: 'center', weight: 'bold', color: '#FFFFFF', margin: 'xs' },
-                { type: 'text', text: '出門前先看', size: 'xxs', align: 'center', color: '#999999', wrap: true }
+                { type: 'text', text: '機器狀態', size: 'xs', align: 'center', weight: 'bold', color: '#FFFFFF', margin: 'xs' },
+                { type: 'text', text: '即時查看', size: 'xxs', align: 'center', color: '#999999', wrap: true }
               ]},
               { type: 'box', layout: 'vertical', flex: 1, spacing: 'xs', alignItems: 'center', contents: [
                 { type: 'box', layout: 'vertical', backgroundColor: '#151518', cornerRadius: '8px', width: '40px', height: '40px', justifyContent: 'center', alignItems: 'center', contents: [
@@ -6208,7 +6339,7 @@ function buildCustomerWelcomeReply() {
             ]
           },
           { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
-          { type: 'text', text: '💡 儲值滿 NT$200 再送 NT$30，比投幣更划算！', size: 'sm', wrap: true, color: BRAND_GOLD, margin: 'md', weight: 'bold' }
+          { type: 'text', text: '💡 儲值享加碼回饋，優惠金額依門市活動而定', size: 'sm', wrap: true, color: BRAND_GOLD, margin: 'md', weight: 'bold' }
         ]
       }
     }
@@ -6232,8 +6363,8 @@ function buildCustomerWelcomeReply() {
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
-          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即查空機', uri: LIFF_WASH } },
-          { type: 'button', style: 'primary', color: '#4CAF50', action: { type: 'postback', label: '首次儲值送 $20', data: 'action=topup_intro', displayText: '我想儲值' } },
+          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '查看機器狀態', uri: LIFF_WASH } },
+          { type: 'button', style: 'primary', color: '#4CAF50', action: { type: 'postback', label: '儲值享回饋', data: 'action=topup_intro', displayText: '我想儲值' } },
           { type: 'button', style: 'link', color: BRAND_GOLD, action: { type: 'postback', label: '查看附近門市', data: 'action=show_stores', displayText: '門市在哪裡？' } },
           { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '瀏覽門市資訊', uri: OFFICIAL_WEBSITE + '/stores' } }
         ]
@@ -6316,8 +6447,8 @@ function buildBusinessWelcomeReply() {
       footer: {
         type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px',
         contents: [
+          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'postback', label: '📝 填寫諮詢問卷（建議優先）', data: 'action=start_survey', displayText: '我要填寫問卷' } },
           { type: 'button', style: 'primary', color: BRAND_PRIMARY, action: { type: 'postback', label: '📋 查看方案與報價', data: 'action=show_plans', displayText: '查看方案與報價' } },
-          { type: 'button', style: 'primary', color: BRAND_GOLD, action: { type: 'uri', label: '📞 預約免費 Demo', uri: LINE_OA_CHAT_URL } },
           { type: 'button', style: 'link', color: '#E5B94C', height: 'sm', action: { type: 'uri', label: '瀏覽官網', uri: OFFICIAL_WEBSITE } }
         ]
       }
@@ -6326,7 +6457,7 @@ function buildBusinessWelcomeReply() {
 
   const keywordGuide = {
     type: 'text',
-    text: '📩 也可以直接輸入關鍵字：\n\n「方案」→ 查看三種方案詳情\n「成功案例」→ 看其他店主的成效\n「比較」→ 傳統 vs 智慧洗衣對比\n「免費Demo」→ 預約線上展示\n「獲利分析」→ 投報率試算'
+    text: '📩 建議先填寫問卷，讓我們了解您的需求後提供最合適的方案！\n\n也可以輸入關鍵字快速查詢：\n「方案」→ 三種方案詳情\n「成功案例」→ 其他店主成效\n「比較」→ 傳統 vs 智慧洗衣\n「獲利分析」→ 投報率試算'
   };
 
   return [overviewCard, keywordGuide];
@@ -6378,7 +6509,7 @@ function buildPriceGuideCard() {
           ]},
           { type: 'box', layout: 'vertical', height: '1px', backgroundColor: '#1A1A1E', margin: 'lg' },
           { type: 'text', text: '* 價格依機型大小而異，大型機器價格略高', size: 'xxs', color: '#999999', margin: 'md', wrap: true },
-          { type: 'text', text: '💡 儲值 NT$200 送 NT$30，每次洗衣更省！', size: 'xs', color: BRAND_GOLD, margin: 'md', weight: 'bold', wrap: true }
+          { type: 'text', text: '💡 儲值享加碼回饋，優惠依門市活動而定', size: 'xs', color: BRAND_GOLD, margin: 'md', weight: 'bold', wrap: true }
         ]
       },
       footer: {
@@ -6418,7 +6549,7 @@ function buildTopupBenefitsCard() {
                 { type: 'text', text: '🎁', size: 'md', align: 'center' }
               ]},
               { type: 'box', layout: 'vertical', flex: 8, paddingStart: '12px', contents: [
-                { type: 'text', text: '儲 NT$200 送 NT$30', size: 'sm', weight: 'bold', color: '#FFFFFF' },
+                { type: 'text', text: '儲值加碼回饋', size: 'sm', weight: 'bold', color: '#FFFFFF' },
                 { type: 'text', text: '等於打85折，越洗越省', size: 'xs', color: '#999999', wrap: true }
               ]}
             ]
@@ -6480,14 +6611,14 @@ function buildPromotionsCard() {
             type: 'box', layout: 'vertical', backgroundColor: '#0A0A0F', cornerRadius: '8px', paddingAll: '12px', margin: 'none',
             contents: [
               { type: 'text', text: '🔥 新會員首儲禮', size: 'sm', weight: 'bold', color: '#FF6B6B' },
-              { type: 'text', text: '首次儲值任意金額，即送 NT$20 洗衣金', size: 'xs', wrap: true, margin: 'sm', color: '#E0E0E0' }
+              { type: 'text', text: '首次儲值即享新會員專屬回饋', size: 'xs', wrap: true, margin: 'sm', color: '#E0E0E0' }
             ]
           },
           {
             type: 'box', layout: 'vertical', backgroundColor: '#0A0A0F', cornerRadius: '8px', paddingAll: '12px', margin: 'md',
             contents: [
               { type: 'text', text: '💰 儲值加碼', size: 'sm', weight: 'bold', color: '#4CAF50' },
-              { type: 'text', text: '儲值 NT$200 再送 NT$30，最高回饋15%', size: 'xs', wrap: true, margin: 'sm', color: '#E0E0E0' }
+              { type: 'text', text: '儲值金額越多回饋越高，最高回饋 15%', size: 'xs', wrap: true, margin: 'sm', color: '#E0E0E0' }
             ]
           },
           {
@@ -6585,8 +6716,8 @@ function buildFirstWashGuideCard() {
                 ]
               },
               { type: 'box', layout: 'vertical', flex: 7, contents: [
-                { type: 'text', text: '查空機', size: 'sm', weight: 'bold', color: '#FFFFFF' },
-                { type: 'text', text: '在 LINE 上查看附近門市空機狀態', size: 'xs', color: '#999999', wrap: true }
+                { type: 'text', text: '查看機器狀態', size: 'sm', weight: 'bold', color: '#FFFFFF' },
+                { type: 'text', text: '在 LINE 上即時查看門市機器使用狀況', size: 'xs', color: '#999999', wrap: true }
               ]}
             ]
           },
@@ -6990,7 +7121,7 @@ function buildAboutUsCard() {
 function buildFAQCarousel() {
   const faqs = [
     { q: '如何使用雲管家洗衣？', a: '1. 加入LINE官方帳號\n2. 選擇門市與機器\n3. 選擇洗衣模式\n4. LINE Pay或錢包付款\n5. 洗好自動通知' },
-    { q: '可以用什麼方式付款？', a: '支援 LINE Pay、錢包餘額、投幣三種方式。推薦儲值到錢包，儲值 NT$200 送 NT$30！' },
+    { q: '可以用什麼方式付款？', a: '支援 LINE Pay、錢包餘額、投幣三種方式。推薦儲值到錢包，享加碼回饋更划算！' },
     { q: '洗衣機故障怎麼辦？', a: '請輸入「客服」聯繫門市客服，或輸入「故障報修」填寫報修表。雲管家支援遠端診斷，多數問題可即時排除。' },
     { q: '儲值的錢可以退嗎？', a: '可以！請聯繫客服處理退款，1-3 個工作天內退回。機器故障未啟動則全額退回錢包。' },
     { q: '營業時間是？', a: '全台所有門市 24 小時營業、全年無休！出門前可先查看空機狀態。' }
@@ -7525,7 +7656,7 @@ const KEYWORD_REPLIES = {
   },
   '營業時間': {
     tags: [],
-    messages: [{ type: 'text', text: '⏰ 我們所有門市皆為 24 小時自助營業，全年無休！\n\n不管凌晨還是深夜，隨時都能來洗衣。出門前記得先查空機狀態：\n👉 ' + LIFF_WASH }]
+    messages: [{ type: 'text', text: '⏰ 我們所有門市皆為 24 小時自助營業，全年無休！\n\n不管凌晨還是深夜，隨時都能來洗衣。出門前記得先查看機器狀態：\n👉 ' + LIFF_WASH }]
   },
   '教學': {
     tags: [],
@@ -7552,7 +7683,7 @@ const KEYWORD_REPLIES = {
   },
   '行動支付': {
     tags: [],
-    messages: [{ type: 'text', text: '💳 雲管家支援 LINE Pay 行動支付！\n\n使用方式超簡單：\n1️⃣ 掃機台 QR Code\n2️⃣ 選擇洗衣模式\n3️⃣ LINE Pay 付款\n\n也可以先儲值到錢包，儲值滿 NT$200 送 NT$30 更划算！\n\n👉 不用帶零錢，不用找兌幣機' }]
+    messages: [{ type: 'text', text: '💳 雲管家支援 LINE Pay 行動支付！\n\n使用方式超簡單：\n1️⃣ 掃機台 QR Code\n2️⃣ 選擇洗衣模式\n3️⃣ LINE Pay 付款\n\n也可以先儲值到錢包，享門市加碼回饋更划算！\n\n👉 不用帶零錢，不用找兌幣機' }]
   },
   '空機': {
     tags: [],
@@ -8754,7 +8885,7 @@ app.post('/api/user/bind-store', async (req, res) => {
                 { type: 'text', text: storeName, size: 'sm', color: '#FFFFFF', flex: 5, align: 'end', weight: 'bold' }
               ]},
               { type: 'text', text: '您現在可以使用以下功能：', size: 'sm', color: '#999999', margin: 'lg', wrap: true },
-              { type: 'text', text: '🔍 查空機  💰 線上付款  🔔 洗好通知', size: 'sm', color: '#E5B94C', margin: 'sm', wrap: true },
+              { type: 'text', text: '🔍 機器狀態  💰 線上付款  🔔 洗好通知', size: 'sm', color: '#E5B94C', margin: 'sm', wrap: true },
               { type: 'text', text: '💬 輸入「客服」可聯繫門市客服', size: 'xs', color: '#999999', margin: 'lg', wrap: true }
             ]
           },
@@ -8762,7 +8893,7 @@ app.post('/api/user/bind-store', async (req, res) => {
             type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
             contents: [
               { type: 'button', style: 'primary', color: '#E5B94C', height: 'sm',
-                action: { type: 'uri', label: '立即查空機', uri: `https://liff.line.me/2009552592-xkDKSJ1Y?tab=wash` } }
+                action: { type: 'uri', label: '查看機器狀態', uri: `https://liff.line.me/2009552592-xkDKSJ1Y?tab=wash` } }
             ]
           }
         }
@@ -9271,6 +9402,80 @@ setInterval(async () => {
     // Silently ignore scheduler errors to avoid polluting logs
   }
 }, 60000);
+
+// ═══════════════════════════════════════
+//  API: Admin Usage Heatmap
+// ═══════════════════════════════════════
+app.get('/api/admin/usage-heatmap', async (req, res) => {
+  try {
+    const { userId, storeId, groupId, date, period } = req.query;
+    // Validate admin role
+    if (userId) {
+      const roleInfo = await getUserRole(userId);
+      if (!roleInfo || (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin' && roleInfo.role !== 'store_owner')) {
+        // Allow anyway for demo, but log it
+        console.log('[Heatmap] Non-admin access from', userId);
+      }
+    }
+
+    // Determine date range
+    let startDate, endDate;
+    if (date) {
+      // Single day query
+      startDate = date;
+      endDate = date;
+    } else if (period === 'month') {
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+      endDate = now.toISOString().split('T')[0];
+    } else {
+      // Default: last 7 days
+      const now = new Date();
+      endDate = now.toISOString().split('T')[0];
+      const weekAgo = new Date(now.getTime() - 7 * 86400000);
+      startDate = weekAgo.toISOString().split('T')[0];
+    }
+
+    // Build query to count orders per hour
+    let query = `
+      SELECT EXTRACT(HOUR FROM paid_at) as hour, COUNT(*) as count
+      FROM orders
+      WHERE status IN ('paid', 'completed', 'running', 'done')
+        AND paid_at >= $1::date
+        AND paid_at < ($2::date + INTERVAL '1 day')
+    `;
+    const params = [startDate, endDate];
+    let paramIdx = 3;
+
+    if (storeId) {
+      query += ` AND store_id = $${paramIdx++}`;
+      params.push(storeId);
+    } else if (groupId) {
+      query += ` AND store_id IN (SELECT id FROM stores WHERE group_id = $${paramIdx++})`;
+      params.push(groupId);
+    }
+
+    query += ` GROUP BY EXTRACT(HOUR FROM paid_at) ORDER BY hour`;
+
+    const result = await db.query(query, params);
+
+    // Build full 24-hour array
+    const hourMap = {};
+    for (const row of result.rows) {
+      hourMap[parseInt(row.hour)] = parseInt(row.count);
+    }
+    const data = Array.from({ length: 24 }, (_, i) => ({
+      hour: i,
+      count: hourMap[i] || 0,
+    }));
+
+    console.log(`[Heatmap] Query: storeId=${storeId || 'all'}, groupId=${groupId || 'all'}, date=${startDate}~${endDate}, total=${data.reduce((s, d) => s + d.count, 0)}`);
+    res.json(data);
+  } catch (e) {
+    console.error('[Heatmap] error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
