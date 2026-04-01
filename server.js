@@ -10307,8 +10307,9 @@ app.delete('/api/admin/broadcast/scheduled/:id', async (req, res) => {
 // ===== LINE VOOM Post API =====
 
 // POST /api/admin/voom-post - Send a VOOM-style flex message broadcast
+// Enhanced: supports targetStoreIds for store-specific posts, secondaryButton, and scheduling
 app.post('/api/admin/voom-post', async (req, res) => {
-  const { adminUserId, imageUrl, title, description, linkUrl, linkLabel, altText } = req.body;
+  const { adminUserId, imageUrl, title, description, linkUrl, linkLabel, altText, targetStoreIds, secondaryButton, scheduledAt } = req.body;
 
   if (!adminUserId) return res.status(400).json({ error: 'adminUserId required' });
   if (!imageUrl || !title) return res.status(400).json({ error: 'imageUrl and title required' });
@@ -10323,6 +10324,7 @@ app.post('/api/admin/voom-post', async (req, res) => {
       return res.status(403).json({ error: 'Only super_admin can post VOOM messages' });
     }
 
+    // Build enhanced flex message with optional secondary button
     const flexMessage = buildVoomFlexPost({
       imageUrl,
       title,
@@ -10331,38 +10333,369 @@ app.post('/api/admin/voom-post', async (req, res) => {
       linkLabel: linkLabel || '了解更多'
     });
 
-    // Broadcast to all followers
-    const broadcastRes = await fetch('https://api.line.me/v2/bot/message/broadcast', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-      },
-      body: JSON.stringify({ messages: [flexMessage] }),
-    });
-
-    const data = await broadcastRes.json().catch(() => ({}));
-
-    if (!broadcastRes.ok) {
-      console.error('[VOOM Post] LINE API error:', data);
-      return res.status(500).json({ error: data.message || 'LINE API error' });
+    // Add secondary button if provided
+    if (secondaryButton && secondaryButton.label && secondaryButton.url) {
+      flexMessage.contents.footer.contents.push({
+        type: 'button', style: 'link', color: '#E5B94C',
+        action: { type: 'uri', label: secondaryButton.label, uri: secondaryButton.url }
+      });
     }
+
+    // Scheduled posting
+    if (scheduledAt) {
+      const schedTime = new Date(scheduledAt);
+      if (isNaN(schedTime.getTime()) || schedTime <= new Date()) {
+        return res.status(400).json({ error: 'scheduledAt must be a valid future date' });
+      }
+      const insertResult = await db.query(`
+        INSERT INTO scheduled_broadcasts (messages, target_tags, exclude_tags, scheduled_at, created_by, target_store_ids)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+      `, [
+        JSON.stringify([flexMessage]),
+        null,
+        null,
+        schedTime.toISOString(),
+        adminUserId,
+        targetStoreIds || null
+      ]);
+      console.log(`[VOOM Post] Scheduled for ${schedTime.toISOString()}, broadcast #${insertResult.rows[0].id}`);
+      return res.json({ success: true, scheduled: true, scheduledAt: schedTime.toISOString(), broadcastId: insertResult.rows[0].id, title });
+    }
+
+    // Immediate send: use executeBroadcast for store-specific or global
+    const result = await executeBroadcast([flexMessage], null, null, adminUserId, targetStoreIds || null);
 
     // Log to push_logs
     try {
       await db.query(`
         INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
         VALUES ($1, $2, $3, $4, $5, $6)
-      `, ['voom_post', 0, 1, adminUserId, `VOOM: ${title}`, true]);
+      `, ['voom_post', result.sentCount || 0, 1, adminUserId, `VOOM: ${title}${targetStoreIds ? ' (stores: ' + targetStoreIds.join(',') + ')' : ''}`, result.success]);
     } catch (logErr) { console.error('[VOOM Post] Push log error:', logErr.message); }
 
-    console.log(`[VOOM Post] Broadcast sent: "${title}"`);
-    res.json({ success: true, title, message: 'VOOM-style post broadcasted to all followers' });
+    console.log(`[VOOM Post] Broadcast sent: "${title}", sentCount: ${result.sentCount}`);
+    res.json({ success: result.success, title, sentCount: result.sentCount, message: targetStoreIds ? `VOOM post sent to users of stores: ${targetStoreIds.join(', ')}` : 'VOOM-style post broadcasted to all followers' });
 
   } catch (e) {
     console.error('[VOOM Post] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===== Flex Message Template API (圖文訊息推播) =====
+
+// Template builders for admin flex-message endpoint
+function buildAdminFlexTemplate(template, customData = {}) {
+  const LOGO_URL = 'https://cloudmonster-website.vercel.app/cloudmonster-logo.png';
+
+  switch (template) {
+    case 'welcome':
+      return {
+        type: 'flex',
+        altText: '歡迎加入雲管家！',
+        contents: {
+          type: 'bubble', size: 'mega',
+          hero: {
+            type: 'image',
+            url: LOGO_URL,
+            size: 'full',
+            aspectRatio: '20:13',
+            aspectMode: 'cover'
+          },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+            contents: [
+              { type: 'text', text: '歡迎加入雲管家！', weight: 'bold', size: 'xl', color: '#3A3A8C' },
+              { type: 'text', text: '掃碼洗衣、行動支付、即時通知\n讓洗衣變得更聰明', size: 'sm', color: '#666666', margin: 'md', wrap: true }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '16px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即使用', uri: LIFF_URL } },
+              { type: 'button', style: 'link', action: { type: 'uri', label: '了解更多', uri: OFFICIAL_WEBSITE } }
+            ]
+          }
+        }
+      };
+
+    case 'promo':
+      return {
+        type: 'flex',
+        altText: customData.title || '限時優惠活動！',
+        contents: {
+          type: 'bubble', size: 'mega',
+          styles: {
+            header: { backgroundColor: '#3A3A8C' },
+            body: { backgroundColor: '#FFFFFF' },
+            footer: { backgroundColor: '#FFFFFF', separator: false }
+          },
+          header: {
+            type: 'box', layout: 'vertical', paddingAll: '20px',
+            contents: [
+              { type: 'text', text: '限時優惠', weight: 'bold', size: 'xl', color: '#E5B94C', align: 'center' },
+              { type: 'text', text: customData.subtitle || '儲值享回饋 洗衣更划算', size: 'sm', color: '#FFFFFF', align: 'center', margin: 'sm' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'lg',
+            contents: [
+              {
+                type: 'box', layout: 'horizontal', spacing: 'md',
+                contents: [
+                  { type: 'box', layout: 'vertical', flex: 1, cornerRadius: '8px', backgroundColor: '#F5F5FF', paddingAll: '12px',
+                    contents: [
+                      { type: 'text', text: '儲值 $300', weight: 'bold', size: 'sm', color: '#3A3A8C', align: 'center' },
+                      { type: 'text', text: '送 5% 點數', size: 'xs', color: '#666666', align: 'center', margin: 'sm' }
+                    ]
+                  },
+                  { type: 'box', layout: 'vertical', flex: 1, cornerRadius: '8px', backgroundColor: '#F5F5FF', paddingAll: '12px',
+                    contents: [
+                      { type: 'text', text: '儲值 $500', weight: 'bold', size: 'sm', color: '#3A3A8C', align: 'center' },
+                      { type: 'text', text: '送 10% 點數', size: 'xs', color: '#666666', align: 'center', margin: 'sm' }
+                    ]
+                  },
+                  { type: 'box', layout: 'vertical', flex: 1, cornerRadius: '8px', backgroundColor: '#FFF8E5', paddingAll: '12px',
+                    contents: [
+                      { type: 'text', text: '儲值 $1000', weight: 'bold', size: 'sm', color: '#E5B94C', align: 'center' },
+                      { type: 'text', text: '送 12% 點數', size: 'xs', color: '#666666', align: 'center', margin: 'sm' }
+                    ]
+                  }
+                ]
+              },
+              { type: 'text', text: customData.description || '活動期間儲值即享點數回饋，儲值越多送越多！', size: 'sm', color: '#666666', wrap: true }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '16px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即儲值', uri: LIFF_URL + '?tab=wallet' } },
+              { type: 'button', style: 'link', action: { type: 'uri', label: '查看更多優惠', uri: OFFICIAL_WEBSITE } }
+            ]
+          }
+        }
+      };
+
+    case 'store_update':
+      return {
+        type: 'flex',
+        altText: customData.title || '新店開幕！',
+        contents: {
+          type: 'bubble', size: 'mega',
+          hero: customData.imageUrl ? {
+            type: 'image',
+            url: customData.imageUrl,
+            size: 'full',
+            aspectRatio: '20:13',
+            aspectMode: 'cover'
+          } : {
+            type: 'image',
+            url: LOGO_URL,
+            size: 'full',
+            aspectRatio: '20:13',
+            aspectMode: 'cover'
+          },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+            contents: [
+              { type: 'text', text: customData.storeName || '新店開幕', weight: 'bold', size: 'xl', color: '#3A3A8C' },
+              {
+                type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
+                contents: [
+                  {
+                    type: 'box', layout: 'baseline', spacing: 'sm',
+                    contents: [
+                      { type: 'text', text: '地址', color: '#999999', size: 'sm', flex: 2 },
+                      { type: 'text', text: customData.address || '即將公布', wrap: true, color: '#333333', size: 'sm', flex: 5 }
+                    ]
+                  },
+                  {
+                    type: 'box', layout: 'baseline', spacing: 'sm',
+                    contents: [
+                      { type: 'text', text: '優惠', color: '#999999', size: 'sm', flex: 2 },
+                      { type: 'text', text: customData.promoText || '開幕期間全館 9 折', wrap: true, color: '#E5B94C', size: 'sm', flex: 5, weight: 'bold' }
+                    ]
+                  }
+                ]
+              },
+              { type: 'text', text: customData.description || '全新智慧洗衣體驗，掃碼即洗，歡迎蒞臨！', size: 'sm', color: '#666666', wrap: true, margin: 'md' }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '16px',
+            contents: [
+              ...(customData.address ? [{
+                type: 'button', style: 'primary', color: '#3A3A8C',
+                action: { type: 'uri', label: '查看地圖', uri: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(customData.address)}` }
+              }] : []),
+              { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '立即使用', uri: LIFF_URL } }
+            ]
+          }
+        }
+      };
+
+    case 'monthly_report':
+      return {
+        type: 'flex',
+        altText: '本月洗衣報告',
+        contents: {
+          type: 'bubble', size: 'mega',
+          styles: {
+            header: { backgroundColor: '#3A3A8C' },
+            body: { backgroundColor: '#FFFFFF' },
+            footer: { backgroundColor: '#FFFFFF', separator: false }
+          },
+          header: {
+            type: 'box', layout: 'vertical', paddingAll: '20px',
+            contents: [
+              { type: 'text', text: '本月洗衣報告', weight: 'bold', size: 'xl', color: '#FFFFFF', align: 'center' },
+              { type: 'text', text: customData.month || new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: 'long' }), size: 'sm', color: '#E5B94C', align: 'center', margin: 'sm' }
+            ]
+          },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'lg',
+            contents: [
+              {
+                type: 'box', layout: 'horizontal', spacing: 'md',
+                contents: [
+                  {
+                    type: 'box', layout: 'vertical', flex: 1, cornerRadius: '8px', backgroundColor: '#F5F5FF', paddingAll: '14px',
+                    contents: [
+                      { type: 'text', text: '使用次數', size: 'xs', color: '#999999', align: 'center' },
+                      { type: 'text', text: String(customData.usageCount || 0), weight: 'bold', size: 'xxl', color: '#3A3A8C', align: 'center', margin: 'sm' },
+                      { type: 'text', text: '次', size: 'xs', color: '#999999', align: 'center' }
+                    ]
+                  },
+                  {
+                    type: 'box', layout: 'vertical', flex: 1, cornerRadius: '8px', backgroundColor: '#FFF8E5', paddingAll: '14px',
+                    contents: [
+                      { type: 'text', text: '節省金額', size: 'xs', color: '#999999', align: 'center' },
+                      { type: 'text', text: 'NT$' + String(customData.savedAmount || 0), weight: 'bold', size: 'xl', color: '#E5B94C', align: 'center', margin: 'sm' },
+                      { type: 'text', text: '元', size: 'xs', color: '#999999', align: 'center' }
+                    ]
+                  }
+                ]
+              },
+              {
+                type: 'box', layout: 'vertical', cornerRadius: '8px', backgroundColor: '#F9F9F9', paddingAll: '14px',
+                contents: [
+                  { type: 'text', text: '會員等級', size: 'xs', color: '#999999' },
+                  {
+                    type: 'box', layout: 'baseline', spacing: 'sm', margin: 'sm',
+                    contents: [
+                      { type: 'text', text: customData.memberLevel || '一般會員', weight: 'bold', size: 'lg', color: '#3A3A8C' },
+                      { type: 'text', text: customData.levelNote || '再消費可升級', size: 'xs', color: '#999999', flex: 0 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          footer: {
+            type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '16px',
+            contents: [
+              { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'uri', label: '查看詳情', uri: LIFF_URL + '?tab=profile' } },
+              { type: 'button', style: 'link', action: { type: 'uri', label: '繼續洗衣', uri: LIFF_URL } }
+            ]
+          }
+        }
+      };
+
+    default:
+      return null;
+  }
+}
+
+// POST /api/admin/flex-message - Send Flex Message (push or broadcast)
+app.post('/api/admin/flex-message', async (req, res) => {
+  const { adminUserId, type, targetUserId, template, customData } = req.body;
+
+  // Validate required fields
+  if (!adminUserId) return res.status(400).json({ error: 'adminUserId required' });
+  if (!type || !['push', 'broadcast'].includes(type)) {
+    return res.status(400).json({ error: 'type must be "push" or "broadcast"' });
+  }
+  if (!template || !['welcome', 'promo', 'store_update', 'monthly_report'].includes(template)) {
+    return res.status(400).json({ error: 'template must be one of: welcome, promo, store_update, monthly_report' });
+  }
+  if (type === 'push' && !targetUserId) {
+    return res.status(400).json({ error: 'targetUserId required for push type' });
+  }
+
+  try {
+    // Verify super_admin
+    const roleCheck = await db.query(
+      'SELECT role FROM user_roles WHERE line_user_id = $1 AND role = $2',
+      [adminUserId, 'super_admin']
+    );
+    if (roleCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Only super_admin can send flex messages' });
+    }
+
+    // Build flex message from template
+    const flexMessage = buildAdminFlexTemplate(template, customData || {});
+    if (!flexMessage) {
+      return res.status(400).json({ error: 'Failed to build template' });
+    }
+
+    console.log(`[Flex Message] Admin ${adminUserId} sending ${template} template via ${type}`);
+
+    let result = { success: false };
+
+    if (type === 'push') {
+      // Push to single user
+      const ok = await sendLinePush(targetUserId, [flexMessage], {
+        pushType: 'admin_flex',
+        triggeredBy: adminUserId,
+        description: `Flex template: ${template} -> ${targetUserId}`
+      });
+      result = { success: ok, sentTo: targetUserId };
+    } else {
+      // Broadcast to all followers
+      const broadcastRes = await fetch('https://api.line.me/v2/bot/message/broadcast', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        },
+        body: JSON.stringify({ messages: [flexMessage] }),
+      });
+
+      const data = await broadcastRes.json().catch(() => ({}));
+      if (!broadcastRes.ok) {
+        console.error('[Flex Message] LINE broadcast error:', data);
+        return res.status(500).json({ error: data.message || 'LINE API error' });
+      }
+
+      // Log broadcast
+      try {
+        await db.query(`
+          INSERT INTO push_logs (push_type, recipient_count, message_count, triggered_by, description, success)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, ['admin_flex_broadcast', 0, 1, adminUserId, `Flex broadcast: ${template}`, true]);
+      } catch (logErr) { console.error('[Flex Message] Push log error:', logErr.message); }
+
+      result = { success: true, sentTo: 'all_followers' };
+    }
+
+    console.log(`[Flex Message] ${template} ${type} completed:`, result.success);
+    res.json({ success: result.success, template, type, ...result });
+
+  } catch (e) {
+    console.error('[Flex Message] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/flex-message/templates - List available templates with preview
+app.get('/api/admin/flex-message/templates', async (req, res) => {
+  const templates = [
+    { id: 'welcome', name: '歡迎新用戶', description: '歡迎加入雲管家，引導用戶開始使用', customFields: [] },
+    { id: 'promo', name: '優惠活動', description: '儲值送點數、限時折扣等促銷活動', customFields: ['title', 'subtitle', 'description'] },
+    { id: 'store_update', name: '新店開幕', description: '新店開幕通知，含地址和優惠資訊', customFields: ['storeName', 'address', 'promoText', 'description', 'imageUrl'] },
+    { id: 'monthly_report', name: '月報', description: '本月洗衣使用報告', customFields: ['month', 'usageCount', 'savedAmount', 'memberLevel', 'levelNote'] }
+  ];
+  res.json({ success: true, templates });
 });
 
 // ===== Scheduled Broadcast Processor =====
