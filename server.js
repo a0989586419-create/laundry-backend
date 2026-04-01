@@ -9592,8 +9592,7 @@ async function handleTextMessage(event, userId, text) {
       // Code not found -- fall through to normal keyword matching
     } catch (e) {
       console.error('[Referral Code Input]', e.message);
-      await lineReply(event.replyToken, [{ type: 'text', text: '推薦碼處理失敗，請稍後再試。' }]);
-      return;
+      // Don't return — fall through to keyword matching
     }
   }
 
