@@ -1117,10 +1117,12 @@ app.get('/api/admin/users', async (req, res) => {
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
     let query = `
       SELECT ur.id, ur.line_user_id, ur.role, ur.group_id, sg.name as group_name,
-        ur.display_name, ur.phone, ur.notes, m.picture_url
+        ur.display_name, ur.phone, ur.notes, m.picture_url,
+        spb.balance as push_balance, spb.selected_plan as push_plan, spb.per_push_rate as push_rate
       FROM user_roles ur
       LEFT JOIN store_groups sg ON ur.group_id = sg.id
       LEFT JOIN members m ON ur.line_user_id = m.line_user_id
+      LEFT JOIN store_push_balance spb ON ur.group_id = spb.group_id
       WHERE 1=1
     `;
     const params = [];
@@ -4951,10 +4953,10 @@ app.get('/api/admin/store-push/balance', async (req, res) => {
     if (!targetGroupId) return res.status(400).json({ error: 'groupId required' });
 
     const balanceRes = await db.query(
-      'SELECT balance, per_push_rate, monthly_manual_limit, updated_at FROM store_push_balance WHERE group_id = $1',
+      'SELECT balance, per_push_rate, monthly_manual_limit, selected_plan, updated_at FROM store_push_balance WHERE group_id = $1',
       [targetGroupId]
     );
-    const balanceRow = balanceRes.rows[0] || { balance: 0, per_push_rate: 0.16, monthly_manual_limit: 500, updated_at: null };
+    const balanceRow = balanceRes.rows[0] || { balance: 0, per_push_rate: 0.16, monthly_manual_limit: 500, selected_plan: 'light', updated_at: null };
 
     const topupRes = await db.query(
       'SELECT id, amount, method, note, created_by, created_at FROM store_push_topup WHERE group_id = $1 ORDER BY created_at DESC LIMIT 20',
@@ -4964,6 +4966,7 @@ app.get('/api/admin/store-push/balance', async (req, res) => {
     res.json({
       groupId: targetGroupId,
       balance: parseFloat(balanceRow.balance) || 0,
+      selectedPlan: balanceRow.selected_plan || 'light',
       perPushRate: parseFloat(balanceRow.per_push_rate) || 0.16,
       monthlyManualLimit: parseInt(balanceRow.monthly_manual_limit) || 500,
       updatedAt: balanceRow.updated_at,
@@ -5342,16 +5345,18 @@ app.post('/api/admin/push-plans/select', async (req, res) => {
     const planRes = await db.query('SELECT * FROM push_plans WHERE plan_key=$1 AND is_active=true', [planKey]);
     if (planRes.rows.length === 0) return res.status(404).json({ error: 'Plan not found' });
 
-    // Update store's selected plan and per_push_rate
+    // Update store's selected plan and per_push_rate (preserve existing balance)
     const plan = planRes.rows[0];
-    await db.query(
-      `INSERT INTO store_push_balance (group_id, selected_plan, per_push_rate, monthly_manual_limit)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (group_id) DO UPDATE SET selected_plan=$2, per_push_rate=$3, monthly_manual_limit=$4, updated_at=NOW()`,
+    const updateRes = await db.query(
+      `INSERT INTO store_push_balance (group_id, balance, selected_plan, per_push_rate, monthly_manual_limit)
+       VALUES ($1, 0, $2, $3, $4)
+       ON CONFLICT (group_id) DO UPDATE SET selected_plan=$2, per_push_rate=$3, monthly_manual_limit=$4, updated_at=NOW()
+       RETURNING balance, per_push_rate, monthly_manual_limit, selected_plan`,
       [groupId, planKey, plan.extra_rate, plan.included_messages]
     );
+    const row = updateRes.rows[0];
 
-    res.json({ success: true, plan: plan, groupId });
+    res.json({ success: true, plan: plan, groupId, balance: parseFloat(row.balance), perPushRate: parseFloat(row.per_push_rate), monthlyManualLimit: parseInt(row.monthly_manual_limit) });
   } catch (e) {
     console.error('[Push Plan Select]', e.message);
     res.status(500).json({ error: e.message });
