@@ -8441,11 +8441,63 @@ const KEYWORD_REPLIES = {
   },
   'Demo': {
     tags: ['B2B_Demo預約'],
-    messages: [{ type: 'text', text: '🎯 太好了！預約免費 Demo 只需要 30 秒：\n\n請回覆以下資訊：\n1️⃣ 你的姓名\n2️⃣ 目前身份（準備開店 / 已有洗衣店 / 連鎖業者）\n3️⃣ 方便的聯繫時間\n4️⃣ 聯絡電話或 Email\n\n我們會在 24 小時內安排專人與你聯繫！\n\n📞 急件可撥：' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+    messages: [{
+      type: 'flex', altText: '免費 Demo 預約',
+      contents: {
+        type: 'bubble', size: 'mega',
+        styles: {
+          header: { backgroundColor: '#0A0A0F' },
+          body: { backgroundColor: '#050508' },
+          footer: { backgroundColor: '#050508', separator: false }
+        },
+        header: { type: 'box', layout: 'vertical', paddingAll: '20px', contents: [
+          { type: 'text', text: '🎯 免費 Demo 預約', color: '#E5B94C', weight: 'bold', size: 'lg' },
+          { type: 'text', text: '30 秒填表，專人安排展示', color: '#999999', size: 'xs', margin: 'sm' }
+        ]},
+        body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+          { type: 'text', text: 'Demo 內容包含：', size: 'sm', weight: 'bold', color: '#E5B94C' },
+          { type: 'text', text: '✅ IoT 智慧洗衣管理系統完整展示\n✅ LINE Pay 支付流程體驗\n✅ 後台報表與會員管理操作\n✅ 投資回報分析與方案說明', size: 'sm', wrap: true, color: '#E0E0E0', margin: 'sm' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
+          { type: 'text', text: '⏱ 展示時間：約 30 分鐘', size: 'sm', color: '#999999', margin: 'md' },
+          { type: 'text', text: '📍 可線上或到場展示', size: 'sm', color: '#999999', margin: 'sm' }
+        ]},
+        footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'postback', label: '立即填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } },
+          { type: 'button', style: 'link', color: '#E5B94C', action: { type: 'uri', label: '直接聯繫顧問', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', color: '#999999', action: { type: 'uri', label: '📞 ' + CONTACT_PHONE, uri: 'tel:' + CONTACT_PHONE } }
+        ]}
+      }
+    }]
   },
   '免費Demo': {
     tags: ['B2B_Demo預約'],
-    messages: [{ type: 'text', text: '🎯 太好了！預約免費 Demo 只需要 30 秒：\n\n請回覆以下資訊：\n1️⃣ 你的姓名\n2️⃣ 目前身份（準備開店 / 已有洗衣店 / 連鎖業者）\n3️⃣ 方便的聯繫時間\n4️⃣ 聯絡電話或 Email\n\n我們會在 24 小時內安排專人與你聯繫！\n\n📞 急件可撥：' + CONTACT_PHONE + '\n📧 ' + CONTACT_EMAIL }]
+    messages: [{
+      type: 'flex', altText: '免費 Demo 預約',
+      contents: {
+        type: 'bubble', size: 'mega',
+        styles: {
+          header: { backgroundColor: '#0A0A0F' },
+          body: { backgroundColor: '#050508' },
+          footer: { backgroundColor: '#050508', separator: false }
+        },
+        header: { type: 'box', layout: 'vertical', paddingAll: '20px', contents: [
+          { type: 'text', text: '🎯 免費 Demo 預約', color: '#E5B94C', weight: 'bold', size: 'lg' },
+          { type: 'text', text: '30 秒填表，專人安排展示', color: '#999999', size: 'xs', margin: 'sm' }
+        ]},
+        body: { type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px', contents: [
+          { type: 'text', text: 'Demo 內容包含：', size: 'sm', weight: 'bold', color: '#E5B94C' },
+          { type: 'text', text: '✅ IoT 智慧洗衣管理系統完整展示\n✅ LINE Pay 支付流程體驗\n✅ 後台報表與會員管理操作\n✅ 投資回報分析與方案說明', size: 'sm', wrap: true, color: '#E0E0E0', margin: 'sm' },
+          { type: 'separator', color: '#1A1A1E', margin: 'lg' },
+          { type: 'text', text: '⏱ 展示時間：約 30 分鐘', size: 'sm', color: '#999999', margin: 'md' },
+          { type: 'text', text: '📍 可線上或到場展示', size: 'sm', color: '#999999', margin: 'sm' }
+        ]},
+        footer: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '15px', contents: [
+          { type: 'button', style: 'primary', color: '#E5B94C', action: { type: 'postback', label: '立即填寫諮詢表', data: 'action=start_survey', displayText: '填寫諮詢表' } },
+          { type: 'button', style: 'link', color: '#E5B94C', action: { type: 'uri', label: '直接聯繫顧問', uri: LINE_OA_CHAT_URL } },
+          { type: 'button', style: 'link', color: '#999999', action: { type: 'uri', label: '📞 ' + CONTACT_PHONE, uri: 'tel:' + CONTACT_PHONE } }
+        ]}
+      }
+    }]
   },
   '報價': {
     tags: ['B2B_報價需求'],
@@ -8614,7 +8666,7 @@ const FUZZY_MAP = [
   { keywords: ['成功案例', '案例'], reply: '成功案例' },
   { keywords: ['傳統', '比較', '差別'], reply: '傳統比較' },
   // B2B - pricing plans
-  { keywords: ['方案', '價格', '費用', '多少錢', '月租', '年租', '訂閱', '系統費用'], reply: '方案' },
+  { keywords: ['方案', '費用', '多少錢', '月租', '年租', '訂閱', '系統費用'], reply: '方案' },
   // B2B - demo
   { keywords: ['Demo', 'demo', 'DEMO', '展示', '預約', '試用', '預約Demo', '免費Demo', '免費demo'], reply: '免費Demo' },
   // B2B - quote
