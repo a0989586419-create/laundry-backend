@@ -11628,6 +11628,20 @@ function checkRequiredEnvVars() {
 
 checkRequiredEnvVars();
 
+// ═══ Health Check ═══
+const SERVER_START = Date.now();
+app.get('/health', async (req, res) => {
+  const uptimeMs = Date.now() - SERVER_START;
+  const h = Math.floor(uptimeMs / 3600000);
+  const m = Math.floor((uptimeMs % 3600000) / 60000);
+  let dbStatus = 'unknown';
+  try {
+    await pool.query('SELECT 1');
+    dbStatus = 'connected';
+  } catch { dbStatus = 'disconnected'; }
+  res.json({ status: 'ok', uptime: `${h}h ${m}m`, db: dbStatus, timestamp: new Date().toISOString() });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   await initDB();
