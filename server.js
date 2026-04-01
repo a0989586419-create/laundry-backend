@@ -1607,7 +1607,7 @@ app.post('/api/payment/create', async (req, res) => {
 });
 
 // API: Report machine state from frontend (for cross-user visibility)
-app.post('/api/machines/state', requireIotApiKey, async (req, res) => {
+app.post('/api/machines/state', async (req, res) => {
   try {
     const { machineId, state, remainSec } = req.body;
     if (!machineId) return res.status(400).json({ error: 'machineId required' });
@@ -1941,13 +1941,13 @@ app.post('/api/jkopay/result', async (req, res) => {
   }
 });
 
-// POST /api/jkopay/inquiry - 查詢街口訂單狀態
-app.post('/api/jkopay/inquiry', async (req, res) => {
+// GET /api/jkopay/inquiry?orderId=xxx - 查詢街口訂單狀態
+app.get('/api/jkopay/inquiry', async (req, res) => {
   try {
-    const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    const orderId = req.query.orderId;
+    if (!orderId) return res.status(400).json({ status: 'fail', error: 'orderId required' });
     if (!JKOPAY_API_KEY || !JKOPAY_SECRET_KEY || !JKOPAY_STORE_ID) {
-      return res.status(503).json({ success: false, error: '街口支付尚未設定' });
+      return res.status(503).json({ status: 'fail', error: '街口支付尚未設定' });
     }
 
     const inquiryBody = {
@@ -1956,10 +1956,18 @@ app.post('/api/jkopay/inquiry', async (req, res) => {
     };
     const result = await jkopayRequest('/platform/inquiry', inquiryBody);
     console.log(`[JKOPay] Inquiry: orderId=${orderId}, result=${JSON.stringify(result)}`);
-    res.json({ success: true, data: result });
+
+    // 統一回傳格式：將 JKOPay 原始狀態碼轉換為前端期望的 status
+    if (result.status === 'S' || result.result_code === '000') {
+      res.json({ status: 'success', data: result });
+    } else if (result.status === 'F') {
+      res.json({ status: 'fail', data: result });
+    } else {
+      res.json({ status: 'pending', data: result });
+    }
   } catch (e) {
     console.error('[JKOPay] inquiry error:', e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ status: 'fail', error: e.message });
   }
 });
 
