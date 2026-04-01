@@ -210,8 +210,8 @@ async function sendLinePush(userId, messages, options = {}) {
   // Record push log
   try {
     await db.query(`
-      INSERT INTO push_logs (group_id, store_id, push_type, recipient_count, message_count, triggered_by, target_user_id, description, success)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO push_logs (group_id, store_id, push_type, recipient_count, message_count, triggered_by, target_user_id, description, success, cost)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `, [
       options.groupId || null,
       options.storeId || null,
@@ -221,9 +221,24 @@ async function sendLinePush(userId, messages, options = {}) {
       options.triggeredBy || 'system',
       userId,
       options.description || '',
-      success
+      success,
+      options.cost || 0
     ]);
   } catch (e) { console.error('[Push Log] Error:', e.message); }
+
+  // Deduct balance for auto pushes (manual pushes are deducted in store-push endpoint)
+  if (success && options.groupId && options.pushType && options.pushType.startsWith('auto_')) {
+    try {
+      const balRow = await db.query('SELECT per_push_rate FROM store_push_balance WHERE group_id = $1', [options.groupId]);
+      if (balRow.rows.length > 0) {
+        const rate = parseFloat(balRow.rows[0].per_push_rate) || 0.16;
+        await db.query(
+          'UPDATE store_push_balance SET balance = GREATEST(balance - $1, 0), updated_at = NOW() WHERE group_id = $2',
+          [rate, options.groupId]
+        );
+      }
+    } catch (e) { console.error('[Auto Push Deduct] Error:', e.message); }
+  }
 
   return success;
 }
@@ -4805,9 +4820,9 @@ app.get('/api/admin/store-push/preview', async (req, res) => {
     const perPushRate = parseFloat(balanceRow.per_push_rate) || 0.16;
     const monthlyLimit = parseInt(balanceRow.monthly_manual_limit) || 500;
 
-    // Monthly manual push count
+    // Monthly total push count (manual + auto)
     const monthlyRes = await db.query(
-      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND push_type LIKE '%manual%' AND created_at >= date_trunc('month', CURRENT_DATE)`,
+      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND created_at >= date_trunc('month', CURRENT_DATE)`,
       [targetGroupId]
     );
     const monthlyUsed = parseInt(monthlyRes.rows[0].cnt) || 0;
@@ -4866,9 +4881,9 @@ app.post('/api/admin/store-push', async (req, res) => {
     const currentBalance = parseFloat(balanceRow.balance) || 0;
     const totalCost = Math.round(targets.length * perPushRate * 100) / 100;
 
-    // Check monthly limit
+    // Check monthly limit (manual + auto)
     const monthlyRes = await db.query(
-      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND push_type LIKE '%manual%' AND created_at >= date_trunc('month', CURRENT_DATE)`,
+      `SELECT COUNT(*) as cnt FROM push_logs WHERE group_id = $1 AND created_at >= date_trunc('month', CURRENT_DATE)`,
       [targetGroupId]
     );
     const monthlyUsed = parseInt(monthlyRes.rows[0].cnt) || 0;
