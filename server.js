@@ -5023,6 +5023,190 @@ app.post('/api/admin/store-push/topup', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════
+//  API: Topup Request (store_admin submit, super_admin review)
+// ═══════════════════════════════════════
+
+// 1. Store admin submits a topup request
+app.post('/api/store-admin/topup-request', async (req, res) => {
+  try {
+    const { userId, groupId, amount, screenshotUrl, note } = req.body;
+    if (!userId || !groupId || !amount) return res.status(400).json({ error: 'userId, groupId, and amount required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'store_admin' && roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only store_admin or super_admin can submit topup requests' });
+    }
+
+    const numAmount = parseFloat(amount);
+    if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    const result = await db.query(
+      `INSERT INTO topup_requests (user_id, group_id, amount, screenshot_url, note, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id`,
+      [userId, groupId, numAmount, screenshotUrl || null, note || null]
+    );
+    const requestId = result.rows[0].id;
+    console.log(`[TopupReq] Created request #${requestId} by ${userId}, group=${groupId}, amount=${numAmount}`);
+
+    // Look up group name for notification
+    const groupRes = await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId]);
+    const groupName = groupRes.rows.length > 0 ? groupRes.rows[0].name : groupId;
+
+    // Notify super_admin via LINE push
+    const SUPER_ADMIN_ID = process.env.SUPER_ADMIN_LINE_ID || '';
+    if (SUPER_ADMIN_ID) {
+      const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+      await sendLinePush(SUPER_ADMIN_ID, [{
+        type: 'text',
+        text: `⚡ 推播儲值申請\n店家：${groupName}\n金額：NT$${numAmount}\n時間：${now}`
+      }], { pushType: 'topup_request', description: `Topup request #${requestId} from ${groupName}` });
+      console.log(`[TopupReq] Notified super_admin about request #${requestId}`);
+    }
+
+    res.json({ success: true, requestId });
+  } catch (e) {
+    console.error('[TopupReq] Submit error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 2. Store admin views own topup requests
+app.get('/api/store-admin/topup-requests', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'store_admin' && roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const result = await db.query(
+      `SELECT tr.*, sg.name as group_name
+       FROM topup_requests tr
+       LEFT JOIN store_groups sg ON tr.group_id = sg.id
+       WHERE tr.user_id = $1
+       ORDER BY tr.created_at DESC`,
+      [userId]
+    );
+    console.log(`[TopupReq] Listed ${result.rows.length} requests for user ${userId}`);
+    res.json({ success: true, requests: result.rows });
+  } catch (e) {
+    console.error('[TopupReq] List error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 3. Admin views all topup requests (with status filter)
+app.get('/api/admin/topup-requests', async (req, res) => {
+  try {
+    const { userId, status } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only super_admin can view all topup requests' });
+    }
+
+    let query = `SELECT tr.*, sg.name as group_name
+                 FROM topup_requests tr
+                 LEFT JOIN store_groups sg ON tr.group_id = sg.id`;
+    const params = [];
+
+    if (status && status !== 'all') {
+      query += ' WHERE tr.status = $1';
+      params.push(status);
+    }
+    query += ' ORDER BY tr.created_at DESC';
+
+    const result = await db.query(query, params);
+    console.log(`[TopupReq] Admin listed ${result.rows.length} requests (status=${status || 'all'})`);
+    res.json({ success: true, requests: result.rows });
+  } catch (e) {
+    console.error('[TopupReq] Admin list error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4. Admin approves or rejects a topup request
+app.put('/api/admin/topup-requests/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, userId } = req.body;
+    if (!userId || !action) return res.status(400).json({ error: 'userId and action required' });
+    if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'action must be approve or reject' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only super_admin can review topup requests' });
+    }
+
+    // Fetch the request
+    const reqResult = await db.query('SELECT * FROM topup_requests WHERE id=$1', [id]);
+    if (reqResult.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const topupReq = reqResult.rows[0];
+
+    if (topupReq.status !== 'pending') {
+      return res.status(400).json({ error: `Request already ${topupReq.status}` });
+    }
+
+    const numAmount = parseFloat(topupReq.amount);
+
+    if (action === 'approve') {
+      // Update status
+      await db.query(
+        'UPDATE topup_requests SET status=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3',
+        ['approved', userId, id]
+      );
+
+      // Record topup (same as store-push/topup logic)
+      await db.query(
+        'INSERT INTO store_push_topup (group_id, amount, method, note, created_by) VALUES ($1, $2, $3, $4, $5)',
+        [topupReq.group_id, numAmount, 'topup_request', `Approved request #${id}`, userId]
+      );
+
+      // Update balance (upsert)
+      const updateRes = await db.query(
+        `INSERT INTO store_push_balance (group_id, balance, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (group_id) DO UPDATE SET balance = store_push_balance.balance + $2, updated_at = NOW()
+         RETURNING balance`,
+        [topupReq.group_id, numAmount]
+      );
+      const newBalance = parseFloat(updateRes.rows[0].balance);
+
+      console.log(`[TopupReq] Approved request #${id}, group=${topupReq.group_id}, amount=${numAmount}, newBalance=${newBalance}`);
+
+      // Notify the store admin via LINE push
+      await sendLinePush(topupReq.user_id, [{
+        type: 'text',
+        text: `✅ 儲值已通過\n金額：NT$${numAmount}\n餘額：NT$${newBalance}`
+      }], { pushType: 'topup_approved', description: `Topup request #${id} approved` });
+
+      res.json({ success: true, newBalance });
+    } else {
+      // Reject
+      await db.query(
+        'UPDATE topup_requests SET status=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3',
+        ['rejected', userId, id]
+      );
+      console.log(`[TopupReq] Rejected request #${id}, group=${topupReq.group_id}, amount=${numAmount}`);
+
+      // Notify the store admin via LINE push
+      await sendLinePush(topupReq.user_id, [{
+        type: 'text',
+        text: `❌ 儲值未通過\n金額：NT$${numAmount}\n請聯繫客服`
+      }], { pushType: 'topup_rejected', description: `Topup request #${id} rejected` });
+
+      res.json({ success: true });
+    }
+  } catch (e) {
+    console.error('[TopupReq] Review error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Update store push settings (super_admin only)
 app.put('/api/admin/store-push/settings', async (req, res) => {
   try {
@@ -6424,6 +6608,22 @@ async function initDB() {
       status TEXT DEFAULT 'pending',
       created_at TIMESTAMPTZ DEFAULT NOW(),
       resolved_at TIMESTAMPTZ
+    )
+  `).catch(() => {});
+
+  // Topup requests table (store_admin submit, super_admin review)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS topup_requests (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      group_id TEXT,
+      amount NUMERIC NOT NULL,
+      screenshot_url TEXT,
+      note TEXT,
+      status TEXT DEFAULT 'pending',
+      reviewed_by TEXT,
+      reviewed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `).catch(() => {});
 
