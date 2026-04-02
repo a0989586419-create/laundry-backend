@@ -296,7 +296,7 @@ const LIFF_URL = 'https://liff.line.me/2009552592-xkDKSJ1Y';
 const LIFF_WASH = LIFF_URL + '?tab=wash';
 const LIFF_PROFILE = LIFF_URL + '?tab=profile';
 const LINE_OA_CHAT_URL = 'https://line.me/R/ti/p/@016kcwrh';
-const OFFICIAL_WEBSITE = 'https://cloudmonster-website.vercel.app';
+const OFFICIAL_WEBSITE = process.env.OFFICIAL_WEBSITE || 'https://cloudmonster.monsterstore.tw';
 const CONTACT_PHONE = '0800-018-888';
 const CONTACT_EMAIL = 'contact@cloudmonster.com.tw';
 const DEFAULT_SUPPORT_PHONE = '0800-018-888';
@@ -1439,8 +1439,8 @@ app.get('/api/orders/:lineUserId', async (req, res) => {
 app.post('/api/payment/request', async (req, res) => {
   try {
     const { orderId, amount, orderName } = req.body;
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     const body = {
       amount, currency: 'TWD', orderId,
       packages: [{ id: orderId, amount, name: orderName || '雲管家洗衣服務', products: [{ name: orderName || '洗衣服務', quantity: 1, price: amount }] }],
@@ -1462,7 +1462,7 @@ app.post('/api/payment/request', async (req, res) => {
 app.get('/api/payment/confirm', async (req, res) => {
   try {
     const { transactionId, orderId } = req.query;
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     const orderResult = await db.query('SELECT * FROM orders WHERE id=$1 AND status NOT IN ($2, $3)', [orderId, 'paid', 'completed']);
     if (orderResult.rows.length === 0) return res.redirect(`${FRONTEND_URL}/?status=success&orderId=${orderId}&already_confirmed=1`);
     const order = orderResult.rows[0];
@@ -1512,7 +1512,7 @@ app.get('/api/payment/confirm', async (req, res) => {
       res.redirect(`${FRONTEND_URL}/?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
     }
   } catch (e) {
-    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=error&msg=${encodeURIComponent(e.message)}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -1520,7 +1520,7 @@ app.get('/api/payment/cancel', async (req, res) => {
   try {
     const { orderId } = req.query;
     if (orderId) await db.query(`UPDATE orders SET status='cancelled' WHERE id=$1`, [orderId]);
-    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=cancel&orderId=${orderId || ''}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=cancel&orderId=${orderId || ''}`);
   } catch (err) {
     console.error('[payment/cancel] Error:', err.message);
     res.redirect(`${FRONTEND_URL}/?paymentResult=pay_fail`);
@@ -1625,8 +1625,8 @@ app.post('/api/payment/create', async (req, res) => {
     }
 
     // Try LINE Pay
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     try {
       const storeName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || '洗衣服務';
       const machineName = machineId.includes('-d') ? `烘乾${machineNum}號` : `洗脫烘${machineNum}號(${mode})`;
@@ -1770,8 +1770,8 @@ app.post('/api/topup/linepay', async (req, res) => {
     const { userId, groupId, amount } = req.body;
     if (!userId || !groupId || !amount || amount <= 0) return res.status(400).json({ error: 'missing params' });
     const orderId = 'TOP' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     // Get group name
     const gr = await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId]);
     const groupName = gr.rows[0]?.name || '洗衣服務';
@@ -1801,7 +1801,7 @@ app.post('/api/topup/linepay', async (req, res) => {
 app.get('/api/topup/confirm', async (req, res) => {
   try {
     const { transactionId, orderId } = req.query;
-    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-chi.vercel.app';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
 
     // Retrieve order from DB (tamper-proof)
     if (!orderId) {
@@ -1856,7 +1856,7 @@ app.get('/api/topup/confirm', async (req, res) => {
       res.redirect(`${FRONTEND_URL}/?status=topup_fail`);
     }
   } catch (e) {
-    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=topup_fail`);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=topup_fail`);
   }
 });
 
@@ -1957,8 +1957,8 @@ app.post('/api/jkopay/entry', async (req, res) => {
     }
 
     // Call JKOPay Entry API
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     const storeName = (await db.query('SELECT name FROM stores WHERE id=$1', [storeId])).rows[0]?.name || '洗衣服務';
     const machineName = machineId.includes('-d') ? `烘乾${machineNum}號` : `洗脫烘${machineNum}號(${mode})`;
 
@@ -2177,8 +2177,8 @@ app.post('/api/topup/jkopay', async (req, res) => {
     }
 
     const orderId = 'JKTOP' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
-    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
 
     const gr = await db.query('SELECT name FROM store_groups WHERE id=$1', [groupId]);
     const groupName = gr.rows[0]?.name || '洗衣服務';
@@ -3529,8 +3529,8 @@ app.post('/api/coupons/purchase', async (req, res) => {
         [orderId, memberId, couponId, price]
       );
       // Call LINE Pay Request API
-      const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-production-efa4.up.railway.app';
-      const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+      const SERVER_URL = process.env.SERVER_URL || 'https://laundry-backend-api.monsterstore.tw';
+      const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
       const orderName = `購買優惠券: ${coupon.name}`;
       const payBody = {
         amount: price, currency: 'TWD', orderId,
@@ -3607,7 +3607,7 @@ app.post('/api/coupons/purchase', async (req, res) => {
 app.get('/api/coupons/purchase/confirm', async (req, res) => {
   try {
     const { transactionId, orderId } = req.query;
-    const FRONTEND_URL = 'https://laundry-frontend-chi.vercel.app';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw';
     if (!transactionId || !orderId) return res.redirect(`${FRONTEND_URL}/?status=error&msg=missing_params`);
 
     // Fetch the coupon_purchase order (idempotency: skip if already paid/completed)
@@ -3666,7 +3666,7 @@ app.get('/api/coupons/purchase/confirm', async (req, res) => {
     res.redirect(`${FRONTEND_URL}/?status=success&type=coupon_purchase&orderId=${orderId}`);
   } catch (e) {
     console.error('[Coupon] LINE Pay confirm error:', e.message);
-    res.redirect(`https://laundry-frontend-chi.vercel.app/?status=error&msg=${encodeURIComponent(e.message)}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -6876,7 +6876,7 @@ const RICH_MENU_TEMPLATE = {
     },
     {
       bounds: { x: 0, y: 843, width: 833, height: 843 },
-      action: { type: 'uri', uri: 'https://cloudmonster-website.vercel.app/stores', label: '服務據點' }
+      action: { type: 'uri', uri: `${process.env.OFFICIAL_WEBSITE || 'https://cloudmonster.monsterstore.tw'}/stores`, label: '服務據點' }
     },
     {
       bounds: { x: 833, y: 843, width: 834, height: 843 },
@@ -11018,7 +11018,7 @@ app.post('/api/admin/voom-post', async (req, res) => {
 
 // Template builders for admin flex-message endpoint
 function buildAdminFlexTemplate(template, customData = {}) {
-  const LOGO_URL = 'https://cloudmonster-website.vercel.app/cloudmonster-logo.png';
+  const LOGO_URL = `${process.env.OFFICIAL_WEBSITE || 'https://cloudmonster.monsterstore.tw'}/cloudmonster-logo.png`;
 
   switch (template) {
     case 'welcome':
