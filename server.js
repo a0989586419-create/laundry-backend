@@ -21,13 +21,36 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://liff.line.me',
+    'https://cloudmonster.monsterstore.tw',
+    'https://cloudmonster.tw',
+    'https://www.cloudmonster.tw',
+    'https://laundry-frontend-app.monsterstore.tw',
+    ...(process.env.NODE_ENV === 'development' ? ['http://localhost:5173', 'http://localhost:3000'] : [])
+  ],
+  credentials: true
+}));
 
 // Rate limiting
 app.use('/api/', rateLimit({ windowMs: 60000, max: 200, message: { error: 'Too many requests' } }));
 app.use('/api/payment/', rateLimit({ windowMs: 60000, max: 10, message: { error: 'Too many payment requests' } }));
 app.use('/api/wallet/', rateLimit({ windowMs: 60000, max: 20, message: { error: 'Too many wallet requests' } }));
 app.use('/api/notifications/', rateLimit({ windowMs: 60000, max: 5, message: { error: 'Too many notification requests' } }));
+
+// Reject guest userIds on sensitive endpoints
+function rejectGuestUser(req, res, next) {
+  const userId = req.query.userId || req.body?.userId || req.query.adminId || req.body?.adminId;
+  if (userId && userId.startsWith('guest-')) {
+    return res.status(403).json({ error: 'Guest users cannot perform this action' });
+  }
+  next();
+}
+app.use('/api/wallet/', rejectGuestUser);
+app.use('/api/payment/', rejectGuestUser);
+app.use('/api/admin/', rejectGuestUser);
+app.use('/api/orders/', rejectGuestUser);
 
 // 資料庫
 const db = new Pool({
@@ -107,10 +130,11 @@ mqttClient.on('message', async (topic, payload) => {
 } // end if (mqttClient)
 
 // ===== IoT API Key middleware for device endpoints =====
-const IOT_API_KEY = process.env.IOT_API_KEY || '';
+const IOT_API_KEY = process.env.IOT_API_KEY;
 function requireIotApiKey(req, res, next) {
+  if (!IOT_API_KEY) return res.status(500).json({ error: 'IOT_API_KEY not configured' });
   const key = req.headers['x-api-key'] || req.query.apiKey;
-  if (key !== IOT_API_KEY) return res.status(401).json({ error: 'Invalid or missing API key' });
+  if (!key || key !== IOT_API_KEY) return res.status(401).json({ error: 'Invalid or missing API key' });
   next();
 }
 
@@ -746,7 +770,7 @@ app.get('/api/user/profile', async (req, res) => {
     });
   } catch (e) {
     console.error('profile error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -831,7 +855,7 @@ app.get('/api/user/orders', async (req, res) => {
     });
   } catch (e) {
     console.error('user orders error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -874,7 +898,7 @@ app.get('/api/user/orders/:orderId', async (req, res) => {
     res.json({ order });
   } catch (e) {
     console.error('user order detail error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -899,7 +923,7 @@ app.get('/api/store-groups', async (req, res) => {
       }
     }
     res.json(gr.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.get('/api/store-groups/:groupId', async (req, res) => {
@@ -910,14 +934,14 @@ app.get('/api/store-groups/:groupId', async (req, res) => {
     const sr = await db.query('SELECT * FROM stores WHERE group_id=$1 ORDER BY name', [group.id]);
     group.stores = sr.rows;
     res.json(group);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.get('/api/stores', async (req, res) => {
   try {
     const r = await db.query('SELECT s.*, sg.name as group_name, sg.type as group_type FROM stores s LEFT JOIN store_groups sg ON s.group_id=sg.id ORDER BY s.name');
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -929,7 +953,7 @@ app.get('/api/wallet/:groupId', async (req, res) => {
     if (!lineUserId) return res.status(400).json({ error: 'userId required' });
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [lineUserId, req.params.groupId]);
     res.json({ balance: r.rows[0]?.balance || 0 });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.post('/api/wallet/topup', async (req, res) => {
@@ -965,7 +989,8 @@ app.post('/api/wallet/topup', async (req, res) => {
     res.json({ success: true, balance: r.rows[0].balance, bonus });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    res.status(500).json({ error: e.message });
+    console.error('wallet topup error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   } finally { client.release(); }
 });
 
@@ -1003,7 +1028,8 @@ app.post('/api/wallet/deduct', async (req, res) => {
     res.json({ success: true, balance: deductResult.rows[0].balance });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    res.status(500).json({ error: e.message });
+    console.error('wallet deduct error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   } finally { client.release(); }
 });
 
@@ -1025,7 +1051,7 @@ app.get('/api/transactions', async (req, res) => {
 
     const r = await db.query(query, params);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1132,7 +1158,7 @@ app.get('/api/admin/dashboard', async (req, res) => {
     });
   } catch (e) {
     console.error('dashboard error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -1147,7 +1173,7 @@ app.put('/api/admin/store-group/:id/support', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query('UPDATE store_groups SET support_url=$1, support_phone=$2 WHERE id=$3', [supportUrl || '', supportPhone || '', req.params.id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1176,7 +1202,7 @@ app.get('/api/admin/users', async (req, res) => {
     query += ' ORDER BY ur.role DESC, sg.name';
     const r = await db.query(query, params);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.post('/api/admin/users', async (req, res) => {
@@ -1194,7 +1220,7 @@ app.post('/api/admin/users', async (req, res) => {
     `, [targetUserId, role, gid, displayName || null, phone || null, notes || null, JSON.stringify(permissions || {})]);
     logAudit(userId, 'role_add', 'user', targetUserId, { role, groupId: gid }, req.ip);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.delete('/api/admin/users/:id', async (req, res) => {
@@ -1204,7 +1230,7 @@ app.delete('/api/admin/users/:id', async (req, res) => {
     if (roleInfo.role !== 'super_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query('DELETE FROM user_roles WHERE id=$1', [req.params.id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1241,7 +1267,7 @@ app.get('/api/admin/topup-overview', async (req, res) => {
     query += ' ORDER BY sg.name';
     const r = await db.query(query, qParams);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Toggle topup enabled/disabled for a group
@@ -1254,7 +1280,20 @@ app.post('/api/admin/topup-toggle', async (req, res) => {
     await db.query('ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true').catch(() => {});
     await db.query('UPDATE store_groups SET topup_enabled=$1 WHERE id=$2', [enabled, groupId]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
+});
+
+// Toggle member system enabled/disabled for a group
+app.post('/api/admin/member-system-toggle', async (req, res) => {
+  try {
+    const { userId, groupId, enabled } = req.body;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    if (roleInfo.role === 'store_admin' && roleInfo.groupId !== groupId) return res.status(403).json({ error: 'not your group' });
+    await db.query('ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS member_system_enabled BOOLEAN DEFAULT true').catch(() => {});
+    await db.query('UPDATE store_groups SET member_system_enabled=$1 WHERE id=$2', [enabled, groupId]);
+    res.json({ success: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Manual topup/deduct for a consumer
@@ -1281,7 +1320,7 @@ app.post('/api/admin/manual-topup', async (req, res) => {
 
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [targetUserId, groupId]);
     res.json({ success: true, balance: r.rows[0]?.balance || 0 });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Search consumers
@@ -1310,7 +1349,7 @@ app.get('/api/admin/consumers', async (req, res) => {
     query += ' ORDER BY m.last_login DESC NULLS LAST LIMIT 50';
     const r = await db.query(query, params);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Get a specific consumer's detail with transaction history
@@ -1365,7 +1404,7 @@ app.get('/api/admin/consumer/:lineUserId', async (req, res) => {
       transactions: txR.rows,
       orders: orderR.rows,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1389,7 +1428,7 @@ app.get('/api/machines/:storeId', async (req, res) => {
       WHERE m.store_id=$1 AND m.active=true ORDER BY m.sort_order,m.name
     `, [req.params.storeId]);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1414,7 +1453,7 @@ app.post('/api/orders/create', async (req, res) => {
       [orderId, member.id, storeId, machineId, mode, JSON.stringify(addons||[]), extendMin||0, temp, totalAmount, pulses, durationSec]
     );
     res.json({ orderId, totalAmount, pulses });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.get('/api/orders/:lineUserId', async (req, res) => {
@@ -1457,7 +1496,7 @@ app.post('/api/payment/request', async (req, res) => {
     } else {
       res.status(400).json({ success: false, error: result.returnMessage });
     }
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ success: false, error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.get('/api/payment/confirm', async (req, res) => {
@@ -1513,7 +1552,8 @@ app.get('/api/payment/confirm', async (req, res) => {
       res.redirect(`${FRONTEND_URL}/?status=fail&msg=${encodeURIComponent(result.returnMessage)}`);
     }
   } catch (e) {
-    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent(e.message)}`);
+    console.error('payment confirm error:', e);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent('付款處理失敗，請稍後再試')}`);
   }
 });
 
@@ -1702,7 +1742,7 @@ app.post('/api/payment/create', async (req, res) => {
     res.json({ success: true, orderId, demoMode: true, discountAmount, finalAmount });
   } catch (e) {
     console.error('payment/create error:', e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -1807,7 +1847,7 @@ app.post('/api/machines/state', async (req, res) => {
     }
 
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -1843,7 +1883,7 @@ app.post('/api/topup/linepay', async (req, res) => {
       console.error('LINE Pay topup error:', linePayErr.message);
       return res.status(500).json({ success: false, error: 'LINE Pay 服務暫時無法使用，請稍後再試' });
     }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.get('/api/topup/confirm', async (req, res) => {
@@ -2038,7 +2078,7 @@ app.post('/api/jkopay/entry', async (req, res) => {
     }
   } catch (e) {
     console.error('[JKOPay] entry error:', e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2164,7 +2204,7 @@ app.get('/api/jkopay/inquiry', async (req, res) => {
     }
   } catch (e) {
     console.error('[JKOPay] inquiry error:', e);
-    res.status(500).json({ status: 'fail', error: e.message });
+    res.status(500).json({ status: 'fail', error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2207,7 +2247,7 @@ app.post('/api/jkopay/refund', async (req, res) => {
     }
   } catch (e) {
     console.error('[JKOPay] refund error:', e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2257,7 +2297,7 @@ app.post('/api/topup/jkopay', async (req, res) => {
     }
   } catch (e) {
     console.error('[JKOPay] topup entry error:', e);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2402,7 +2442,7 @@ app.post('/api/admin/machine/control', async (req, res) => {
       ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, progress=0, updated_at=NOW()
     `, [machineId, state, remainSec]);
     res.json({ success: true, state, remainSec });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -2472,7 +2512,7 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
     }
 
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -2542,7 +2582,7 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
       res.json({ success: true, event, device });
     } catch (e) {
       console.error('[TB Webhook] Error:', e.message);
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
     }
   } else if (event === 'machine_fault') {
     // Machine fault event from ThingsBoard rule chain
@@ -2594,7 +2634,7 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
       res.json({ success: true, event, device });
     } catch (e) {
       console.error('[TB Webhook Fault] Error:', e.message);
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
     }
   } else {
     res.json({ success: true, event, message: 'event received' });
@@ -2635,11 +2675,10 @@ app.get('/api/tb/diag', async (req, res) => {
     steps.overall = 'OK';
     res.json(steps);
   } catch (e) {
+    console.error('[TB Debug]', e);
     steps.error = {
       step: steps.login ? (steps.device_lookup ? 'telemetry' : 'device_lookup') : 'login',
-      status: e.response?.status,
-      data: e.response?.data,
-      message: e.message,
+      message: '伺服器錯誤，請稍後再試',
     };
     res.status(500).json(steps);
   }
@@ -2680,7 +2719,7 @@ app.get('/api/tb/telemetry/:deviceName', async (req, res) => {
     res.json(flat);
   } catch (e) {
     console.error('[TB Telemetry]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2726,7 +2765,7 @@ app.get('/api/tb/telemetry/store/:storeId', async (req, res) => {
     res.json({ store_id: storeId, machines: results, source: 'thingsboard', timestamp: new Date().toISOString() });
   } catch (e) {
     console.error('[TB Store Telemetry]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2758,7 +2797,7 @@ app.get('/api/tb/history/:deviceName', async (req, res) => {
     res.json({ device: deviceName, source: 'thingsboard', startTs: Number(startTs), endTs: Number(endTs), data });
   } catch (e) {
     console.error('[TB History]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2788,7 +2827,7 @@ app.get('/api/tb/attributes/:deviceName', async (req, res) => {
     res.json({ device: deviceName, source: 'thingsboard', shared: sharedObj, client: clientObj });
   } catch (e) {
     console.error('[TB Attributes]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2838,7 +2877,7 @@ app.get('/api/tb/config/:storeId', async (req, res) => {
     });
   } catch (e) {
     console.error('[TB Config]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -2951,7 +2990,7 @@ app.get('/api/store/modes/:storeId', async (req, res) => {
     });
   } catch (e) {
     console.error('[Store Modes]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3036,7 +3075,7 @@ app.get('/api/monitor/store/:storeId', async (req, res) => {
     });
   } catch (e) {
     console.error('[Monitor]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3095,7 +3134,7 @@ app.get('/api/monitor/overview', async (req, res) => {
     res.json({ stores, timestamp: new Date().toISOString() });
   } catch (e) {
     console.error('[Monitor Overview]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3163,7 +3202,7 @@ app.get('/api/machines/:storeId/live', async (req, res) => {
     res.json(machines);
   } catch (e) {
     console.error('[Live Machines]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3213,7 +3252,7 @@ app.post('/api/admin/machines', async (req, res) => {
     res.json(created);
   } catch (e) {
     console.error('[Machine Create]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3255,7 +3294,7 @@ app.put('/api/admin/machines/:machineId', async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) {
     console.error('[Machine Update]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3278,7 +3317,7 @@ app.delete('/api/admin/machines/:machineId', async (req, res) => {
     res.json({ success: true, message: `已停用 ${result.rows[0].name}`, machine: result.rows[0] });
   } catch (e) {
     console.error('[Machine Delete]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3304,7 +3343,7 @@ app.get('/api/admin/machines/all', async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error('[Machine List]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -3376,7 +3415,7 @@ app.post('/api/machine/notify', requireIotApiKey, async (req, res) => {
     }
 
     res.json({ success: true, message: `通知已記錄: ${storeName} ${machineNum}`, pushedCount, usersFound: recentUsers.rows.length, fallbackUsed });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -3394,7 +3433,7 @@ app.get('/api/admin/coupons', async (req, res) => {
     query += ' ORDER BY c.created_at DESC';
     const r = await db.query(query, params);
     res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.post('/api/admin/coupons', async (req, res) => {
@@ -3437,7 +3476,7 @@ app.post('/api/admin/coupons', async (req, res) => {
     } else {
       res.json({ success: true });
     }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.put('/api/admin/coupons/:id', async (req, res) => {
@@ -3455,7 +3494,7 @@ app.put('/api/admin/coupons/:id', async (req, res) => {
       WHERE id=$1
     `, [req.params.id, name, discount, type, minSpend, expiry, active, price, description, timeSlot, deviceLimit, validity, storeScope, maxUses, category, groupId, notes, refundPolicy, redeemCode]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 app.delete('/api/admin/coupons/:id', async (req, res) => {
@@ -3465,7 +3504,7 @@ app.delete('/api/admin/coupons/:id', async (req, res) => {
     if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
     await db.query('DELETE FROM admin_coupons WHERE id=$1', [req.params.id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ========== Announcements API ==========
@@ -3483,7 +3522,7 @@ app.get('/api/announcements', async (req, res) => {
     query += ' ORDER BY sort_order ASC, created_at DESC';
     const result = await db.query(query, params);
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Admin: get all announcements (including unpublished)
@@ -3501,7 +3540,7 @@ app.get('/api/admin/announcements', async (req, res) => {
     query += ' ORDER BY sort_order ASC, created_at DESC';
     const result = await db.query(query, params);
     res.json(result.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Admin: create announcement
@@ -3517,7 +3556,7 @@ app.post('/api/admin/announcements', async (req, res) => {
       RETURNING *
     `, [groupId || null, title, content || '', imageUrl || '', linkUrl || '', published !== false, sortOrder || 0, tag || '']);
     res.json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Admin: update announcement
@@ -3542,7 +3581,7 @@ app.put('/api/admin/announcements/:id', async (req, res) => {
     `, [req.params.id, title, content, imageUrl, linkUrl, groupId || null, published, sortOrder, tag]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'announcement not found' });
     res.json(result.rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Admin: delete announcement
@@ -3554,7 +3593,7 @@ app.delete('/api/admin/announcements/:id', async (req, res) => {
     const result = await db.query('DELETE FROM announcements WHERE id=$1 RETURNING id', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'announcement not found' });
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Redeem coupon by code
@@ -3594,7 +3633,7 @@ app.post('/api/coupons/redeem', async (req, res) => {
         expiry: expiryDate, category: coupon.category || 'coupon',
       },
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -3645,7 +3684,7 @@ app.get('/api/coupons', async (req, res) => {
       };
     });
     res.json(coupons);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Purchase a coupon (deducts points OR LINE Pay, creates user_coupon)
@@ -3744,7 +3783,7 @@ app.post('/api/coupons/purchase', async (req, res) => {
     } finally {
       walletClient.release();
     }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // LINE Pay confirm for coupon purchase
@@ -3810,7 +3849,7 @@ app.get('/api/coupons/purchase/confirm', async (req, res) => {
     res.redirect(`${FRONTEND_URL}/?status=success&type=coupon_purchase&orderId=${orderId}`);
   } catch (e) {
     console.error('[Coupon] LINE Pay confirm error:', e.message);
-    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent(e.message)}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'https://laundry-frontend-app.monsterstore.tw'}/?status=error&msg=${encodeURIComponent('付款處理失敗，請稍後再試')}`);
   }
 });
 
@@ -3864,7 +3903,7 @@ app.get('/api/coupons/mine', async (req, res) => {
       };
     });
     res.json(coupons);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -3888,7 +3927,7 @@ app.post('/api/machine/coin-insert', requireIotApiKey, async (req, res) => {
     machineCache[machineId].coinTotal = (machineCache[machineId].coinTotal || 0) + coinVal;
     console.log(`Coin insert: ${storeId}/${machineId} +${coinVal} (${ct}元)`);
     res.json({ success: true, orderId, coinCount: machineCache[machineId].coinCount, coinTotal: machineCache[machineId].coinTotal });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -3940,7 +3979,7 @@ app.get('/api/admin/coin-revenue', async (req, res) => {
         amount: parseInt(r.amount)
       }))
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -4073,7 +4112,7 @@ app.get('/api/admin/revenue-chart', async (req, res) => {
     });
     const result = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
     res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Revenue CSV export with store breakdown + financial summary
@@ -4254,7 +4293,7 @@ app.get('/api/admin/revenue-export', async (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="revenue-report-${today}.csv"`);
     res.send(csv);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Revenue Excel export (same data as CSV but in .xlsx format with multiple sheets)
@@ -4410,7 +4449,7 @@ app.get('/api/admin/revenue-export-excel', async (req, res) => {
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="revenue-report-${today}.xlsx"`);
     res.send(buf);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -4472,7 +4511,7 @@ app.get('/api/member/level', async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error('[Member] level error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4515,7 +4554,7 @@ app.post('/api/member/update-spent', async (req, res) => {
     res.json({ success: true, ...memberLevel });
   } catch (e) {
     console.error('[Member] update-spent error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4589,7 +4628,7 @@ app.get('/api/member/referral', async (req, res) => {
     });
   } catch (e) {
     console.error('[Referral] referral get error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4627,7 +4666,7 @@ app.get('/api/referral/my-code', async (req, res) => {
     });
   } catch (e) {
     console.error('[Referral] my-code error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4662,7 +4701,7 @@ app.get('/api/referral/stats', async (req, res) => {
     });
   } catch (e) {
     console.error('[Referral] stats error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4747,7 +4786,7 @@ app.post('/api/member/referral/use', async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('referral use error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   } finally {
     client.release();
   }
@@ -4769,7 +4808,7 @@ app.get('/api/admin/member-levels', async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error('admin member-levels error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4796,7 +4835,7 @@ app.put('/api/admin/member-levels/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) {
     console.error('admin update member-level error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4813,7 +4852,7 @@ app.put('/api/admin/referral-reward', async (req, res) => {
     // Update all future referral codes' reward (existing codes keep their original reward)
     await db.query('UPDATE referral_codes SET reward_points = $1 WHERE uses = 0', [rewardPoints]);
     res.json({ success: true, message: `Referral reward updated to ${rewardPoints} points for unused codes` });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -4859,7 +4898,7 @@ app.get('/api/admin/referral-stats', async (req, res) => {
     });
   } catch (e) {
     console.error('admin referral-stats error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -4927,7 +4966,7 @@ app.post('/api/notifications/send', async (req, res) => {
     res.json({ success: true, totalTargets: targets.length, successCount, failCount });
   } catch (e) {
     console.error('notifications/send error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5081,7 +5120,7 @@ app.get('/api/admin/push-stats', async (req, res) => {
     });
   } catch (e) {
     console.error('push-stats error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5160,7 +5199,7 @@ app.get('/api/admin/push-export', async (req, res) => {
     res.send(csv);
   } catch (e) {
     console.error('push-export error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5218,7 +5257,7 @@ app.get('/api/admin/store-push/preview', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push/preview error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5329,7 +5368,7 @@ app.post('/api/admin/store-push', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5376,7 +5415,7 @@ app.get('/api/admin/store-push/balance', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push/balance error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5435,7 +5474,7 @@ app.get('/api/admin/store-push/history', async (req, res) => {
     res.json({ records, total: records.length });
   } catch (e) {
     console.error('store-push/history error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5477,7 +5516,7 @@ app.post('/api/admin/store-push/topup', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push/topup error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5525,7 +5564,7 @@ app.post('/api/store-admin/topup-request', async (req, res) => {
     res.json({ success: true, requestId });
   } catch (e) {
     console.error('[TopupReq] Submit error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5552,7 +5591,7 @@ app.get('/api/store-admin/topup-requests', async (req, res) => {
     res.json({ success: true, requests: result.rows });
   } catch (e) {
     console.error('[TopupReq] List error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5583,7 +5622,7 @@ app.get('/api/admin/topup-requests', async (req, res) => {
     res.json({ success: true, requests: result.rows });
   } catch (e) {
     console.error('[TopupReq] Admin list error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5661,7 +5700,7 @@ app.put('/api/admin/topup-requests/:id', async (req, res) => {
     }
   } catch (e) {
     console.error('[TopupReq] Review error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5718,7 +5757,7 @@ app.put('/api/admin/store-push/settings', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push/settings error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5731,7 +5770,7 @@ app.get('/api/admin/push-plans', async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error('[Push Plans]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5762,7 +5801,7 @@ app.put('/api/admin/push-plans/:planKey', async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) {
     console.error('[Push Plans Update]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5786,7 +5825,7 @@ app.post('/api/admin/push-plans', async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) {
     console.error('[Push Plans Create]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5821,7 +5860,7 @@ app.post('/api/admin/push-plans/select', async (req, res) => {
     res.json({ success: true, plan: plan, groupId, balance: parseFloat(row.balance), perPushRate: parseFloat(row.per_push_rate), monthlyManualLimit: parseInt(row.monthly_manual_limit) });
   } catch (e) {
     console.error('[Push Plan Select]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5844,7 +5883,7 @@ app.get('/api/admin/push-plans/store/:groupId', async (req, res) => {
     res.json({ selected_plan: result.rows[0].selected_plan, plan: result.rows[0] });
   } catch (e) {
     console.error('[Push Plan Store]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -5862,7 +5901,7 @@ app.post('/api/admin/cleanup', async (req, res) => {
       )
     `);
     res.json({ success: true, deleted: result.rowCount });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -5940,7 +5979,7 @@ app.get('/api/user/member-level', async (req, res) => {
     res.json({ ...levelInfo, totalWashes });
   } catch (e) {
     console.error('member-level error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -6011,7 +6050,7 @@ app.post('/api/user/add-spending', async (req, res) => {
     });
   } catch (e) {
     console.error('add-spending error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -6129,7 +6168,7 @@ app.post('/api/referral/apply', async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('referral apply error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   } finally {
     client.release();
   }
@@ -6193,7 +6232,7 @@ app.post('/api/user/apply-referral', async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('apply-referral error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   } finally {
     client.release();
   }
@@ -6221,7 +6260,7 @@ app.get('/api/user/referral', async (req, res) => {
     });
   } catch (e) {
     console.error('user referral error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -6256,7 +6295,7 @@ app.get('/api/referral/status', async (req, res) => {
     });
   } catch (e) {
     console.error('referral status error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -6276,7 +6315,7 @@ app.get('/api/owner/check', async (req, res) => {
     } else {
       res.json({ isOwner: false });
     }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Owner dashboard data (only their store)
@@ -6326,7 +6365,7 @@ app.get('/api/owner/dashboard', async (req, res) => {
       machines: machinesR.rows,
       recentOrders: ordersR.rows
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Owner's machines only
@@ -6342,7 +6381,7 @@ app.get('/api/owner/machines', async (req, res) => {
       [storeId + '%']
     );
     res.json({ machines: r.rows, storeId });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Owner revenue report
@@ -6412,7 +6451,7 @@ app.get('/api/owner/revenue', async (req, res) => {
       peakHours: peakR.rows.map(row => ({ hour: parseInt(row.hour), count: parseInt(row.count) })),
       storeId
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Super admin: add a store owner
@@ -6430,7 +6469,7 @@ app.post('/api/admin/store-owners', async (req, res) => {
       [userId, storeId, ownerName || null, phone || null]
     );
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Super admin: list all store owners
@@ -6442,7 +6481,7 @@ app.get('/api/admin/store-owners', async (req, res) => {
   try {
     const r = await db.query('SELECT * FROM store_owners ORDER BY created_at DESC');
     res.json({ owners: r.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Super admin: revenue report (with optional storeId filter)
@@ -6494,7 +6533,7 @@ app.get('/api/admin/revenue', async (req, res) => {
       storeBreakdown: storeR.rows.map(row => ({ storeId: row.store_id, revenue: parseInt(row.revenue), orders: parseInt(row.orders) })),
       storeId: storeId || 'all'
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ═══════════════════════════════════════
@@ -6647,6 +6686,7 @@ async function initDB() {
       await db.query(`ALTER TABLE admin_coupons ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
     }
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS topup_enabled BOOLEAN DEFAULT true`).catch(() => {});
+    await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS member_system_enabled BOOLEAN DEFAULT true`).catch(() => {});
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS support_url VARCHAR(500) DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE store_groups ADD COLUMN IF NOT EXISTS support_phone VARCHAR(30) DEFAULT ''`).catch(() => {});
     // Announcements table
@@ -7273,7 +7313,7 @@ app.post('/api/admin/rich-menu/create', requireAdmin, async (req, res) => {
     res.json({ success: true, richMenuId: data.richMenuId });
   } catch (e) {
     console.error('[RichMenu] Create error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -7332,7 +7372,7 @@ app.post('/api/admin/rich-menu/upload-image', requireAdmin, async (req, res) => 
     res.json({ success: true, richMenuId });
   } catch (e) {
     console.error('[RichMenu] Upload error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -7363,7 +7403,7 @@ app.post('/api/admin/rich-menu/set-default', requireAdmin, async (req, res) => {
     res.json({ success: true, richMenuId, message: 'Rich menu set as default for all users' });
   } catch (e) {
     console.error('[RichMenu] Set default error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -7388,7 +7428,7 @@ app.get('/api/admin/rich-menu/list', requireAdmin, async (req, res) => {
     res.json({ success: true, richmenus: data.richmenus || [] });
   } catch (e) {
     console.error('[RichMenu] List error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -7415,7 +7455,7 @@ app.delete('/api/admin/rich-menu/:richMenuId', requireAdmin, async (req, res) =>
     res.json({ success: true, richMenuId, message: 'Rich menu deleted' });
   } catch (e) {
     console.error('[RichMenu] Delete error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -7476,7 +7516,7 @@ app.post('/api/admin/rich-menu/setup', requireAdmin, async (req, res) => {
     });
   } catch (e) {
     console.error('[RichMenu] Setup error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10779,7 +10819,7 @@ app.post('/api/admin/scheduled-followup', async (req, res) => {
     });
   } catch (e) {
     console.error('[Followup] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10808,7 +10848,8 @@ app.get('/api/admin/followup-candidates', async (req, res) => {
       users: result.rows
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('followup candidates error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10821,7 +10862,7 @@ app.get('/api/user/tags', async (req, res) => {
   try {
     const result = await db.query('SELECT tag, source, created_at FROM user_tags WHERE line_user_id = $1 ORDER BY created_at', [userId]);
     res.json({ success: true, tags: result.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // Add tag manually (admin)
@@ -10906,7 +10947,8 @@ app.post('/api/user/bind-store', async (req, res) => {
 
     res.json({ success: true, storeName, storeId });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('store bind error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10925,7 +10967,8 @@ app.get('/api/user/bound-stores', async (req, res) => {
     );
     res.json({ stores: result.rows });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('bound stores error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10937,7 +10980,8 @@ app.get('/api/admin/inquiries', async (req, res) => {
     );
     res.json({ inquiries: result.rows });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('inquiries error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -10949,7 +10993,7 @@ app.get('/api/admin/tags', async (req, res) => {
       FROM user_tags GROUP BY tag ORDER BY user_count DESC
     `);
     res.json({ success: true, tags: result.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // List users by tag (admin)
@@ -10963,7 +11007,7 @@ app.get('/api/admin/tags/:tag/users', async (req, res) => {
       ORDER BY ut.created_at DESC
     `, [req.params.tag]);
     res.json({ success: true, users: result.rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // ===== Broadcast API (群發訊息) =====
@@ -11137,7 +11181,7 @@ async function executeBroadcast(messages, targetTags, excludeTags, createdBy, ta
 
   } catch (e) {
     console.error('[Broadcast] Error:', e.message);
-    return { success: false, error: e.message, sentCount: 0 };
+    return { success: false, error: '伺服器錯誤，請稍後再試', sentCount: 0 };
   }
 }
 
@@ -11153,7 +11197,8 @@ app.get('/api/admin/store-bindings', async (req, res) => {
     `);
     res.json({ stores: result.rows });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('store bindings error:', e);
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11216,7 +11261,7 @@ app.post('/api/admin/broadcast', async (req, res) => {
 
   } catch (e) {
     console.error('[Broadcast API] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11261,7 +11306,7 @@ app.get('/api/admin/broadcast/history', async (req, res) => {
     });
   } catch (e) {
     console.error('[Broadcast History] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11291,7 +11336,7 @@ app.delete('/api/admin/broadcast/scheduled/:id', async (req, res) => {
     res.json({ success: true, cancelled: true, broadcastId: parseInt(broadcastId) });
   } catch (e) {
     console.error('[Cancel Broadcast] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11369,7 +11414,7 @@ app.post('/api/admin/voom-post', async (req, res) => {
 
   } catch (e) {
     console.error('[VOOM Post] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11674,7 +11719,7 @@ app.post('/api/admin/flex-message', async (req, res) => {
 
   } catch (e) {
     console.error('[Flex Message] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11810,7 +11855,7 @@ app.get('/api/admin/usage-heatmap', async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error('[Heatmap] error:', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11917,7 +11962,7 @@ app.post('/api/fault-report', async (req, res) => {
     res.json({ success: true, reportId });
   } catch (e) {
     console.error('[Fault] Create report error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11962,7 +12007,7 @@ app.get('/api/fault-reports', async (req, res) => {
     res.json({ success: true, reports: result.rows });
   } catch (e) {
     console.error('[Fault] List reports error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -11995,7 +12040,7 @@ app.put('/api/admin/fault-reports/:id', async (req, res) => {
     res.json({ success: true, report: result.rows[0] });
   } catch (e) {
     console.error('[Fault] Update report error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12036,7 +12081,7 @@ app.get('/api/admin/promotions', requireAdmin, async (req, res) => {
     res.json({ success: true, promotions: result.rows });
   } catch (e) {
     console.error('[Admin] List promotions error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12056,7 +12101,7 @@ app.post('/api/admin/promotions', requireAdmin, async (req, res) => {
     res.json({ success: true, promotion: result.rows[0] });
   } catch (e) {
     console.error('[Admin] Create promotion error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12083,7 +12128,7 @@ app.put('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
     res.json({ success: true, promotion: result.rows[0] });
   } catch (e) {
     console.error('[Admin] Update promotion error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12102,7 +12147,7 @@ app.delete('/api/admin/promotions/:id', requireAdmin, async (req, res) => {
     res.json({ success: true, promotion: result.rows[0] });
   } catch (e) {
     console.error('[Admin] Delete promotion error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12115,7 +12160,7 @@ app.get('/api/admin/broadcast-templates', requireAdmin, async (req, res) => {
     res.json({ success: true, templates: result.rows });
   } catch (e) {
     console.error('[Admin] List broadcast templates error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12135,7 +12180,7 @@ app.post('/api/admin/broadcast-templates', requireAdmin, async (req, res) => {
     res.json({ success: true, template: result.rows[0] });
   } catch (e) {
     console.error('[Admin] Create broadcast template error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12190,7 +12235,7 @@ app.post('/api/admin/broadcast/send', requireAdmin, async (req, res) => {
     res.json({ success: true, sentCount: result.sentCount, audience });
   } catch (e) {
     console.error('[Admin] Send broadcast error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12207,7 +12252,7 @@ app.get('/api/admin/broadcast-history', requireAdmin, async (req, res) => {
     res.json({ success: true, history: result.rows });
   } catch (e) {
     console.error('[Admin] Broadcast history error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
@@ -12272,7 +12317,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     });
   } catch (e) {
     console.error('[Admin] Stats error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: '伺服器錯誤，請稍後再試' });
   }
 });
 
