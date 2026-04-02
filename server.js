@@ -12,6 +12,7 @@ const fs = require('fs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
+const XLSX = require('xlsx');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -1758,6 +1759,53 @@ app.post('/api/machines/state', async (req, res) => {
       }
     }
 
+    // [Fault Notify] Send fault notification to store_admin + super_admin when machine enters fault state
+    if (prevState !== 'fault' && newState === 'fault') {
+      try {
+        // Get machine info + store + group
+        const machineInfo = await db.query(
+          `SELECT m.id, m.name as machine_name, m.store_id, s.name as store_name, s.group_id
+           FROM machines m LEFT JOIN stores s ON m.store_id = s.id
+           WHERE m.id = $1`, [machineId]
+        );
+        if (machineInfo.rows.length > 0) {
+          const mi = machineInfo.rows[0];
+          const faultMsg = `⚠️ 機器異常通知\n\n📍 ${mi.store_name || mi.store_id}\n🔧 ${mi.machine_name || mi.id}\n⏰ ${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}\n\n機器目前狀態異常，請盡速前往檢查。`;
+
+          // Notify store_admin(s) of the group
+          if (mi.group_id) {
+            const admins = await db.query(
+              `SELECT line_user_id FROM user_roles WHERE group_id = $1 AND role = 'store_admin'`, [mi.group_id]
+            );
+            for (const admin of admins.rows) {
+              sendLinePush(admin.line_user_id, [{ type: 'text', text: faultMsg }], {
+                pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id,
+                description: `機器異常通知 ${mi.store_name} ${mi.machine_name || mi.id}`
+              }).catch(e => console.error('[Fault Notify] store_admin push error:', e.message));
+            }
+          }
+
+          // Also notify super_admin
+          if (SUPER_ADMIN_LINE_ID) {
+            sendLinePush(SUPER_ADMIN_LINE_ID, [{ type: 'text', text: faultMsg }], {
+              pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id || null,
+              description: `機器異常通知(super) ${mi.store_name} ${mi.machine_name || mi.id}`
+            }).catch(e => console.error('[Fault Notify] super_admin push error:', e.message));
+          }
+
+          // Insert fault_report record
+          await db.query(
+            `INSERT INTO fault_reports (user_id, store_id, machine_id, machine_name, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')`,
+            ['system', mi.store_id || '', machineId, mi.machine_name || '', '自動偵測：機器進入故障狀態']
+          );
+          console.log(`[Fault Notify] Machine ${machineId} entered fault state, notified admins`);
+        }
+      } catch (faultErr) {
+        console.error('[Fault Notify] Error:', faultErr.message);
+      }
+    }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2364,6 +2412,11 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
   const { storeId, machineId, status, remaining, mode, temperature, rpm, power, waterLevel, coinCount, coinTotal } = req.body;
   if (!machineId) return res.status(400).json({ error: 'machineId required' });
   try {
+    // Check previous state for fault detection
+    const prevRow = await db.query('SELECT state FROM machine_current_state WHERE machine_id=$1', [machineId]).catch(() => ({ rows: [] }));
+    const prevState = prevRow.rows[0]?.state;
+    const newStatus = status || 'unknown';
+
     await db.query(`
       INSERT INTO machine_current_state (store_id, machine_id, status, remaining, mode, temperature, rpm, power, water_level, coin_count, coin_total, updated_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
@@ -2372,13 +2425,52 @@ app.post('/api/machines/state/update', requireIotApiKey, async (req, res) => {
         temperature=EXCLUDED.temperature, rpm=EXCLUDED.rpm, power=EXCLUDED.power,
         water_level=EXCLUDED.water_level, coin_count=EXCLUDED.coin_count, coin_total=EXCLUDED.coin_total,
         updated_at=NOW()
-    `, [storeId || '', machineId, status || 'unknown', remaining || 0, mode || '', temperature || 0, rpm || 0, power || 0, waterLevel || 0, coinCount || 0, coinTotal || 0]);
+    `, [storeId || '', machineId, newStatus, remaining || 0, mode || '', temperature || 0, rpm || 0, power || 0, waterLevel || 0, coinCount || 0, coinTotal || 0]);
     // Also update legacy machine_id-only row for backward compatibility
     await db.query(`
       INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
       VALUES ($1, $2, $3, 0, NOW())
       ON CONFLICT (machine_id) DO UPDATE SET state=$2, remain_sec=$3, updated_at=NOW()
-    `, [machineId, status || 'unknown', remaining || 0]).catch(() => {});
+    `, [machineId, newStatus, remaining || 0]).catch(() => {});
+
+    // Fault notification: when machine transitions to fault state
+    if (prevState !== 'fault' && newStatus === 'fault') {
+      try {
+        const machineInfo = await db.query(
+          `SELECT m.id, m.name as machine_name, m.store_id, s.name as store_name, s.group_id
+           FROM machines m LEFT JOIN stores s ON m.store_id = s.id
+           WHERE m.id = $1`, [machineId]
+        );
+        if (machineInfo.rows.length > 0) {
+          const mi = machineInfo.rows[0];
+          const faultMsg = `⚠️ 機器異常通知\n\n📍 ${mi.store_name || mi.store_id || storeId}\n🔧 ${mi.machine_name || mi.id}\n⏰ ${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}\n\n機器目前狀態異常，請盡速前往檢查。`;
+          if (mi.group_id) {
+            const admins = await db.query(`SELECT line_user_id FROM user_roles WHERE group_id = $1 AND role = 'store_admin'`, [mi.group_id]);
+            for (const admin of admins.rows) {
+              sendLinePush(admin.line_user_id, [{ type: 'text', text: faultMsg }], {
+                pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id,
+                description: `IoT機器異常 ${mi.store_name} ${mi.machine_name || mi.id}`
+              }).catch(e => console.error('[IoT Fault] push error:', e.message));
+            }
+          }
+          if (SUPER_ADMIN_LINE_ID) {
+            sendLinePush(SUPER_ADMIN_LINE_ID, [{ type: 'text', text: faultMsg }], {
+              pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id || null,
+              description: `IoT機器異常(super) ${mi.store_name} ${mi.machine_name || mi.id}`
+            }).catch(e => console.error('[IoT Fault] super push error:', e.message));
+          }
+          await db.query(
+            `INSERT INTO fault_reports (user_id, store_id, machine_id, machine_name, description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')`,
+            ['iot_update', mi.store_id || '', machineId, mi.machine_name || '', '自動偵測：IoT回報機器故障']
+          );
+          console.log(`[IoT Fault] Machine ${machineId} fault detected, notified admins`);
+        }
+      } catch (faultErr) {
+        console.error('[IoT Fault Notify] Error:', faultErr.message);
+      }
+    }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2450,6 +2542,58 @@ app.post('/api/thingsboard/webhook', async (req, res) => {
       res.json({ success: true, event, device });
     } catch (e) {
       console.error('[TB Webhook] Error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  } else if (event === 'machine_fault') {
+    // Machine fault event from ThingsBoard rule chain
+    try {
+      const machineInfo = await db.query(
+        `SELECT m.id, m.name as machine_name, m.store_id, s.name as store_name, s.group_id
+         FROM machines m LEFT JOIN stores s ON m.store_id = s.id
+         WHERE m.id = $1`, [device]
+      );
+      if (machineInfo.rows.length > 0) {
+        const mi = machineInfo.rows[0];
+        // Update state to fault
+        await db.query(`
+          INSERT INTO machine_current_state (machine_id, state, remain_sec, progress, updated_at)
+          VALUES ($1, 'fault', 0, 0, NOW())
+          ON CONFLICT (machine_id) DO UPDATE SET state='fault', remain_sec=0, updated_at=NOW()
+        `, [device]);
+
+        const faultDetail = req.body.fault_code || req.body.description || '未知故障';
+        const faultMsg = `⚠️ 機器異常通知\n\n📍 ${mi.store_name || mi.store_id}\n🔧 ${mi.machine_name || mi.id}\n❌ 故障碼：${faultDetail}\n⏰ ${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}\n\n機器目前狀態異常，請盡速前往檢查。`;
+
+        // Notify store admins
+        if (mi.group_id) {
+          const admins = await db.query(
+            `SELECT line_user_id FROM user_roles WHERE group_id = $1 AND role = 'store_admin'`, [mi.group_id]
+          );
+          for (const admin of admins.rows) {
+            sendLinePush(admin.line_user_id, [{ type: 'text', text: faultMsg }], {
+              pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id,
+              description: `TB機器異常 ${mi.store_name} ${mi.machine_name || mi.id}`
+            }).catch(e => console.error('[TB Fault] store_admin push error:', e.message));
+          }
+        }
+        // Notify super_admin
+        if (SUPER_ADMIN_LINE_ID) {
+          sendLinePush(SUPER_ADMIN_LINE_ID, [{ type: 'text', text: faultMsg }], {
+            pushType: 'auto_fault', storeId: mi.store_id, groupId: mi.group_id || null,
+            description: `TB機器異常(super) ${mi.store_name} ${mi.machine_name || mi.id}`
+          }).catch(e => console.error('[TB Fault] super_admin push error:', e.message));
+        }
+        // Record fault report
+        await db.query(
+          `INSERT INTO fault_reports (user_id, store_id, machine_id, machine_name, description, status)
+           VALUES ($1, $2, $3, $4, $5, 'pending')`,
+          ['thingsboard', mi.store_id || '', device, mi.machine_name || '', `ThingsBoard故障事件: ${faultDetail}`]
+        );
+        console.log(`[TB Webhook] Machine ${device} fault detected, notified admins`);
+      }
+      res.json({ success: true, event, device });
+    } catch (e) {
+      console.error('[TB Webhook Fault] Error:', e.message);
       res.status(500).json({ error: e.message });
     }
   } else {
@@ -4113,6 +4257,162 @@ app.get('/api/admin/revenue-export', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Revenue Excel export (same data as CSV but in .xlsx format with multiple sheets)
+app.get('/api/admin/revenue-export-excel', async (req, res) => {
+  try {
+    const { userId, days, groupId, startDate, endDate, storeId } = req.query;
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') return res.status(403).json({ error: 'forbidden' });
+    const scopeGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : groupId;
+    const params = [];
+    let dateFilter, txDateFilter;
+    if (startDate && endDate) {
+      params.push(startDate, endDate);
+      dateFilter = `o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')`;
+      txDateFilter = `t.created_at >= $1::date AND t.created_at < ($2::date + INTERVAL '1 day')`;
+    } else {
+      const numDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
+      params.push(numDays);
+      dateFilter = `o.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+      txDateFilter = `t.created_at >= CURRENT_DATE - ($1 || ' days')::INTERVAL`;
+    }
+
+    // Same queries as CSV export
+    let orderQuery = `SELECT DATE(o.created_at) as date, s.name as store_name, COALESCE(o.machine_id, 'unknown') as machine_id, COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue FROM orders o JOIN stores s ON o.store_id = s.id WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}`;
+    const orderExtraParams = [];
+    if (scopeGroupId) { orderQuery += ` AND s.group_id = $${params.length + orderExtraParams.length + 1}`; orderExtraParams.push(scopeGroupId); }
+    if (storeId) { orderQuery += ` AND o.store_id = $${params.length + orderExtraParams.length + 1}`; orderExtraParams.push(storeId); }
+    orderQuery += ' GROUP BY DATE(o.created_at), s.name, o.machine_id ORDER BY date, s.name, o.machine_id';
+
+    let txQuery = `SELECT DATE(t.created_at) as date, COALESCE(SUM(CASE WHEN t.type='topup' THEN t.amount ELSE 0 END), 0) as topup, COALESCE(SUM(CASE WHEN t.type='payment' THEN ABS(t.amount) ELSE 0 END), 0) as consumption, COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount > 0 THEN t.amount ELSE 0 END), 0) as manual_topup, COALESCE(SUM(CASE WHEN t.type='adjustment' AND t.amount < 0 THEN ABS(t.amount) ELSE 0 END), 0) as manual_deduct, COUNT(CASE WHEN t.type='topup' THEN 1 END) as topup_count, COUNT(CASE WHEN t.type='payment' THEN 1 END) as payment_count FROM transactions t WHERE ${txDateFilter}`;
+    if (scopeGroupId) { txQuery += ` AND t.group_id = $${params.length + 1}`; }
+    txQuery += ' GROUP BY DATE(t.created_at) ORDER BY date';
+
+    const coinExportParams = [...params];
+    let coinExportDateFilter = dateFilter.replace(/o\./g, 'co.');
+    let coinExportQuery = `SELECT DATE(co.created_at) as date, COALESCE(SUM(co.total_amount), 0) as coin_revenue, COUNT(*) as coin_count FROM orders co LEFT JOIN stores cs ON co.store_id = cs.id WHERE co.type = 'coin_payment' AND ${coinExportDateFilter}`;
+    if (scopeGroupId) { coinExportQuery += ` AND cs.group_id = $${coinExportParams.length + 1}`; coinExportParams.push(scopeGroupId); }
+    if (storeId) { coinExportQuery += ` AND co.store_id = $${coinExportParams.length + 1}`; coinExportParams.push(storeId); }
+    coinExportQuery += ' GROUP BY DATE(co.created_at) ORDER BY date';
+
+    const spExportParams = [...params];
+    let spExportDateFilter = dateFilter.replace(/o\./g, 'sp.');
+    let spExportQuery = `SELECT DATE(sp.created_at) as date, COALESCE(SUM(sp.total_amount), 0) as single_pay, COUNT(*) as single_pay_count FROM orders sp LEFT JOIN stores ss ON sp.store_id = ss.id WHERE sp.status IN ('paid','done','running','completed') AND sp.payment_method IN ('linepay','applepay','creditcard') AND COALESCE(sp.type, 'online') != 'coin_payment' AND ${spExportDateFilter}`;
+    if (scopeGroupId) { spExportQuery += ` AND ss.group_id = $${spExportParams.length + 1}`; spExportParams.push(scopeGroupId); }
+    if (storeId) { spExportQuery += ` AND sp.store_id = $${spExportParams.length + 1}`; spExportParams.push(storeId); }
+    spExportQuery += ' GROUP BY DATE(sp.created_at) ORDER BY date';
+
+    const orderParams = [...params, ...orderExtraParams];
+    const txParams = scopeGroupId ? [...params, scopeGroupId] : params;
+    const [orderRes, txRes, coinExportRes, spExportRes] = await Promise.all([
+      db.query(orderQuery, orderParams),
+      db.query(txQuery, txParams),
+      db.query(coinExportQuery, coinExportParams),
+      db.query(spExportQuery, spExportParams),
+    ]);
+
+    const toD = r => r.date instanceof Date ? r.date.toISOString().split('T')[0] : String(r.date).split('T')[0];
+    const txMap = {}; txRes.rows.forEach(r => { txMap[toD(r)] = r; });
+    const coinMap = {}; coinExportRes.rows.forEach(r => { coinMap[toD(r)] = r; });
+    const spMap = {}; spExportRes.rows.forEach(r => { spMap[toD(r)] = r; });
+
+    // Compute totals
+    const totalRevenue = orderRes.rows.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
+    const totalOrders = orderRes.rows.reduce((s, r) => s + (parseInt(r.orders) || 0), 0);
+    const totalTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.topup) || 0), 0);
+    const totalConsumption = txRes.rows.reduce((s, r) => s + (parseInt(r.consumption) || 0), 0);
+    const totalManualTopup = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_topup) || 0), 0);
+    const totalManualDeduct = txRes.rows.reduce((s, r) => s + (parseInt(r.manual_deduct) || 0), 0);
+    const totalTopupCount = txRes.rows.reduce((s, r) => s + (parseInt(r.topup_count) || 0), 0);
+    const totalPaymentCount = txRes.rows.reduce((s, r) => s + (parseInt(r.payment_count) || 0), 0);
+    const totalCoinRevenue = coinExportRes.rows.reduce((s, r) => s + (parseInt(r.coin_revenue) || 0), 0);
+    const totalCoinCount = coinExportRes.rows.reduce((s, r) => s + (parseInt(r.coin_count) || 0), 0);
+    const totalSinglePay = spExportRes.rows.reduce((s, r) => s + (parseInt(r.single_pay) || 0), 0);
+    const totalSinglePayCount = spExportRes.rows.reduce((s, r) => s + (parseInt(r.single_pay_count) || 0), 0);
+
+    const periodLabel = startDate && endDate ? `${startDate} ~ ${endDate}` : `近 ${params[0]} 天`;
+    const genTime = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+    const wb = XLSX.utils.book_new();
+
+    // Sheet 1: 營收摘要
+    const summaryData = [
+      ['雲管家營收報表'],
+      ['報表期間', periodLabel],
+      ['產生時間', genTime],
+      [],
+      ['項目', '金額'],
+      ['機台營業總額', totalRevenue],
+      ['儲值點數消費', totalConsumption],
+      ['單次線上支付', totalSinglePay],
+      ['現金投幣收入', totalCoinRevenue],
+      ['線上儲值總額', totalTopup],
+      ['手動加值', totalManualTopup],
+      ['手動扣款', totalManualDeduct],
+      ['淨儲值', totalTopup - totalConsumption + totalManualTopup - totalManualDeduct],
+      ['總交易筆數', totalOrders],
+      ['儲值筆數', totalTopupCount],
+      ['消費筆數(點數)', totalPaymentCount],
+      ['投幣筆數', totalCoinCount],
+      ['單次支付筆數', totalSinglePayCount],
+    ];
+    const ws1 = XLSX.utils.aoa_to_sheet(summaryData);
+    ws1['!cols'] = [{ wch: 18 }, { wch: 20 }];
+    XLSX.utils.book_append_sheet(wb, ws1, '營收摘要');
+
+    // Sheet 2: 每日明細
+    const dailyRows = [['日期', '機台營收', '儲值消費', '單次支付', '投幣金額', '線上儲值', '儲值筆數', '消費筆數', '投幣筆數', '單次支付筆數']];
+    const allDates = new Set([
+      ...orderRes.rows.map(r => toD(r)),
+      ...txRes.rows.map(r => toD(r)),
+      ...coinExportRes.rows.map(r => toD(r)),
+      ...spExportRes.rows.map(r => toD(r)),
+    ]);
+    [...allDates].sort().forEach(d => {
+      const dayOrders = orderRes.rows.filter(r => toD(r) === d);
+      const dayRev = dayOrders.reduce((s, r) => s + (parseInt(r.revenue) || 0), 0);
+      const tx = txMap[d] || {};
+      const coin = coinMap[d] || {};
+      const sp = spMap[d] || {};
+      dailyRows.push([d, dayRev, parseInt(tx.consumption)||0, parseInt(sp.single_pay)||0, parseInt(coin.coin_revenue)||0, parseInt(tx.topup)||0, parseInt(tx.topup_count)||0, parseInt(tx.payment_count)||0, parseInt(coin.coin_count)||0, parseInt(sp.single_pay_count)||0]);
+    });
+    const ws2 = XLSX.utils.aoa_to_sheet(dailyRows);
+    ws2['!cols'] = [{ wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 12 }];
+    XLSX.utils.book_append_sheet(wb, ws2, '每日明細');
+
+    // Sheet 3: 機台明細
+    const machineDetailRows = [['日期', '店舖名稱', '機台編號', '交易筆數', '營收金額']];
+    orderRes.rows.forEach(row => {
+      machineDetailRows.push([toD(row), row.store_name, row.machine_id, parseInt(row.orders)||0, parseInt(row.revenue)||0]);
+    });
+    const ws3 = XLSX.utils.aoa_to_sheet(machineDetailRows);
+    ws3['!cols'] = [{ wch: 12 }, { wch: 20 }, { wch: 15 }, { wch: 10 }, { wch: 12 }];
+    XLSX.utils.book_append_sheet(wb, ws3, '機台明細');
+
+    // Sheet 4: 機台營收彙總
+    let machineQuery = `SELECT o.machine_id, s.name as store_name, COUNT(*) as orders, COALESCE(SUM(o.total_amount), 0) as revenue FROM orders o JOIN stores s ON o.store_id = s.id WHERE o.status IN ('paid','done','running','completed') AND ${dateFilter}`;
+    const machineExtraParams = [];
+    if (scopeGroupId) { machineQuery += ` AND s.group_id = $${params.length + machineExtraParams.length + 1}`; machineExtraParams.push(scopeGroupId); }
+    if (storeId) { machineQuery += ` AND o.store_id = $${params.length + machineExtraParams.length + 1}`; machineExtraParams.push(storeId); }
+    machineQuery += ' GROUP BY o.machine_id, s.name ORDER BY s.name, o.machine_id';
+    try {
+      const machineRes = await db.query(machineQuery, [...params, ...machineExtraParams]);
+      const machineSummaryRows = [['機台編號', '所屬門市', '交易筆數', '營收金額']];
+      machineRes.rows.forEach(row => {
+        machineSummaryRows.push([row.machine_id || '未知', row.store_name, parseInt(row.orders)||0, parseInt(row.revenue)||0]);
+      });
+      const ws4 = XLSX.utils.aoa_to_sheet(machineSummaryRows);
+      ws4['!cols'] = [{ wch: 15 }, { wch: 20 }, { wch: 10 }, { wch: 12 }];
+      XLSX.utils.book_append_sheet(wb, ws4, '機台營收彙總');
+    } catch (e) { /* ignore */ }
+
+    const today = new Date().toISOString().split('T')[0];
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="revenue-report-${today}.xlsx"`);
+    res.send(buf);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ═══════════════════════════════════════
 //  API: Member Level System
 // ═══════════════════════════════════════
@@ -5076,6 +5376,65 @@ app.get('/api/admin/store-push/balance', async (req, res) => {
     });
   } catch (e) {
     console.error('store-push/balance error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get push transaction history (topups + deductions)
+app.get('/api/admin/store-push/history', async (req, res) => {
+  try {
+    const { userId, groupId, limit: queryLimit } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const roleInfo = await getUserRole(userId);
+    if (roleInfo.role !== 'super_admin' && roleInfo.role !== 'store_admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const targetGroupId = roleInfo.role === 'store_admin' ? roleInfo.groupId : (groupId || null);
+    const rowLimit = Math.min(parseInt(queryLimit) || 50, 200);
+
+    // Fetch topups
+    const topupQuery = targetGroupId
+      ? 'SELECT id, group_id, amount, method, note, created_by, created_at FROM store_push_topup WHERE group_id = $1 ORDER BY created_at DESC LIMIT $2'
+      : 'SELECT id, group_id, amount, method, note, created_by, created_at FROM store_push_topup ORDER BY created_at DESC LIMIT $1';
+    const topupParams = targetGroupId ? [targetGroupId, rowLimit] : [rowLimit];
+    const topupRes = await db.query(topupQuery, topupParams);
+
+    // Fetch push deductions (manual pushes with cost > 0)
+    const deductQuery = targetGroupId
+      ? "SELECT id, group_id, store_id, push_type, description, cost, recipient_count, created_at FROM push_logs WHERE group_id = $1 AND cost > 0 ORDER BY created_at DESC LIMIT $2"
+      : "SELECT id, group_id, store_id, push_type, description, cost, recipient_count, created_at FROM push_logs WHERE cost > 0 ORDER BY created_at DESC LIMIT $1";
+    const deductParams = targetGroupId ? [targetGroupId, rowLimit] : [rowLimit];
+    const deductRes = await db.query(deductQuery, deductParams);
+
+    // Merge and sort by date
+    const records = [
+      ...topupRes.rows.map(r => ({
+        id: `topup-${r.id}`,
+        type: 'topup',
+        groupId: r.group_id,
+        amount: parseFloat(r.amount),
+        note: r.note || '儲值',
+        method: r.method,
+        createdAt: r.created_at,
+      })),
+      ...deductRes.rows.map(r => ({
+        id: `deduct-${r.id}`,
+        type: 'deduction',
+        groupId: r.group_id,
+        storeId: r.store_id,
+        amount: -parseFloat(r.cost),
+        note: r.description || r.push_type,
+        pushType: r.push_type,
+        recipientCount: r.recipient_count,
+        createdAt: r.created_at,
+      })),
+    ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, rowLimit);
+
+    res.json({ records, total: records.length });
+  } catch (e) {
+    console.error('store-push/history error:', e);
     res.status(500).json({ error: e.message });
   }
 });
