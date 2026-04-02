@@ -39,6 +39,65 @@ app.use('/api/payment/', rateLimit({ windowMs: 60000, max: 10, message: { error:
 app.use('/api/wallet/', rateLimit({ windowMs: 60000, max: 20, message: { error: 'Too many wallet requests' } }));
 app.use('/api/notifications/', rateLimit({ windowMs: 60000, max: 5, message: { error: 'Too many notification requests' } }));
 
+// ===== LIFF Access Token Authentication =====
+// Cache: accessToken → { userId, expiresAt }
+const authCache = new Map();
+const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Clean expired cache entries every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of authCache) {
+    if (now > val.expiresAt) authCache.delete(key);
+  }
+}, 10 * 60 * 1000);
+
+async function verifyLiffToken(accessToken) {
+  // Check cache first
+  const cached = authCache.get(accessToken);
+  if (cached && Date.now() < cached.expiresAt) return cached.userId;
+
+  // Verify token with LINE Profile API
+  const res = await axios.get('https://api.line.me/v2/profile', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: 5000,
+  });
+  if (res.status === 200 && res.data.userId) {
+    authCache.set(accessToken, {
+      userId: res.data.userId,
+      expiresAt: Date.now() + AUTH_CACHE_TTL,
+    });
+    return res.data.userId;
+  }
+  throw new Error('Invalid token');
+}
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: '未授權：缺少認證 Token' });
+  }
+  const token = authHeader.slice(7);
+  verifyLiffToken(token)
+    .then(userId => {
+      req.verifiedUserId = userId;
+      next();
+    })
+    .catch(() => {
+      return res.status(401).json({ error: '未授權：Token 無效或已過期' });
+    });
+}
+
+// Optional auth: if token provided, verify it; otherwise pass through
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return next();
+  const token = authHeader.slice(7);
+  verifyLiffToken(token)
+    .then(userId => { req.verifiedUserId = userId; next(); })
+    .catch(() => next());
+}
+
 // Reject guest userIds on sensitive endpoints
 function rejectGuestUser(req, res, next) {
   const userId = req.query.userId || req.body?.userId || req.query.adminId || req.body?.adminId;
@@ -47,10 +106,18 @@ function rejectGuestUser(req, res, next) {
   }
   next();
 }
-app.use('/api/wallet/', rejectGuestUser);
-app.use('/api/payment/', rejectGuestUser);
-app.use('/api/admin/', rejectGuestUser);
-app.use('/api/orders/', rejectGuestUser);
+
+// Apply auth middleware to sensitive route groups
+app.use('/api/wallet/', requireAuth, rejectGuestUser);
+app.use('/api/payment/', requireAuth, rejectGuestUser);
+app.use('/api/admin/', requireAuth, rejectGuestUser);
+app.use('/api/orders/', requireAuth, rejectGuestUser);
+app.use('/api/notifications/', requireAuth);
+app.use('/api/topup/', requireAuth);
+app.use('/api/coupons/', optionalAuth);
+app.use('/api/user/', optionalAuth);
+app.use('/api/member/', optionalAuth);
+app.use('/api/transactions', optionalAuth);
 
 // 資料庫
 const db = new Pool({
