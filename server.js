@@ -13,6 +13,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const XLSX = require('xlsx');
+const multer = require('multer');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -32,6 +33,27 @@ app.use(cors({
   ],
   credentials: true
 }));
+
+// Static file serving for kiosk product images
+const uploadsDir = path.join(__dirname, 'uploads', 'kiosk-products');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Multer config for kiosk product image uploads
+const kioskUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname) || '.jpg';
+      cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPEG, PNG, WebP, GIF allowed'));
+  },
+});
 
 // Rate limiting
 app.use('/api/', rateLimit({ windowMs: 60000, max: 200, message: { error: 'Too many requests' } }));
@@ -1030,7 +1052,7 @@ app.post('/api/wallet/topup', async (req, res) => {
     if (!userId || !groupId || !amount) return res.status(400).json({ error: 'userId, groupId, amount required' });
     if (amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
     // Only allow topup from trusted sources
-    const allowedSources = ['linepay_confirm', 'admin_manual'];
+    const allowedSources = ['linepay_confirm', 'admin_manual', 'kiosk_cash'];
     if (!source || !allowedSources.includes(source)) {
       return res.status(403).json({ error: 'Unauthorized topup source. Use LINE Pay or admin panel.' });
     }
@@ -1041,11 +1063,17 @@ app.post('/api/wallet/topup', async (req, res) => {
       INSERT INTO wallets (line_user_id, group_id, balance) VALUES ($1, $2, $3)
       ON CONFLICT (line_user_id, group_id) DO UPDATE SET balance = wallets.balance + $3
     `, [userId, groupId, amount]);
-    // Record transaction
+    // Record transaction with source-specific description
+    const sourceDescMap = {
+      linepay_confirm: `LINE Pay 儲值 +${amount}`,
+      kiosk_cash: `三合一機器儲值 +${amount}`,
+      admin_manual: `管理員手動儲值 +${amount}`,
+    };
+    const txDescription = sourceDescMap[source] || `儲值 +${amount}`;
     await client.query(`
       INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
       VALUES ($1, $2, 'topup', $3, $4, NOW())
-    `, [userId, groupId, amount, `Topup +${amount}`]);
+    `, [userId, groupId, amount, txDescription]);
     await client.query('COMMIT');
 
     // [Bonus] Apply topup bonus (outside transaction since it's additive)
@@ -1113,6 +1141,13 @@ app.get('/api/transactions', async (req, res) => {
     if (userId) { query += ` AND line_user_id=$${idx++}`; params.push(userId); }
     if (groupId) { query += ` AND group_id=$${idx++}`; params.push(groupId); }
     if (type) { query += ` AND type=$${idx++}`; params.push(type); }
+
+    // Hide developer-only transactions (broadcast balance) from non-admin users
+    const callerRole = userId ? await getUserRole(userId).catch(() => ({ role: 'consumer' })) : { role: 'consumer' };
+    if (callerRole.role !== 'super_admin') {
+      query += ` AND (description NOT LIKE '%推播餘額%' AND description NOT LIKE '%broadcast%')`;
+    }
+
     query += ` ORDER BY created_at DESC LIMIT $${idx++}`;
     params.push(parseInt(lim) || 50);
 
@@ -1380,10 +1415,11 @@ app.post('/api/admin/manual-topup', async (req, res) => {
 
     // Record transaction
     const type = parseInt(amount) > 0 ? 'topup' : 'adjustment';
+    const defaultDesc = `管理員${parseInt(amount) > 0 ? '手動儲值' : '扣點'}`;
     await db.query(`
       INSERT INTO transactions (line_user_id, group_id, type, amount, description, created_at)
       VALUES ($1, $2, $3, $4, $5, NOW())
-    `, [targetUserId, groupId, type, parseInt(amount), description || `管理員${parseInt(amount) > 0 ? '儲值' : '扣點'}`]);
+    `, [targetUserId, groupId, type, parseInt(amount), description || defaultDesc]);
 
     const r = await db.query('SELECT balance FROM wallets WHERE line_user_id=$1 AND group_id=$2', [targetUserId, groupId]);
     res.json({ success: true, balance: r.rows[0]?.balance || 0 });
@@ -3850,7 +3886,7 @@ app.post('/api/coupons/purchase', async (req, res) => {
     } finally {
       walletClient.release();
     }
-  } catch (e) { console.error(e); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
+  } catch (e) { console.error('[Coupon Purchase Error]', e.message, e.stack); res.status(500).json({ error: '伺服器錯誤，請稍後再試' }); }
 });
 
 // LINE Pay confirm for coupon purchase
@@ -7255,6 +7291,73 @@ async function initDB() {
   `).catch(() => {});
   await db.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)`).catch(() => {});
   await db.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)`).catch(() => {});
+
+  // Kiosk sessions table (for QR code scan-to-topup flow)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS kiosk_sessions (
+      id VARCHAR(80) PRIMARY KEY,
+      store_id VARCHAR(20),
+      group_id VARCHAR(20),
+      status VARCHAR(20) DEFAULT 'pending',
+      line_user_id VARCHAR(100),
+      display_name VARCHAR(100),
+      balance INT DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      authenticated_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '10 minutes'
+    )
+  `).catch(() => {});
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_status ON kiosk_sessions(status, expires_at)`).catch(() => {});
+
+  // Kiosk store config (admin panel settings per store)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS kiosk_store_config (
+      store_id VARCHAR(20) PRIMARY KEY,
+      store_name VARCHAR(100) DEFAULT '',
+      service_phone VARCHAR(30) DEFAULT '0800-018-888',
+      exchange_denominations JSONB DEFAULT '[2000, 1000, 500, 200, 100, 50]',
+      coin_value INT DEFAULT 10,
+      bill_value INT DEFAULT 100,
+      admin_password VARCHAR(100) DEFAULT '1234',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `).catch(() => {});
+
+  // Kiosk products (managed remotely via admin panel)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS kiosk_products (
+      id SERIAL PRIMARY KEY,
+      store_id VARCHAR(20) NOT NULL,
+      slot VARCHAR(10) DEFAULT '',
+      name_zh VARCHAR(100) DEFAULT '',
+      name_en VARCHAR(100) DEFAULT '',
+      price INT DEFAULT 0,
+      stock INT DEFAULT 0,
+      icon_name VARCHAR(30) DEFAULT 'Droplets',
+      color VARCHAR(80) DEFAULT 'from-blue-500 to-blue-600',
+      image_url VARCHAR(500) DEFAULT '',
+      sort_order INT DEFAULT 0,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `).catch(() => {});
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_kiosk_products_store ON kiosk_products(store_id, active)`).catch(() => {});
+
+  // Kiosk sales records
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS kiosk_sales (
+      id SERIAL PRIMARY KEY,
+      store_id VARCHAR(20) NOT NULL,
+      product_id INT,
+      slot VARCHAR(10),
+      product_name VARCHAR(100),
+      price INT DEFAULT 0,
+      quantity INT DEFAULT 1,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `).catch(() => {});
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_kiosk_sales_store ON kiosk_sales(store_id, created_at DESC)`).catch(() => {});
 
   console.log('DB initialized with multi-tenant tables');
 }
@@ -12856,6 +12959,672 @@ app.get('/api/admin/audit-logs', async (req, res) => {
     console.error('[audit-logs] Error:', err.message);
     res.status(500).json({ error: 'Failed to fetch audit logs' });
   }
+});
+
+// ===== Kiosk Session API (QR code scan-to-topup) =====
+
+// POST /api/kiosk/session — Kiosk creates a new session (optional, kiosk can also use client-generated IDs)
+app.post('/api/kiosk/session', async (req, res) => {
+  try {
+    const { sessionId, storeId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+    // Look up group_id from store
+    let groupId = null;
+    if (storeId) {
+      const sr = await db.query('SELECT group_id FROM stores WHERE id = $1', [storeId]);
+      groupId = sr.rows[0]?.group_id || null;
+    }
+
+    await db.query(`
+      INSERT INTO kiosk_sessions (id, store_id, group_id, status, created_at, expires_at)
+      VALUES ($1, $2, $3, 'pending', NOW(), NOW() + INTERVAL '10 minutes')
+      ON CONFLICT (id) DO UPDATE SET status = 'pending', store_id = $2, group_id = $3,
+        line_user_id = NULL, display_name = NULL, balance = 0,
+        created_at = NOW(), expires_at = NOW() + INTERVAL '10 minutes', authenticated_at = NULL
+    `, [sessionId, storeId || null, groupId]);
+
+    res.json({ success: true, sessionId, storeId, groupId });
+  } catch (e) {
+    console.error('[kiosk/session] create error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// GET /api/kiosk/session/:id — Kiosk polls this to check if user scanned QR
+app.get('/api/kiosk/session/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await db.query(
+      'SELECT * FROM kiosk_sessions WHERE id = $1 AND expires_at > NOW()',
+      [id]
+    );
+    if (r.rows.length === 0) {
+      return res.json({ status: 'expired' });
+    }
+    const session = r.rows[0];
+    if (session.status === 'authenticated') {
+      // Fetch current balance
+      let balance = 0;
+      if (session.line_user_id && session.group_id) {
+        const wr = await db.query(
+          'SELECT balance FROM wallets WHERE line_user_id = $1 AND group_id = $2',
+          [session.line_user_id, session.group_id]
+        );
+        balance = wr.rows[0]?.balance || 0;
+      }
+      return res.json({
+        status: 'authenticated',
+        user: {
+          userId: session.line_user_id,
+          name: session.display_name,
+          displayName: session.display_name,
+          balance,
+          groupId: session.group_id,
+        },
+      });
+    }
+    res.json({ status: session.status });
+  } catch (e) {
+    console.error('[kiosk/session] poll error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/session/:id/authenticate — LIFF calls this after user scans QR
+app.post('/api/kiosk/session/:id/authenticate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, displayName } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Check session exists and is pending
+    const sr = await db.query(
+      'SELECT * FROM kiosk_sessions WHERE id = $1 AND expires_at > NOW()',
+      [id]
+    );
+    if (sr.rows.length === 0) {
+      return res.status(404).json({ error: 'Session expired or not found' });
+    }
+
+    const session = sr.rows[0];
+    const groupId = session.group_id;
+
+    // Get user's balance at this store group
+    let balance = 0;
+    if (groupId) {
+      const wr = await db.query(
+        'SELECT balance FROM wallets WHERE line_user_id = $1 AND group_id = $2',
+        [userId, groupId]
+      );
+      balance = wr.rows[0]?.balance || 0;
+    }
+
+    // Update session to authenticated
+    await db.query(`
+      UPDATE kiosk_sessions SET status = 'authenticated', line_user_id = $2,
+        display_name = $3, balance = $4, authenticated_at = NOW()
+      WHERE id = $1
+    `, [id, userId, displayName || '會員', balance]);
+
+    res.json({ success: true, balance, groupId });
+  } catch (e) {
+    console.error('[kiosk/session] auth error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/session/:id/close — Kiosk closes session after topup is done
+app.post('/api/kiosk/session/:id/close', async (req, res) => {
+  try {
+    await db.query(
+      "UPDATE kiosk_sessions SET status = 'closed' WHERE id = $1",
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// ═══════════════════════════════════════
+//  API: Kiosk Admin Panel (Remote Management)
+// ═══════════════════════════════════════
+
+// --- Store Config ---
+// GET /api/kiosk/config/:storeId
+app.get('/api/kiosk/config/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const r = await db.query('SELECT * FROM kiosk_store_config WHERE store_id = $1', [storeId]);
+    if (r.rows.length === 0) {
+      // Return defaults
+      return res.json({
+        store_id: storeId,
+        store_name: '',
+        service_phone: '0800-018-888',
+        exchange_denominations: [2000, 1000, 500, 200, 100, 50],
+        coin_value: 10,
+        bill_value: 100,
+        admin_password: '1234',
+      });
+    }
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/config] get error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// PUT /api/kiosk/config/:storeId
+app.put('/api/kiosk/config/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const { store_name, service_phone, exchange_denominations, coin_value, bill_value, admin_password } = req.body;
+    await db.query(`
+      INSERT INTO kiosk_store_config (store_id, store_name, service_phone, exchange_denominations, coin_value, bill_value, admin_password, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      ON CONFLICT (store_id) DO UPDATE SET
+        store_name = COALESCE($2, kiosk_store_config.store_name),
+        service_phone = COALESCE($3, kiosk_store_config.service_phone),
+        exchange_denominations = COALESCE($4, kiosk_store_config.exchange_denominations),
+        coin_value = COALESCE($5, kiosk_store_config.coin_value),
+        bill_value = COALESCE($6, kiosk_store_config.bill_value),
+        admin_password = COALESCE($7, kiosk_store_config.admin_password),
+        updated_at = NOW()
+    `, [storeId, store_name || '', service_phone || '0800-018-888',
+        JSON.stringify(exchange_denominations || [2000, 1000, 500, 200, 100, 50]),
+        coin_value || 10, bill_value || 100, admin_password || '1234']);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[kiosk/config] update error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// --- Products CRUD ---
+// GET /api/kiosk/products/:storeId
+app.get('/api/kiosk/products/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const r = await db.query(
+      'SELECT * FROM kiosk_products WHERE store_id = $1 AND active = true ORDER BY sort_order, id',
+      [storeId]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error('[kiosk/products] list error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/products/:storeId — Create product
+app.post('/api/kiosk/products/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const { slot, name_zh, name_en, price, stock, icon_name, color, image_url, sort_order } = req.body;
+    const r = await db.query(`
+      INSERT INTO kiosk_products (store_id, slot, name_zh, name_en, price, stock, icon_name, color, image_url, sort_order)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [storeId, slot || '', name_zh || '', name_en || '', price || 0, stock || 0,
+        icon_name || 'Droplets', color || 'from-blue-500 to-blue-600', image_url || '', sort_order || 0]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/products] create error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// PUT /api/kiosk/products/:storeId/:id — Update product
+app.put('/api/kiosk/products/:storeId/:id', async (req, res) => {
+  try {
+    const { storeId, id } = req.params;
+    const { slot, name_zh, name_en, price, stock, icon_name, color, image_url, sort_order } = req.body;
+    const r = await db.query(`
+      UPDATE kiosk_products SET
+        slot = COALESCE($3, slot), name_zh = COALESCE($4, name_zh), name_en = COALESCE($5, name_en),
+        price = COALESCE($6, price), stock = COALESCE($7, stock), icon_name = COALESCE($8, icon_name),
+        color = COALESCE($9, color), image_url = COALESCE($10, image_url), sort_order = COALESCE($11, sort_order),
+        updated_at = NOW()
+      WHERE id = $1 AND store_id = $2 RETURNING *
+    `, [id, storeId, slot, name_zh, name_en, price, stock, icon_name, color, image_url, sort_order]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/products] update error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// DELETE /api/kiosk/products/:storeId/:id — Soft delete
+app.delete('/api/kiosk/products/:storeId/:id', async (req, res) => {
+  try {
+    const { storeId, id } = req.params;
+    await db.query('UPDATE kiosk_products SET active = false WHERE id = $1 AND store_id = $2', [id, storeId]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[kiosk/products] delete error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/products/:storeId/:id/upload-image — Upload product image
+app.post('/api/kiosk/products/:storeId/:id/upload-image', kioskUpload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+    const { storeId, id } = req.params;
+    const imageUrl = `/uploads/kiosk-products/${req.file.filename}`;
+
+    // Delete old image if exists
+    const old = await db.query('SELECT image_url FROM kiosk_products WHERE id = $1 AND store_id = $2', [id, storeId]);
+    if (old.rows[0]?.image_url) {
+      const oldPath = path.join(__dirname, old.rows[0].image_url);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+
+    await db.query('UPDATE kiosk_products SET image_url = $3, updated_at = NOW() WHERE id = $1 AND store_id = $2', [id, storeId, imageUrl]);
+    res.json({ success: true, image_url: imageUrl });
+  } catch (e) {
+    console.error('[kiosk/products] upload error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/products/batch/:storeId — Batch save all products (full replace)
+app.post('/api/kiosk/products/batch/:storeId', async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { storeId } = req.params;
+    const { products } = req.body;
+    if (!Array.isArray(products)) return res.status(400).json({ error: 'products array required' });
+
+    await client.query('BEGIN');
+    // Soft-delete all existing
+    await client.query('UPDATE kiosk_products SET active = false WHERE store_id = $1', [storeId]);
+
+    const results = [];
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      if (p.id && typeof p.id === 'number') {
+        // Update existing
+        const r = await client.query(`
+          UPDATE kiosk_products SET
+            slot = $3, name_zh = $4, name_en = $5, price = $6, stock = $7,
+            icon_name = $8, color = $9, image_url = $10, sort_order = $11,
+            active = true, updated_at = NOW()
+          WHERE id = $1 AND store_id = $2 RETURNING *
+        `, [p.id, storeId, p.slot || '', p.name_zh || '', p.name_en || '', p.price || 0, p.stock || 0,
+            p.icon_name || 'Droplets', p.color || 'from-blue-500 to-blue-600', p.image_url || '', i]);
+        if (r.rows[0]) results.push(r.rows[0]);
+      } else {
+        // Insert new
+        const r = await client.query(`
+          INSERT INTO kiosk_products (store_id, slot, name_zh, name_en, price, stock, icon_name, color, image_url, sort_order)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
+        `, [storeId, p.slot || '', p.name_zh || '', p.name_en || '', p.price || 0, p.stock || 0,
+            p.icon_name || 'Droplets', p.color || 'from-blue-500 to-blue-600', p.image_url || '', i]);
+        results.push(r.rows[0]);
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, products: results });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[kiosk/products] batch error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  } finally { client.release(); }
+});
+
+// ═══════════════════════════════════════
+//  API: Kiosk Developer Panel (Super Admin)
+// ═══════════════════════════════════════
+
+const KIOSK_DEV_PASSWORD = process.env.KIOSK_DEV_PASSWORD || 'cloudmonster2026';
+
+// POST /api/kiosk/dev/auth — Developer login
+app.post('/api/kiosk/dev/auth', (req, res) => {
+  const { password } = req.body;
+  if (password === KIOSK_DEV_PASSWORD) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: 'Invalid password' });
+  }
+});
+
+// GET /api/kiosk/dev/stores — List all stores with kiosk config
+app.get('/api/kiosk/dev/stores', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Get all kiosk configs
+    const configs = await db.query('SELECT * FROM kiosk_store_config ORDER BY updated_at DESC');
+
+    // Get product counts per store
+    const productCounts = await db.query(
+      `SELECT store_id, COUNT(*) as product_count, SUM(stock) as total_stock
+       FROM kiosk_products WHERE active = true GROUP BY store_id`
+    );
+    const countMap = {};
+    productCounts.rows.forEach(r => { countMap[r.store_id] = r; });
+
+    // Get session stats per store (last 30 days)
+    const sessionStats = await db.query(`
+      SELECT store_id,
+        COUNT(*) as total_sessions,
+        COUNT(CASE WHEN status = 'authenticated' OR status = 'closed' THEN 1 END) as auth_sessions,
+        COUNT(CASE WHEN status = 'closed' THEN 1 END) as completed_sessions,
+        MAX(created_at) as last_session_at
+      FROM kiosk_sessions
+      WHERE created_at > NOW() - INTERVAL '30 days'
+      GROUP BY store_id
+    `);
+    const sessionMap = {};
+    sessionStats.rows.forEach(r => { sessionMap[r.store_id] = r; });
+
+    // Get topup stats from transactions (kiosk_cash source)
+    const topupStats = await db.query(`
+      SELECT t.group_id,
+        COUNT(*) as topup_count,
+        COALESCE(SUM(t.amount), 0) as total_topup_amount
+      FROM transactions t
+      WHERE t.type = 'topup' AND t.description LIKE '%kiosk%'
+        AND t.created_at > NOW() - INTERVAL '30 days'
+      GROUP BY t.group_id
+    `);
+    const topupMap = {};
+    topupStats.rows.forEach(r => { topupMap[r.group_id] = r; });
+
+    // Also get stores from main stores table to cross-reference
+    const allStores = await db.query('SELECT id, name, group_id FROM stores ORDER BY id');
+    const storeInfoMap = {};
+    allStores.rows.forEach(r => { storeInfoMap[r.id] = r; });
+
+    // Merge all data
+    const result = configs.rows.map(cfg => {
+      const storeInfo = storeInfoMap[cfg.store_id] || {};
+      const counts = countMap[cfg.store_id] || { product_count: 0, total_stock: 0 };
+      const sessions = sessionMap[cfg.store_id] || { total_sessions: 0, auth_sessions: 0, completed_sessions: 0, last_session_at: null };
+      const topups = topupMap[storeInfo.group_id] || { topup_count: 0, total_topup_amount: 0 };
+      return {
+        ...cfg,
+        store_name_main: storeInfo.name || cfg.store_name,
+        group_id: storeInfo.group_id || null,
+        product_count: parseInt(counts.product_count) || 0,
+        total_stock: parseInt(counts.total_stock) || 0,
+        ...sessions,
+        total_sessions: parseInt(sessions.total_sessions) || 0,
+        auth_sessions: parseInt(sessions.auth_sessions) || 0,
+        completed_sessions: parseInt(sessions.completed_sessions) || 0,
+        topup_count: parseInt(topups.topup_count) || 0,
+        total_topup_amount: parseInt(topups.total_topup_amount) || 0,
+      };
+    });
+
+    res.json(result);
+  } catch (e) {
+    console.error('[kiosk/dev] stores error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// GET /api/kiosk/dev/store/:storeId — Detailed store info
+app.get('/api/kiosk/dev/store/:storeId', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+    const { storeId } = req.params;
+
+    const [config, products, sessions] = await Promise.all([
+      db.query('SELECT * FROM kiosk_store_config WHERE store_id = $1', [storeId]),
+      db.query('SELECT * FROM kiosk_products WHERE store_id = $1 AND active = true ORDER BY sort_order, id', [storeId]),
+      db.query(`SELECT * FROM kiosk_sessions WHERE store_id = $1 ORDER BY created_at DESC LIMIT 50`, [storeId]),
+    ]);
+
+    res.json({
+      config: config.rows[0] || null,
+      products: products.rows,
+      recent_sessions: sessions.rows,
+    });
+  } catch (e) {
+    console.error('[kiosk/dev] store detail error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// GET /api/kiosk/dev/stats — Global kiosk system stats
+app.get('/api/kiosk/dev/stats', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+    const [storeCount, productCount, sessionStats, todaySessions] = await Promise.all([
+      db.query('SELECT COUNT(*) FROM kiosk_store_config'),
+      db.query('SELECT COUNT(*) FROM kiosk_products WHERE active = true'),
+      db.query(`
+        SELECT
+          COUNT(*) as total,
+          COUNT(CASE WHEN status = 'authenticated' OR status = 'closed' THEN 1 END) as authenticated,
+          COUNT(CASE WHEN status = 'closed' THEN 1 END) as completed,
+          COUNT(CASE WHEN status = 'expired' OR (status = 'pending' AND expires_at < NOW()) THEN 1 END) as expired
+        FROM kiosk_sessions WHERE created_at > NOW() - INTERVAL '30 days'
+      `),
+      db.query(`SELECT COUNT(*) FROM kiosk_sessions WHERE created_at >= CURRENT_DATE`),
+    ]);
+
+    res.json({
+      total_stores: parseInt(storeCount.rows[0].count),
+      total_products: parseInt(productCount.rows[0].count),
+      sessions_30d: sessionStats.rows[0],
+      today_sessions: parseInt(todaySessions.rows[0].count),
+    });
+  } catch (e) {
+    console.error('[kiosk/dev] stats error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// ─── Kiosk Account Management (dev only) ───
+
+// GET /api/kiosk/dev/accounts — List all store accounts
+app.get('/api/kiosk/dev/accounts', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+    const configs = await db.query(
+      'SELECT store_id, store_name, admin_password, updated_at FROM kiosk_store_config ORDER BY updated_at DESC'
+    );
+    res.json(configs.rows);
+  } catch (e) {
+    console.error('[kiosk/dev] accounts error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/dev/accounts — Create a new store account
+app.post('/api/kiosk/dev/accounts', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+    const { store_id, store_name, admin_password } = req.body;
+    if (!store_id || !admin_password) return res.status(400).json({ error: 'store_id and admin_password required' });
+    const r = await db.query(`
+      INSERT INTO kiosk_store_config (store_id, store_name, admin_password, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (store_id) DO UPDATE SET store_name = $2, admin_password = $3, updated_at = NOW()
+      RETURNING *
+    `, [store_id, store_name || '', admin_password]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/dev] create account error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// PUT /api/kiosk/dev/accounts/:storeId — Update store account password
+app.put('/api/kiosk/dev/accounts/:storeId', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+    const { storeId } = req.params;
+    const { store_name, admin_password } = req.body;
+    const r = await db.query(`
+      UPDATE kiosk_store_config SET
+        store_name = COALESCE($2, store_name),
+        admin_password = COALESCE($3, admin_password),
+        updated_at = NOW()
+      WHERE store_id = $1 RETURNING *
+    `, [storeId, store_name, admin_password]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Store not found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/dev] update account error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// DELETE /api/kiosk/dev/accounts/:storeId — Delete store account
+app.delete('/api/kiosk/dev/accounts/:storeId', async (req, res) => {
+  try {
+    const { password } = req.query;
+    if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+    const { storeId } = req.params;
+    await db.query('DELETE FROM kiosk_store_config WHERE store_id = $1', [storeId]);
+    await db.query('UPDATE kiosk_products SET active = false WHERE store_id = $1', [storeId]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[kiosk/dev] delete account error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// PUT /api/kiosk/dev/password — Change dev password
+app.put('/api/kiosk/dev/password', (req, res) => {
+  const { password, new_password } = req.body;
+  if (password !== KIOSK_DEV_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  if (!new_password || new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  // Update in-memory (will reset on restart unless env var is updated)
+  // For persistence, we store in DB
+  process.env.KIOSK_DEV_PASSWORD = new_password;
+  res.json({ success: true });
+});
+
+// ─── Kiosk Sales Tracking ───
+
+// POST /api/kiosk/sales/:storeId — Record a sale
+app.post('/api/kiosk/sales/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const { product_id, slot, product_name, price, quantity } = req.body;
+    const r = await db.query(`
+      INSERT INTO kiosk_sales (store_id, product_id, slot, product_name, price, quantity)
+      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+    `, [storeId, product_id || null, slot || '', product_name || '', price || 0, quantity || 1]);
+
+    // Update stock in kiosk_products
+    if (product_id) {
+      const updated = await db.query(
+        'UPDATE kiosk_products SET stock = GREATEST(0, stock - $3), updated_at = NOW() WHERE id = $1 AND store_id = $2 RETURNING stock',
+        [product_id, storeId, quantity || 1]
+      );
+
+      // Check low stock and send LINE notification
+      const newStock = updated.rows[0]?.stock;
+      if (newStock !== undefined && newStock <= 3) {
+        // Look up group_id for this store to find admin
+        const storeInfo = await db.query('SELECT group_id FROM stores WHERE id = $1', [storeId]);
+        const groupId = storeInfo.rows[0]?.group_id;
+        if (groupId) {
+          // Find store owners to notify
+          const owners = await db.query('SELECT line_user_id FROM store_owners WHERE group_id = $1', [groupId]);
+          for (const owner of owners.rows) {
+            try {
+              await linePush(owner.line_user_id, [{
+                type: 'text',
+                text: `⚠️ 庫存警告\n門市: ${storeId}\n商品: ${product_name || slot}\n剩餘庫存: ${newStock}\n請儘速補貨！`
+              }]);
+              console.log(`[Kiosk] Low stock alert sent to ${owner.line_user_id} for ${storeId}/${slot}`);
+            } catch (e) {
+              console.error('[Kiosk] Failed to send low stock alert:', e.message);
+            }
+          }
+        }
+      }
+    }
+
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('[kiosk/sales] record error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// GET /api/kiosk/sales/:storeId — Sales history & stats
+app.get('/api/kiosk/sales/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const { days } = req.query;
+    const daysNum = parseInt(days) || 30;
+
+    const [salesList, salesByProduct, totalStats] = await Promise.all([
+      db.query(
+        `SELECT * FROM kiosk_sales WHERE store_id = $1 AND created_at > NOW() - $2::interval ORDER BY created_at DESC LIMIT 100`,
+        [storeId, `${daysNum} days`]
+      ),
+      db.query(`
+        SELECT slot, product_name, SUM(quantity) as total_sold, SUM(price * quantity) as total_revenue,
+          COUNT(*) as sale_count
+        FROM kiosk_sales WHERE store_id = $1 AND created_at > NOW() - $2::interval
+        GROUP BY slot, product_name ORDER BY total_sold DESC
+      `, [storeId, `${daysNum} days`]),
+      db.query(`
+        SELECT COUNT(*) as total_transactions, COALESCE(SUM(quantity), 0) as total_items,
+          COALESCE(SUM(price * quantity), 0) as total_revenue
+        FROM kiosk_sales WHERE store_id = $1 AND created_at > NOW() - $2::interval
+      `, [storeId, `${daysNum} days`]),
+    ]);
+
+    res.json({
+      sales: salesList.rows,
+      by_product: salesByProduct.rows,
+      stats: totalStats.rows[0],
+    });
+  } catch (e) {
+    console.error('[kiosk/sales] query error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// POST /api/kiosk/command/:storeId — Queue a command for kiosk to execute
+app.post('/api/kiosk/command/:storeId', async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const { action, slot, count } = req.body;
+    if (!action) return res.status(400).json({ error: 'action required' });
+
+    // Store command in a simple in-memory queue (per store)
+    if (!global._kioskCommandQueue) global._kioskCommandQueue = {};
+    if (!global._kioskCommandQueue[storeId]) global._kioskCommandQueue[storeId] = [];
+    const cmd = { id: Date.now().toString(36), action, slot, count, created_at: new Date().toISOString() };
+    global._kioskCommandQueue[storeId].push(cmd);
+    // Keep only last 50 commands
+    if (global._kioskCommandQueue[storeId].length > 50) global._kioskCommandQueue[storeId].shift();
+    console.log(`[kiosk/command] Queued ${action} for store ${storeId}`, cmd);
+    res.json({ success: true, command: cmd });
+  } catch (e) {
+    console.error('[kiosk/command] error:', e.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// GET /api/kiosk/command/:storeId/poll — Kiosk polls for pending commands
+app.get('/api/kiosk/command/:storeId/poll', (req, res) => {
+  const { storeId } = req.params;
+  const queue = global._kioskCommandQueue?.[storeId] || [];
+  // Return and clear all pending commands
+  if (global._kioskCommandQueue) global._kioskCommandQueue[storeId] = [];
+  res.json(queue);
 });
 
 const PORT = process.env.PORT || 3000;
