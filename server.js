@@ -3858,7 +3858,7 @@ app.post('/api/coupons/purchase', async (req, res) => {
         }
         // Record transaction
         await walletClient.query('INSERT INTO transactions (line_user_id, group_id, type, amount, description) VALUES ($1,$2,$3,$4,$5)',
-          [userId, effectiveGroupId, 'payment', -price, `購買優惠券: ${coupon.name}`]);
+          [userId, effectiveGroupId, 'payment', -price, `點數購買優惠券: ${coupon.name}`]);
       }
       // Calculate expiry date from validity
       let expiryDate = coupon.expiry;
@@ -13280,15 +13280,15 @@ app.post('/api/kiosk/products/batch/:storeId', async (req, res) => {
 //  API: Kiosk Developer Panel (Super Admin)
 // ═══════════════════════════════════════
 
-const KIOSK_DEV_PASSWORD = process.env.KIOSK_DEV_PASSWORD || 'cloudmonster2026';
+const KIOSK_DEV_PASSWORD = process.env.KIOSK_DEV_PASSWORD || 's85010805';
 
 // POST /api/kiosk/dev/auth — Developer login
 app.post('/api/kiosk/dev/auth', (req, res) => {
-  const { password } = req.body;
-  if (password === KIOSK_DEV_PASSWORD) {
+  const { account, password } = req.body;
+  if (account === 'admin' && password === KIOSK_DEV_PASSWORD) {
     res.json({ success: true });
   } else {
-    res.status(401).json({ error: 'Invalid password' });
+    res.status(401).json({ error: 'Invalid account or password' });
   }
 });
 
